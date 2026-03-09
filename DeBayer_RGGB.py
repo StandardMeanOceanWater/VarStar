@@ -200,7 +200,7 @@ def _build_channel_header(
 
     h["CHANNEL"] = (channel_name, "Bayer sub-channel extracted")
     h["BAYERPAT"] = (bayer_pattern, "Original Bayer pattern")
-    h["DEBAYER"] = ("NO", "Split by slicing — no interpolation")
+    h["DEBAYER"] = ("NO", "Split by slicing - no interpolation")
 
     if "DATE-OBS" not in h:
         print(f"  [WARN] {channel_name}：原始 FITS 缺少 DATE-OBS，BJD_TDB 將無法計算。")
@@ -244,7 +244,15 @@ def run_debayer(config_path: "str | Path") -> None:
     print("=" * 60)
 
     for session in sessions:
-        target = session["target"]
+        # 支援 targets 列表（複數）與舊格式 target 單數
+        targets_raw = session.get("targets", session.get("target"))
+        if targets_raw is None:
+            print("[WARN] session 缺少 targets 欄位，跳過。")
+            continue
+        targets_list = (
+            targets_raw if isinstance(targets_raw, list) else [targets_raw]
+        )
+
         date = str(session["date"])
         telescope_id = session.get("telescope", "")
         camera_id = session.get("camera", "")
@@ -252,7 +260,6 @@ def run_debayer(config_path: "str | Path") -> None:
         tel_cfg = cfg.get("telescopes", {}).get(telescope_id, {})
         cam_cfg = cfg.get("cameras", {}).get(camera_id, {})
         obs_cfg = cfg.get("observatory", {})
-        target_cfg = cfg.get("targets", {}).get(target, {})
 
         telescope_name = tel_cfg.get("name", telescope_id)
         camera_name = cam_cfg.get("name", camera_id)
@@ -260,79 +267,83 @@ def run_debayer(config_path: "str | Path") -> None:
         pixel_size_um = cam_cfg.get("pixel_size_um")
         bayer_default = cam_cfg.get("bayer_pattern", "RGGB")
         observer = obs_cfg.get("name", "")
-        object_name = target_cfg.get("display_name", target)
 
         data_root = cfg["_data_root"]
-        target_root = data_root / "targets" / target
-        wcs_dir = target_root / "calibrated" / "wcs"
-        split_base = target_root / "split"
 
-        wcs_files = sorted(wcs_dir.glob("*_wcs.fits"))
-        if not wcs_files:
-            print(f"[SKIP] {target}/{date}：wcs/ 目錄裡找不到 *_wcs.fits。")
-            continue
+        for target in targets_list:
+            target_cfg = cfg.get("targets", {}).get(target, {})
+            object_name = target_cfg.get("display_name", target)
 
-        print(f"\n[Session] {target} / {date}  ({len(wcs_files)} 幀)")
+            target_root = data_root / "targets" / target
+            wcs_dir = target_root / "calibrated" / "wcs"
+            split_base = target_root / "split"
 
-        for ch in ("R", "G1", "G2", "B"):
-            (split_base / ch).mkdir(parents=True, exist_ok=True)
+            wcs_files = sorted(wcs_dir.glob("*_wcs.fits"))
+            if not wcs_files:
+                print(f"[SKIP] {target}/{date}：wcs/ 目錄裡找不到 *_wcs.fits。")
+                continue
 
-        success = failed = 0
-        for fits_path in tqdm(wcs_files, desc=f"{target} 拆色進度"):
-            try:
-                with fits.open(fits_path) as hdul:
-                    hdu = next((h for h in hdul if h.data is not None), None)
-                    if hdu is None:
-                        print(f"\n  [跳過] {fits_path.name}：無數據層。")
+            print(f"\n[Session] {target} / {date}  ({len(wcs_files)} 幀)")
+
+            for ch in ("R", "G1", "G2", "B"):
+                (split_base / ch).mkdir(parents=True, exist_ok=True)
+
+            success = failed = 0
+            for fits_path in tqdm(wcs_files, desc=f"{target} 拆色進度"):
+                try:
+                    with fits.open(fits_path) as hdul:
+                        hdu = next((h for h in hdul if h.data is not None), None)
+                        if hdu is None:
+                            print(f"\n  [跳過] {fits_path.name}：無數據層。")
+                            continue
+                        data = hdu.data.astype(np.float32)
+                        header = hdu.header.copy()
+
+                    if data.ndim != 2:
+                        print(
+                            f"\n  [跳過] {fits_path.name}：非 2D（ndim={data.ndim}），"
+                            "疑似已 Debayer。"
+                        )
                         continue
-                    data = hdu.data.astype(np.float32)
-                    header = hdu.header.copy()
 
-                if data.ndim != 2:
-                    print(
-                        f"\n  [跳過] {fits_path.name}：非 2D（ndim={data.ndim}），"
-                        "疑似已 Debayer。"
-                    )
-                    continue
+                    bayer_pattern = detect_bayer_pattern(header, bayer_default)
+                    pattern_def = _BAYER_PATTERNS[bayer_pattern]
+                    base_name = fits_path.stem
 
-                bayer_pattern = detect_bayer_pattern(header, bayer_default)
-                pattern_def = _BAYER_PATTERNS[bayer_pattern]
-                base_name = fits_path.stem
+                    for ch_key, (row_sl, col_sl, row_off, col_off) in pattern_def.items():
+                        ch_data = data[row_sl, col_sl].copy().astype(np.float32)
+                        # ch_data = np.clip(ch_data, 0.0, None)  #GEMINI建議刪除
 
-                for ch_key, (row_sl, col_sl, row_off, col_off) in pattern_def.items():
-                    ch_data = data[row_sl, col_sl].copy().astype(np.float32)
-                    # ch_data = np.clip(ch_data, 0.0, None)  #GEMINI建議刪除
+                        ch_header = _build_channel_header(
+                            orig_header=header,
+                            channel_name=ch_key,
+                            orig_shape=data.shape,
+                            new_shape=ch_data.shape,
+                            bayer_pattern=bayer_pattern,
+                            row_offset=row_off,
+                            col_offset=col_off,
+                            telescope_name=telescope_name,
+                            camera_name=camera_name,
+                            focal_length_mm=focal_length_mm,
+                            pixel_size_um=pixel_size_um,
+                            observer=observer,
+                            object_name=object_name,
+                        )
 
-                    ch_header = _build_channel_header(
-                        orig_header=header,
-                        channel_name=ch_key,
-                        orig_shape=data.shape,
-                        new_shape=ch_data.shape,
-                        bayer_pattern=bayer_pattern,
-                        row_offset=row_off,
-                        col_offset=col_off,
-                        telescope_name=telescope_name,
-                        camera_name=camera_name,
-                        focal_length_mm=focal_length_mm,
-                        pixel_size_um=pixel_size_um,
-                        observer=observer,
-                        object_name=object_name,
-                    )
+                        out_name = f"{base_name}_{ch_key}.fits"
+                        out_path = split_base / ch_key / out_name
+                        new_hdu = fits.PrimaryHDU(data=ch_data, header=ch_header)
+                        new_hdu.verify("silentfix")
+                        new_hdu.writeto(out_path, overwrite=True)
 
-                    out_name = f"{base_name}_{ch_key}.fits"
-                    out_path = split_base / ch_key / out_name
-                    new_hdu = fits.PrimaryHDU(data=ch_data, header=ch_header)
-                    new_hdu.verify("silentfix")
-                    new_hdu.writeto(out_path, overwrite=True)
+                    success += 1
 
-                success += 1
+                except Exception as exc:
+                    print(f"\n  [失敗] {fits_path.name}：{exc}")
+                    failed += 1
 
-            except Exception as exc:
-                print(f"\n  [失敗] {fits_path.name}：{exc}")
-                failed += 1
-
-        print(f"\n[完成] {target}/{date}：成功 {success} 幀，失敗 {failed} 幀")
-        print(f"       輸出目錄：{split_base}/{{R,G1,G2,B}}/")
+            print(f"\n[完成] {target}/{date}：成功 {success} 幀，失敗 {failed} 幀")
+            print(f"       輸出目錄：{split_base}/{{R,G1,G2,B}}/")
 
     print("\n" + "🔭 " * 20)
     print("所有 Session 拆色完成。")

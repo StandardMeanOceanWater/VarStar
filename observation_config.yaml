@@ -64,6 +64,12 @@ obs_sessions:
     calibration_date: "20251220"
     dark_temp_c: 3.7    # 或 null
     light_temp_c: 4     # 或 null
+    iso: 3200
+
+targets:
+  V1162Ori:
+    ra_hint_h: 5.507
+    dec_hint_deg: 5.11
  
 # -----------------------------------------------------------------------------
 # 5. 校正參數 (Calibration)
@@ -87,11 +93,11 @@ astrometry:
   astap:
     executable: "C:/Program Files/astap/astap_cli.exe"
     db_path: "C:/Program Files/astap/d80"
-    search_radius_deg: 30.0
+    search_radius_deg: 30
     downsample: 2
-    fov_override_deg: 1.61
+    fov_override_deg: 0
     speed: "slow"
-    timeout_sec: 180
+    timeout_sec: 300
     max_retries: 2
 
   astrometry_net:

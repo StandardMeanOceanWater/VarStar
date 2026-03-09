@@ -129,6 +129,8 @@ def _run_astap(
     fits_path: Path,
     out_path: Path,
     astap_cfg: dict,
+    ra_hint_h: float | None = None,
+    dec_hint_deg: float | None = None,
 ) -> bool:
     """
     呼叫 ASTAP CLI 對單張 FITS 執行星圖解算，輸出到 out_path。
@@ -141,9 +143,11 @@ def _run_astap(
 
     Parameters
     ----------
-    fits_path : 輸入的校正 FITS（不會被修改）。
-    out_path  : 輸出的 WCS FITS 路徑。
-    astap_cfg : yaml 裡 astrometry.astap 的設定字典。
+    fits_path    : 輸入的校正 FITS（不會被修改）。
+    out_path     : 輸出的 WCS FITS 路徑。
+    astap_cfg    : yaml 裡 astrometry.astap 的設定字典。
+    ra_hint_h    : 起始 RA（小時），覆蓋 FITS 標頭值；None 表示用標頭值。
+    dec_hint_deg : 起始 DEC（度），覆蓋 FITS 標頭值；None 表示用標頭值。
 
     Returns
     -------
@@ -152,15 +156,11 @@ def _run_astap(
     """
     executable = astap_cfg.get("executable", "astap_cli")
     db_path = astap_cfg.get("db_path", "")
-    db_type = astap_cfg.get("db_type", "d80")
     search_radius = float(astap_cfg.get("search_radius_deg", 30.0))
     downsample = int(astap_cfg.get("downsample", 2))
     fov = float(astap_cfg.get("fov_override_deg", 0.0))
-    speed = astap_cfg.get("speed", "slow")
     timeout = int(astap_cfg.get("timeout_sec", 180))
     max_retries = int(astap_cfg.get("max_retries", 2))
-
-    speed_flag = "-z" if speed == "slow" else ""
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_fits = Path(tmpdir) / fits_path.name
@@ -171,15 +171,21 @@ def _run_astap(
             executable,
             "-f", str(tmp_fits),
             "-r", str(search_radius),
-            "-s", db_type,
             "-d", db_path,
             "-update",
-            "-o", str(tmp_fits),  # 輸出到臨時目錄
+            "-o", str(tmp_fits),
         ]
         if downsample > 1:
             cmd += ["-z", str(downsample)]
         if fov > 0:
             cmd += ["-fov", str(fov)]
+        # hint 座標：覆蓋 FITS 標頭的 RA/DEC，用於標頭座標不可靠的情況
+        # ASTAP -spd 為南極距（South Polar Distance）= 90 - DEC
+        if ra_hint_h is not None:
+            cmd += ["-ra", str(ra_hint_h)]
+        if dec_hint_deg is not None:
+            spd = 90.0 - dec_hint_deg
+            cmd += ["-spd", str(spd)]
 
         for attempt in range(max_retries):
             try:
@@ -450,49 +456,71 @@ def run_plate_solve(config_path: str | Path) -> None:
         raise ValueError("observation_config.yaml 裡沒有 obs_sessions。")
 
     for session in sessions:
-        target = session["target"]
+        # targets / target 雙格式相容（與 Calibration.py 一致）
+        raw_targets = session.get("targets", session.get("target", "UNKNOWN"))
+        targets_list: list[str] = (
+            [str(raw_targets)]
+            if isinstance(raw_targets, str)
+            else [str(t) for t in raw_targets]
+        )
         date = str(session["date"])
         data_root = cfg["_data_root"]
-        cal_dir = data_root / "targets" / target / "calibrated"
-        wcs_dir = cal_dir / "wcs"
-        wcs_dir.mkdir(parents=True, exist_ok=True)
 
-        fits_files = sorted(
-            f for f in cal_dir.glob("*.fits")
-            if f.is_file() and "wcs" not in f.stem.lower()
-        )
+        for target in targets_list:
+            cal_dir = data_root / "targets" / target / "calibrated"
+            wcs_dir = cal_dir / "wcs"
+            wcs_dir.mkdir(parents=True, exist_ok=True)
 
-        if not fits_files:
-            print(f"[SKIP] {target}/{date}：calibrated/ 目錄裡找不到 FITS。")
-            continue
+            fits_files = sorted(
+                f for f in cal_dir.glob("*.fits")
+                if f.is_file() and "wcs" not in f.stem.lower()
+            )
 
-        print(f"\n[Session] {target} / {date}  ({len(fits_files)} 幀)")
-
-        success = failed = skipped = 0
-        for fits_path in fits_files:
-            out_path = wcs_dir / (fits_path.stem + "_wcs.fits")
-
-            if out_path.exists():
-                skipped += 1
+            if not fits_files:
+                print(f"[SKIP] {target}/{date}：calibrated/ 目錄裡找不到 FITS。")
                 continue
 
-            print(f"  解算：{fits_path.name} … ", end="", flush=True)
+            print(f"\n[Session] {target} / {date}  ({len(fits_files)} 幀)")
 
-            if backend == "astap":
-                ok = _run_astap(fits_path, out_path, astap_cfg)
-            else:
-                ok = _run_astrometry_net(fits_path, out_path, anet_cfg)
+            # target 層級的座標 hint（用於 FITS 標頭 RA/DEC 不可靠的情況）
+            target_cfg = cfg.get("targets", {}).get(target, {})
+            ra_hint_h: float | None = target_cfg.get("ra_hint_h")
+            dec_hint_deg: float | None = target_cfg.get("dec_hint_deg")
+            if ra_hint_h is not None or dec_hint_deg is not None:
+                print(
+                    f"  [INFO] 使用座標 hint："
+                    f"RA={ra_hint_h}h  DEC={dec_hint_deg}°"
+                )
 
-            if ok:
-                print("✓")
-                success += 1
-            else:
-                print("✗")
-                failed += 1
+            success = failed = skipped = 0
+            for fits_path in fits_files:
+                out_path = wcs_dir / (fits_path.stem + "_wcs.fits")
 
-        print(f"\n[完成] {target}/{date}：成功 {success}，失敗 {failed}，"
-              f"已跳過（存在）{skipped}")
-        print(f"       WCS 輸出目錄：{wcs_dir}")
+                if out_path.exists():
+                    skipped += 1
+                    continue
+
+                print(f"  解算：{fits_path.name} … ", end="", flush=True)
+
+                if backend == "astap":
+                    ok = _run_astap(
+                        fits_path, out_path, astap_cfg,
+                        ra_hint_h=ra_hint_h,
+                        dec_hint_deg=dec_hint_deg,
+                    )
+                else:
+                    ok = _run_astrometry_net(fits_path, out_path, anet_cfg)
+
+                if ok:
+                    print("✓")
+                    success += 1
+                else:
+                    print("✗")
+                    failed += 1
+
+            print(f"\n[完成] {target}/{date}：成功 {success}，失敗 {failed}，"
+                  f"已跳過（存在）{skipped}")
+            print(f"       WCS 輸出目錄：{wcs_dir}")
 
     print("\n" + "🔭 " * 20)
     print("所有 Session 星圖解算完成。")
