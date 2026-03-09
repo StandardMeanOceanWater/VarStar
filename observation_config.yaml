@@ -1,0 +1,254 @@
+# ============================================================
+# 變星測光管線設定檔  Variable Star Pipeline Configuration
+# 版本：v2.1  |  日期：2026-03-09
+# 修改這個檔案即可切換目標、路徑、儀器參數
+# ============================================================
+
+# -----------------------------------------------------------------------------
+# 1. 環境路徑 (Paths)
+# 程式自動偵測環境，不需手動改
+# -----------------------------------------------------------------------------
+paths:
+  local:
+    project_root: "D:/VarStar"
+  colab:
+    project_root: "/content/drive/Shareddrives/VarStar"
+
+# -----------------------------------------------------------------------------
+# 2. 望遠鏡設定 (Telescopes)
+# -----------------------------------------------------------------------------
+telescopes:
+  VixenR200SS:
+    name: "Vixen R200SS"
+    focal_length_mm: 800.0
+    aperture_mm: 200.0
+    # plate_scale 由程式自動計算：206.265 × pixel_size_um / focal_length_mm
+
+# -----------------------------------------------------------------------------
+# 3. 相機設定 (Cameras)
+# -----------------------------------------------------------------------------
+cameras:
+  Canon6D2:
+    name: "Canon EOS 6D Mark II"
+    pixel_size_um: 5.76           #CANON原廠尺寸除以像素取數值，並平均長和寬
+    sensor_width_px: 6720
+    sensor_height_px: 4480
+    bayer_pattern: "RGGB"
+    camera_model: "Canon_6D2"
+    ir_cut_modified: true         # 已改機移除 IR cut filter
+    saturation_adu: 11469         # 14-bit 滿井的 70%（線性響應安全上限）
+    sensor_db:
+   # 來源：photonstophotos.net ISO 100 實測值線性推算
+   # gain = 7.428 / 32；read_noise = σ_READ(ISO100, DN) × gain
+   # 警告：高 ISO 類比/數位增益混用，read_noise 為下限估計
+   # 待以 master flat pair（ISO 3200）PTC 實測取代
+     3200: [0.232, 1.69]
+
+# -----------------------------------------------------------------------------
+# 4. 觀測 Session 設定 (Observation Sessions)
+# -----------------------------------------------------------------------------
+obs_sessions:
+  - date: "20251122"
+    telescope: "VixenR200SS"
+    camera: "Canon6D2"
+    targets: ["AlVel", "CCAnd", "SXPhe"]
+    calibration_date: "20251122"
+
+  - date: "20251220"
+    telescope: "VixenR200SS"
+    camera: "Canon6D2"
+    targets: ["V1162Ori"]
+    calibration_date: "20251220"
+ 
+# -----------------------------------------------------------------------------
+# 5. 校正參數 (Calibration)
+# -----------------------------------------------------------------------------
+calibration:
+  tz_offset_hours: 8              # 台灣 UTC+8，用於 EXIF 時間轉換
+  chunk_size: 10                  # Remedian 每批幀數（RAM 控制）
+  bad_pixel_threshold: 0.3        # Flat 歸一化後低於此值視為壞像素
+  sigma_clip_sigma: 3.0
+  sigma_clip_iters: 5
+  save_masters: true
+
+# -----------------------------------------------------------------------------
+# 6. 星圖解算 (Astrometry)
+# -----------------------------------------------------------------------------
+astrometry:
+  backend: "auto"
+  # auto 邏輯：偵測到 google.colab → astrometry_net；否則 → astap
+  output: "wcs_subdir"
+
+  astap:
+    executable: "C:/Program Files/astap/astap_cli.exe"
+    db_path: "C:/Program Files/astap/d80"
+    search_radius_deg: 30.0
+    downsample: 2
+    fov_override_deg: 1.61
+    speed: "slow"
+    timeout_sec: 180
+    max_retries: 2
+
+  astrometry_net:
+    api_key: ""
+    upload_downsample: 4
+    timeout_sec: 300
+
+# -----------------------------------------------------------------------------
+# 7. Bayer 拆色 (DeBayer)
+# -----------------------------------------------------------------------------
+debayer:
+  channels_output: ["R", "G1", "B"]   # G2 只做驗證，不輸出獨立光變曲線
+  use_g2_as_independent: false
+
+# -----------------------------------------------------------------------------
+# 8. 比較星選取 (Comparison Stars)
+# -----------------------------------------------------------------------------
+comparison_stars:
+  search_radius_arcmin: 40.0
+  min_stars: 3
+  max_stars: 15
+  min_separation_arcsec: 10.0
+  mag_range_delta: 2.0
+  catalog_priority: ["AAVSO", "APASS"]
+  aavso_min_stars: 5
+  aavso_fov_arcmin: 100
+  aavso_maglimit: 15.0
+  apass_radius_deg: 1.0
+  apass_match_arcsec: 2.0
+  check_star_max_sigma: 0.02
+  save_zeropoint_diagnostic: true
+
+# -----------------------------------------------------------------------------
+# 9. 孔徑測光 (Aperture Photometry)
+# -----------------------------------------------------------------------------
+photometry:
+  channels: ["R", "G1", "B"]
+  use_g2_as_independent: false
+  robust_regression_sigma: 3.0
+  robust_regression_max_iter: 5
+  robust_regression_min_points: 3
+  aperture_growth_radii: [3, 4, 5, 6, 7, 8, 10, 12, 15]  # pixels
+  sky_annulus_inner_px: 15
+  sky_annulus_outer_px: 25
+  max_fwhm_px: 8.0
+
+# -----------------------------------------------------------------------------
+# 10. 時間系統 (Timing)
+# -----------------------------------------------------------------------------
+timing:
+  output_timescale: "BJD_TDB"
+  use_midpoint: true
+  ephemeris: "de432s"
+  fits_time_keys:
+    - "DATE-OBS"
+    - "DATE-BEG"
+    - "TIME-OBS"
+  fits_exptime_keys:
+    - "EXPTIME"
+    - "EXPOSURE"
+    - "EXP_TIME"
+
+# -----------------------------------------------------------------------------
+# 11. 大氣消光修正 (Atmospheric Extinction)
+# -----------------------------------------------------------------------------
+extinction:
+  coefficients:
+    R: 0.10
+    G: 0.13
+    B: 0.22
+  airmass_method: "young1994"
+  max_airmass: 2.5
+
+# -----------------------------------------------------------------------------
+# 12. 週期分析 (Period Analysis)
+# 本區段控制 period_analysis.py（使用者選用進階模組）
+# photometry.py 內建的 LS 區段為管線標準輸出，不受此區段控制
+# -----------------------------------------------------------------------------
+period_analysis:
+
+  # Lomb-Scargle 週期圖
+  lomb_scargle:
+    method: "astropy"               # astropy.timeseries.LombScargle
+    normalization: "standard"       # "standard" | "model" | "log"
+    period_min_hr: 0.5              # 搜尋週期下限（小時）
+    period_max_hr: 24.0             # 搜尋週期上限（小時）
+    oversampling: 10                # 頻率格網 oversampling 因子
+
+    # FAP 計算：bootstrap 迭代至收斂或上限，取先到者
+    fap_method: "bootstrap"
+    fap_bootstrap_max_iter: 1000    # 硬性上限
+    fap_bootstrap_converge_window: 100   # 每 N 次檢查一次收斂
+    fap_bootstrap_converge_tol: 0.05     # 相鄰視窗 FAP 相對變化 < 5% 視為收斂
+    fap_threshold: 0.001            # FAP < 0.1% 視為顯著週期
+
+  # 傅立葉擬合
+  fourier_fit:
+    max_harmonics: 8                # 諧波數上限（Delta Scuti 建議 4–8）
+    model_selection: "BIC"          # BIC 最小化自動選階數
+    min_data_points: 50             # 低於此點數不進行擬合
+
+  # 預白化 (Pre-whitening)
+  pre_whitening:
+    enabled: true                   # 設為 false 可關閉
+    sn_threshold: 4.0               # 殘差 S/N < 此值停止（Breger et al., 1993）
+    max_frequencies: 10             # 最多萃取頻率數（防止無窮迴圈）
+    # CSV 輸出預留（目前停用）
+    save_csv: false                 # 待日後啟用：每個萃取頻率的參數
+
+# -----------------------------------------------------------------------------
+# 13. 輸出設定 (Output)
+# -----------------------------------------------------------------------------
+output:
+  photometry_csv_columns:
+    - "BJD_TDB"
+    - "mag"
+    - "mag_err"
+    - "flux"
+    - "flux_err"
+    - "zero_point"
+    - "zp_err"
+    - "airmass"
+    - "fwhm_px"
+    - "sky_bg"
+    - "flag"
+
+  quality_flags:
+    ok: 0
+    saturated: 1
+    near_edge: 2
+    high_airmass: 4
+    poor_wcs: 8
+    few_comp_stars: 16
+
+  plots:
+    dpi: 150
+    format: "png"
+    figsize_light_curve: [12, 5]
+    figsize_periodogram: [10, 4]
+    figsize_phase_folded: [8, 5]
+    figsize_prewhitening: [15, 4]   # 預白化診斷圖（每次迭代 1 列）
+
+  report:
+    format: "md"
+    include_sections:
+      - "instrument_summary"
+      - "observation_log"
+      - "comparison_stars_table"
+      - "zero_point_diagnostics"
+      - "light_curve"
+      - "periodogram"
+      - "phase_folded_curve"
+      - "fourier_parameters"
+      - "prewhitening_summary"      # 新增：預白化結果摘要
+
+# -----------------------------------------------------------------------------
+# 14. 管線行為 (Pipeline Behavior)
+# -----------------------------------------------------------------------------
+pipeline:
+  skip_existing: true
+  log_level: "INFO"
+  log_file: "pipeline/logs/pipeline_{date}.log"
+  parallel: false
+  n_workers: 1
+  keep_intermediates: true
