@@ -53,12 +53,16 @@ obs_sessions:
     camera: "Canon6D2"
     targets: ["AlVel", "CCAnd", "SXPhe"]
     calibration_date: "20251122"
+    dark_temp_c: 5.3    # 或 null
+    light_temp_c: 7  # 或 null
 
   - date: "20251220"
     telescope: "VixenR200SS"
     camera: "Canon6D2"
     targets: ["V1162Ori"]
     calibration_date: "20251220"
+    dark_temp_c: 3.7    # 或 null
+    light_temp_c: 4     # 或 null
  
 # -----------------------------------------------------------------------------
 # 5. 校正參數 (Calibration)

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 import shutil
 import tempfile
 import warnings
@@ -64,14 +65,22 @@ Header = fits.Header
 # 設定載入
 # =============================================================================
 
-def _detect_project_root(cfg: dict) -> Path:
-    """自動偵測執行環境，回傳對應的 project_root。"""
+def _detect_project_root(cfg: dict, config_path: Path) -> Path:
+    """
+    自動偵測執行環境，回傳對應的 project_root。
+
+    若 yaml 填相對路徑（例如 ".."），以 yaml 檔所在目錄為錨點解析，
+    使整個專案資料夾可自由搬移而不需修改 yaml。
+    """
     try:
         import google.colab  # noqa: F401
         root = cfg["paths"]["colab"]["project_root"]
     except (ImportError, KeyError):
         root = cfg["paths"]["local"]["project_root"]
-    return Path(root)
+    p = Path(root)
+    if not p.is_absolute():
+        p = (config_path.parent / p).resolve()
+    return p
 
 
 def load_config(config_path: str | Path) -> dict:
@@ -102,7 +111,7 @@ def load_config(config_path: str | Path) -> dict:
     with config_path.open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
 
-    project_root = _detect_project_root(cfg)
+    project_root = _detect_project_root(cfg, config_path)
     cfg["_project_root"] = project_root
     cfg["_data_root"] = project_root / "data"
     return cfg
@@ -123,6 +132,14 @@ def resolve_session_paths(
         先找 targets/{target}/raw/{date}/{type}/
         找不到再找 shared_calibration/{date}/{type}/
 
+    Dark 子目錄選取（_find_dark_dir）：
+        1. dark/ 根層直接有影像 → 直接使用（向下相容）
+        2. 有子目錄：
+           a. 解析子目錄名稱，格式 ^[數字][.數字]C$（例如 3.7C、5C）
+           b. 若 session 有 light_temp_c：選溫度最接近者
+           c. 若無 light_temp_c：選溫度最低者（dark current 最小，殘差方向較安全）
+           d. 子目錄無法解析溫度：[WARN] 後選第一個（按名稱排序）
+
     Parameters
     ----------
     cfg     : 完整設定字典。
@@ -132,16 +149,31 @@ def resolve_session_paths(
     -------
     Dict[str, Path]
         包含 light_dir, dark_dir, flat_dir, bias_dir,
-        calibrated_dir, masters_dir 的路徑字典。
+        calibrated_dir, masters_dir, dark_temp_c 的字典。
+        dark_temp_c 為 float 或 None，供 run_calibration() 寫入 FITS 標頭。
     """
+    # ── 正則：子目錄溫度解析，例如 "3.7C"、"5C"、"10.0c" ──────────────────
+    _TEMP_RE = re.compile(r'^(\d+\.?\d*)[Cc]$')
+
     data_root = cfg["_data_root"]
-    target = session["target"]
     date = str(session["date"])
+    # targets / target 雙格式相容
+    raw_targets = session.get("targets", session.get("target", ""))
+    target = (
+        raw_targets[0]
+        if isinstance(raw_targets, list)
+        else str(raw_targets)
+    )
 
     target_root = data_root / "targets" / target
     shared_cal = data_root / "shared_calibration" / date
 
+    light_temp_c: Optional[float] = session.get("light_temp_c")
+    if light_temp_c is not None:
+        light_temp_c = float(light_temp_c)
+
     def _find_cal_dir(frame_type: str) -> Optional[Path]:
+        """非 dark 的通用搜尋：target-local 優先，次選 shared。"""
         local = target_root / "raw" / date / frame_type
         if local.exists() and any(local.iterdir()):
             return local
@@ -150,13 +182,106 @@ def resolve_session_paths(
             return shared
         return None
 
+    def _parse_temp(subdir: Path) -> Optional[float]:
+        """嘗試從子目錄名稱解析溫度（°C）；失敗回傳 None。"""
+        m = _TEMP_RE.match(subdir.name)
+        return float(m.group(1)) if m else None
+
+    def _has_images(directory: Path) -> bool:
+        """判斷目錄內是否有支援格式的影像（不遞迴）。"""
+        valid_exts = {".fit", ".fits", ".cr2"}
+        return any(
+            f.is_file() and f.suffix.lower() in valid_exts
+            for f in directory.iterdir()
+        )
+
+    def _find_dark_dir() -> Tuple[Optional[Path], Optional[float]]:
+        """
+        找 dark 目錄，回傳 (path, resolved_dark_temp_c)。
+
+        resolved_dark_temp_c 優先取 session['dark_temp_c']；
+        若未填，則從子目錄名稱解析。
+        """
+        # 候選位置（target-local 優先）
+        candidates = [
+            target_root / "raw" / date / "dark",
+            shared_cal / "dark",
+        ]
+        explicit_temp: Optional[float] = session.get("dark_temp_c")
+        if explicit_temp is not None:
+            explicit_temp = float(explicit_temp)
+
+        for dark_root in candidates:
+            if not dark_root.exists():
+                continue
+
+            # ── 情況 1：根層直接有影像 ────────────────────────────────────
+            if _has_images(dark_root):
+                return dark_root, explicit_temp
+
+            # ── 情況 2：有子目錄 ──────────────────────────────────────────
+            subdirs = sorted(
+                [d for d in dark_root.iterdir() if d.is_dir()],
+                key=lambda d: d.name,
+            )
+            if not subdirs:
+                continue
+
+            # 解析各子目錄溫度
+            parsed: List[Tuple[float, Path]] = []
+            unparsed: List[Path] = []
+            for sd in subdirs:
+                if not _has_images(sd):
+                    continue
+                t = _parse_temp(sd)
+                if t is not None:
+                    parsed.append((t, sd))
+                else:
+                    unparsed.append(sd)
+
+            if parsed:
+                ref_temp = light_temp_c  # 以觀測溫度為基準
+                if ref_temp is not None:
+                    # 選最接近觀測溫度的 dark
+                    chosen_temp, chosen_dir = min(
+                        parsed, key=lambda x: abs(x[0] - ref_temp)
+                    )
+                else:
+                    # 無觀測溫度：選最低溫（dark current 最小）
+                    chosen_temp, chosen_dir = min(parsed, key=lambda x: x[0])
+                    print(
+                        f"  [WARN] session 未填 light_temp_c，"
+                        f"dark 子目錄自動選最低溫：{chosen_dir.name}"
+                    )
+                resolved_temp = (
+                    explicit_temp
+                    if explicit_temp is not None
+                    else chosen_temp
+                )
+                return chosen_dir, resolved_temp
+
+            # 全部無法解析溫度
+            if unparsed:
+                print(
+                    f"  [WARN] dark 子目錄名稱無法解析溫度，"
+                    f"已選第一個：{unparsed[0].name}。"
+                    f"可用子目錄：{[d.name for d in unparsed]}"
+                )
+                return unparsed[0], explicit_temp
+
+        return None, None
+
+    dark_dir, resolved_dark_temp = _find_dark_dir()
+
     return {
         "light_dir": target_root / "raw" / date / "light",
-        "dark_dir": _find_cal_dir("dark"),
+        "dark_dir": dark_dir,
         "flat_dir": _find_cal_dir("flat"),
         "bias_dir": _find_cal_dir("bias"),
         "calibrated_dir": target_root / "calibrated",
         "masters_dir": target_root / "calibrated" / "masters",
+        "dark_temp_c": resolved_dark_temp,
+        "light_temp_c": light_temp_c,
     }
 
 
@@ -541,24 +666,32 @@ def run_calibration(config_path: str | Path) -> None:
     print("=" * 60)
 
     for session in sessions:
-        target = session["target"]
+        # targets / target 雙格式相容
+        raw_targets = session.get("targets", session.get("target", "UNKNOWN"))
+        targets_list: List[str] = (
+            [str(raw_targets)]
+            if isinstance(raw_targets, str)
+            else [str(t) for t in raw_targets]
+        )
         date = str(session["date"])
         telescope_id = session.get("telescope", "")
         camera_id = session.get("camera", "")
         iso = int(session.get("iso", 0))
 
-        print(f"\n[Session] 目標：{target}  日期：{date}  "
-              f"儀器：{telescope_id} + {camera_id}  ISO：{iso}")
-
-        # ── 取得儀器參數 ────────────────────────────────────────────────────
+        # ── 取得儀器參數（session 共用，在 target 迴圈外取一次）────────────
         cam_cfg = cfg.get("cameras", {}).get(camera_id, {})
         tz_offset = int(
-            cfg.get("instrument", {}).get("camera_timezone_offset_hours", 8)
+            cfg.get("calibration", {}).get("tz_offset_hours", 8)
         )
         sensor_db = cam_cfg.get("sensor_db", {})
         iso_entry = sensor_db.get(iso, {})
-        gain_e = iso_entry.get("gain")
-        rn_e = iso_entry.get("read_noise")
+        # sensor_db 值為 [gain, read_noise] 列表或 dict 兩種格式均相容
+        if isinstance(iso_entry, (list, tuple)):
+            gain_e: Optional[float] = float(iso_entry[0]) if len(iso_entry) > 0 else None
+            rn_e: Optional[float] = float(iso_entry[1]) if len(iso_entry) > 1 else None
+        else:
+            gain_e = iso_entry.get("gain")
+            rn_e = iso_entry.get("read_noise")
         sat_adu = cam_cfg.get("saturation_adu")
 
         if gain_e is None:
@@ -566,22 +699,40 @@ def run_calibration(config_path: str | Path) -> None:
         if rn_e is None:
             print(f"  [WARN] sensor_db 缺少 ISO {iso} 的 read_noise，FITS RDNOISE 標頭將空白。")
 
-        # ── 路徑解析 ────────────────────────────────────────────────────────
-        paths = resolve_session_paths(cfg, session)
-        light_files = _list_image_files(paths["light_dir"])
+        # ── Master 幀：同一 session 所有 target 共用，只合成一次 ────────────
+        # 路徑解析用 targets_list[0] 代表該 session（calibration 幀共用）
+        _ref_session = dict(session)
+        _ref_session["target"] = targets_list[0]
+        paths_ref = resolve_session_paths(cfg, _ref_session)
 
-        if not light_files:
-            print(f"  [SKIP] 找不到 Light 幀：{paths['light_dir']}")
-            continue
+        dark_temp_c: Optional[float] = paths_ref.get("dark_temp_c")
+        light_temp_c_val: Optional[float] = paths_ref.get("light_temp_c")
 
-        dark_files = _list_image_files(paths["dark_dir"])
-        flat_files = _list_image_files(paths["flat_dir"])
-        bias_files = _list_image_files(paths["bias_dir"])
+        dark_tmp_str = (
+            f"{dark_temp_c:.1f} °C" if dark_temp_c is not None else "未知"
+        )
+        light_tmp_str = (
+            f"{light_temp_c_val:.1f} °C"
+            if light_temp_c_val is not None
+            else "未知"
+        )
+        print(
+            f"\n[Session] 日期：{date}  "
+            f"儀器：{telescope_id} + {camera_id}  ISO：{iso}"
+        )
+        print(f"  暗場溫度：{dark_tmp_str}  / 觀測溫度：{light_tmp_str}")
 
-        print(f"  Light  : {len(light_files)} 幀  →  {paths['light_dir']}")
-        print(f"  Dark   : {len(dark_files)} 幀  →  {paths['dark_dir']}")
-        print(f"  Flat   : {len(flat_files)} 幀  →  {paths['flat_dir']}")
-        print(f"  Bias   : {len(bias_files)} 幀  →  {paths['bias_dir']}")
+        if dark_temp_c is not None and light_temp_c_val is not None:
+            temp_diff = abs(light_temp_c_val - dark_temp_c)
+            if temp_diff > 10.0:
+                print(
+                    f"  [WARN] 暗場與觀測溫差 {temp_diff:.1f} °C > 10 °C，"
+                    f"暗電流縮放殘差可能顯著。建議補拍接近觀測溫度的暗場。"
+                )
+
+        dark_files = _list_image_files(paths_ref["dark_dir"])
+        flat_files = _list_image_files(paths_ref["flat_dir"])
+        bias_files = _list_image_files(paths_ref["bias_dir"])
 
         cal_mode = determine_cal_mode(
             has_dark=len(dark_files) > 0,
@@ -590,19 +741,17 @@ def run_calibration(config_path: str | Path) -> None:
         )
         print(f"  校正模式（CAL_MODE）：{cal_mode}")
 
-        # ── 建立輸出目錄 ────────────────────────────────────────────────────
-        paths["calibrated_dir"].mkdir(parents=True, exist_ok=True)
-        paths["masters_dir"].mkdir(parents=True, exist_ok=True)
-        out_dir = paths["calibrated_dir"]
+        # 合成 Master 幀（masters 存到第一個 target 的目錄）
+        paths_ref["masters_dir"].mkdir(parents=True, exist_ok=True)
+        save_masters = cfg.get("calibration", {}).get("save_masters", True)
 
-        # ── 合成 Master 幀 ──────────────────────────────────────────────────
         master_bias: Optional[np.ndarray] = None
         if bias_files:
             master_bias = create_master(
                 bias_files, "Master Bias", chunk_size, tz_offset
             )
-            if cfg.get("output", {}).get("save_masters", True):
-                bias_out = paths["masters_dir"] / f"master_bias_{date}.fits"
+            if save_masters:
+                bias_out = paths_ref["masters_dir"] / f"master_bias_{date}.fits"
                 fits.writeto(bias_out, master_bias, overwrite=True)
                 print(f"  [儲存] Master Bias → {bias_out.name}")
 
@@ -611,14 +760,13 @@ def run_calibration(config_path: str | Path) -> None:
             dark_raw = create_master(
                 dark_files, "Master Dark", chunk_size, tz_offset
             )
-            # Dark 本身包含 Bias 電平，若同時有 Bias 先減去以分離 dark current
             master_dark = (
                 dark_raw - master_bias
                 if master_bias is not None
                 else dark_raw
             )
-            if cfg.get("output", {}).get("save_masters", True):
-                dark_out = paths["masters_dir"] / f"master_dark_{date}.fits"
+            if save_masters:
+                dark_out = paths_ref["masters_dir"] / f"master_dark_{date}.fits"
                 fits.writeto(dark_out, master_dark, overwrite=True)
                 print(f"  [儲存] Master Dark → {dark_out.name}")
 
@@ -632,73 +780,119 @@ def run_calibration(config_path: str | Path) -> None:
             )
             del flat_raw
             gc.collect()
-            if cfg.get("output", {}).get("save_masters", True):
-                flat_out = paths["masters_dir"] / f"master_flat_norm_{date}.fits"
+            if save_masters:
+                flat_out = (
+                    paths_ref["masters_dir"] / f"master_flat_norm_{date}.fits"
+                )
                 fits.writeto(flat_out, master_flat_norm, overwrite=True)
                 print(f"  [儲存] Master Flat（歸一化）→ {flat_out.name}")
 
-        # ── 逐幀校正 ────────────────────────────────────────────────────────
-        print(f"\n[校正] 開始逐幀校正 {len(light_files)} 張 Light 幀…")
+        # ── 逐 target 校正 ───────────────────────────────────────────────────
+        for target in targets_list:
+            print(f"\n[Target] {target}")
+            _t_session = dict(session)
+            _t_session["target"] = target
+            paths = resolve_session_paths(cfg, _t_session)
 
-        success = 0
-        failed = 0
-        for idx, light_path in enumerate(
-            tqdm(light_files, desc=f"{target} 校正進度")
-        ):
-            try:
-                light, header = read_raw_image(
-                    light_path,
-                    tz_offset_hours=tz_offset,
-                    gain_e_per_adu=gain_e,
-                    read_noise_e=rn_e,
-                    saturation_adu=sat_adu,
-                )
+            light_files = _list_image_files(paths["light_dir"])
+            if not light_files:
+                print(f"  [SKIP] 找不到 Light 幀：{paths['light_dir']}")
+                continue
 
-                # ── 天文校正公式 ────────────────────────────────────────────
-                cal = light.copy()
+            print(f"  Light  : {len(light_files)} 幀  →  {paths['light_dir']}")
+            print(f"  Dark   : {len(dark_files)} 幀  →  {paths_ref['dark_dir']}")
+            print(f"  Flat   : {len(flat_files)} 幀  →  {paths_ref['flat_dir']}")
+            print(f"  Bias   : {len(bias_files)} 幀  →  {paths_ref['bias_dir']}")
 
-                if master_dark is not None:
-                    cal -= master_dark
-                elif master_bias is not None:
-                    cal -= master_bias
+            paths["calibrated_dir"].mkdir(parents=True, exist_ok=True)
+            out_dir = paths["calibrated_dir"]
 
-                if master_flat_norm is not None:
-                    cal /= master_flat_norm
+            print(f"\n[校正] 開始逐幀校正 {len(light_files)} 張 Light 幀…")
+            success = 0
+            failed = 0
 
-                cal = cal.astype(np.float32)
+            for idx, light_path in enumerate(
+                tqdm(light_files, desc=f"{target} 校正進度")
+            ):
+                try:
+                    light, header = read_raw_image(
+                        light_path,
+                        tz_offset_hours=tz_offset,
+                        gain_e_per_adu=gain_e,
+                        read_noise_e=rn_e,
+                        saturation_adu=sat_adu,
+                    )
 
-                # ── 更新標頭 ────────────────────────────────────────────────
-                header["BITPIX"] = -32
-                header["CAL_MODE"] = (cal_mode, "Calibration frames used")
-                header["TELESCOP"] = (
-                    cfg.get("telescopes", {})
-                    .get(telescope_id, {})
-                    .get("name", telescope_id),
-                    "Telescope",
-                )
-                header["FOCALLEN"] = (
-                    cfg.get("telescopes", {})
-                    .get(telescope_id, {})
-                    .get("focal_length_mm", ""),
-                    "[mm] Focal length",
-                )
-                header["HISTORY"] = "Calibrated by Calibration.py (variable star pipeline)"
-                header["HISTORY"] = f"CAL_MODE={cal_mode}  ISO={iso}"
+                    # ── 天文校正公式 ────────────────────────────────────────
+                    cal = light.copy()
 
-                out_name = f"Cal_{light_path.stem}_{idx + 1:04d}.fits"
-                out_path = out_dir / out_name
+                    if master_dark is not None:
+                        cal -= master_dark
+                    elif master_bias is not None:
+                        cal -= master_bias
 
-                hdu = fits.PrimaryHDU(data=cal, header=header)
-                hdu.verify("silentfix")
-                hdu.writeto(out_path, overwrite=True)
-                success += 1
+                    if master_flat_norm is not None:
+                        cal /= master_flat_norm
 
-            except Exception as exc:
-                print(f"\n  [失敗] {light_path.name}：{exc}")
-                failed += 1
+                    cal = cal.astype(np.float32)
 
-        print(f"\n[完成] {target} / {date}：成功 {success} 幀，失敗 {failed} 幀")
-        print(f"       輸出目錄：{out_dir}")
+                    # ── 更新標頭 ────────────────────────────────────────────
+                    header["BITPIX"] = -32
+                    header["CAL_MODE"] = (cal_mode, "Calibration frames used")
+
+                    header["DARKTMP"] = (
+                        float(dark_temp_c)
+                        if dark_temp_c is not None
+                        else "UNKNOWN",
+                        "[degC] Dark frame sensor temperature",
+                    )
+                    header["LIGHTTMP"] = (
+                        float(light_temp_c_val)
+                        if light_temp_c_val is not None
+                        else "UNKNOWN",
+                        "[degC] Light frame sensor temperature",
+                    )
+                    if dark_temp_c is not None and light_temp_c_val is not None:
+                        header["DTMPDIFF"] = (
+                            round(light_temp_c_val - dark_temp_c, 2),
+                            "[degC] Light minus Dark temperature",
+                        )
+                    else:
+                        header["DTMPDIFF"] = (
+                            "N/A", "[degC] Light minus Dark temperature"
+                        )
+
+                    header["TELESCOP"] = (
+                        cfg.get("telescopes", {})
+                        .get(telescope_id, {})
+                        .get("name", telescope_id),
+                        "Telescope",
+                    )
+                    header["FOCALLEN"] = (
+                        cfg.get("telescopes", {})
+                        .get(telescope_id, {})
+                        .get("focal_length_mm", ""),
+                        "[mm] Focal length",
+                    )
+                    header["HISTORY"] = (
+                        "Calibrated by Calibration.py (variable star pipeline)"
+                    )
+                    header["HISTORY"] = f"CAL_MODE={cal_mode}  ISO={iso}"
+
+                    out_name = f"Cal_{light_path.stem}_{idx + 1:04d}.fits"
+                    out_path = out_dir / out_name
+
+                    hdu = fits.PrimaryHDU(data=cal, header=header)
+                    hdu.verify("silentfix")
+                    hdu.writeto(out_path, overwrite=True)
+                    success += 1
+
+                except Exception as exc:
+                    print(f"\n  [失敗] {light_path.name}：{exc}")
+                    failed += 1
+
+            print(f"\n[完成] {target} / {date}：成功 {success} 幀，失敗 {failed} 幀")
+            print(f"       輸出目錄：{out_dir}")
 
         # 釋放 Master 幀記憶體供下一個 session 使用
         del master_bias, master_dark, master_flat_norm

@@ -104,7 +104,22 @@ def _load_config(config_path: Optional[Path]) -> Dict:
     try:
         with open(config_path, "r", encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh)
-        return cfg if cfg else _DEFAULT_CONFIG
+        if not cfg:
+            return _DEFAULT_CONFIG
+
+        # ── 推算 project_root（支援相對路徑）────────────────────────────────
+        try:
+            import google.colab  # noqa: F401
+            root = cfg["paths"]["colab"]["project_root"]
+        except (ImportError, KeyError):
+            root = cfg["paths"]["local"]["project_root"]
+        p = Path(root)
+        if not p.is_absolute():
+            p = (Path(config_path).parent / p).resolve()
+        cfg["_project_root"] = p
+        cfg["_data_root"] = p / "data"
+
+        return cfg
     except yaml.YAMLError as exc:
         logger.warning("observation_config.yaml 解析失敗：%s，使用預設參數。", exc)
         return _DEFAULT_CONFIG

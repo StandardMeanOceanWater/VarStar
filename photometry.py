@@ -77,12 +77,16 @@ def _find_config() -> Path:
     )
 
 
-def _detect_project_root(cfg_dict: dict) -> Path:
+def _detect_project_root(cfg_dict: dict, config_path: Path) -> Path:
     try:
         import google.colab  # noqa: F401
-        return Path(cfg_dict["paths"]["colab"]["project_root"])
+        root = cfg_dict["paths"]["colab"]["project_root"]
     except (ImportError, KeyError):
-        return Path(cfg_dict["paths"]["local"]["project_root"])
+        root = cfg_dict["paths"]["local"]["project_root"]
+    p = Path(root)
+    if not p.is_absolute():
+        p = (config_path.parent / p).resolve()
+    return p
 
 
 def load_pipeline_config(config_path: Path | None = None) -> dict:
@@ -90,7 +94,7 @@ def load_pipeline_config(config_path: Path | None = None) -> dict:
         config_path = _find_config()
     with config_path.open("r", encoding="utf-8") as fh:
         cfg_dict = yaml.safe_load(fh)
-    cfg_dict["_project_root"] = _detect_project_root(cfg_dict)
+    cfg_dict["_project_root"] = _detect_project_root(cfg_dict, config_path)
     cfg_dict["_data_root"] = cfg_dict["_project_root"] / "data"
     cfg_dict["_config_path"] = config_path
     return cfg_dict
