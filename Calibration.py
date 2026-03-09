@@ -157,13 +157,17 @@ def resolve_session_paths(
 
     data_root = cfg["_data_root"]
     date = str(session["date"])
-    # targets / target 雙格式相容
-    raw_targets = session.get("targets", session.get("target", ""))
-    target = (
-        raw_targets[0]
-        if isinstance(raw_targets, list)
-        else str(raw_targets)
-    )
+    # 優先讀單數 "target"（由 run_calibration 迴圈注入）；
+    # 若不存在才從 "targets" list 取第一個（直接呼叫時的 fallback）。
+    if "target" in session and session["target"]:
+        target = str(session["target"])
+    else:
+        raw_targets = session.get("targets", "")
+        target = (
+            raw_targets[0]
+            if isinstance(raw_targets, list)
+            else str(raw_targets)
+        )
 
     target_root = data_root / "targets" / target
     shared_cal = data_root / "shared_calibration" / date
@@ -274,12 +278,12 @@ def resolve_session_paths(
     dark_dir, resolved_dark_temp = _find_dark_dir()
 
     return {
-        "light_dir": target_root / "raw" / date / "light",
+        "light_dir": target_root / "raw" / date,
         "dark_dir": dark_dir,
         "flat_dir": _find_cal_dir("flat"),
         "bias_dir": _find_cal_dir("bias"),
         "calibrated_dir": target_root / "calibrated",
-        "masters_dir": target_root / "calibrated" / "masters",
+        "masters_dir": shared_cal / "masters",
         "dark_temp_c": resolved_dark_temp,
         "light_temp_c": light_temp_c,
     }
@@ -314,6 +318,7 @@ def read_raw_image(
     gain_e_per_adu: Optional[float] = None,
     read_noise_e: Optional[float] = None,
     saturation_adu: Optional[float] = None,
+    iso: Optional[int] = None,
 ) -> Tuple[np.ndarray, Header]:
     """
     多格式混合讀取引擎。
@@ -329,6 +334,7 @@ def read_raw_image(
     gain_e_per_adu  : 相機增益（e⁻/DN），由 sensor_db 傳入。
     read_noise_e    : 讀出雜訊（e⁻），由 sensor_db 傳入。
     saturation_adu  : 飽和閾值（DN）。
+    iso             : 相機 ISO 設定；None 表示未知。
 
     Returns
     -------
@@ -433,8 +439,10 @@ def read_raw_image(
         header["RDNOISE"] = (float(read_noise_e), "[e-] Read noise from sensor_db")
     if saturation_adu is not None:
         header["SATURATE"] = (float(saturation_adu), "[DN] 70% full-well saturation threshold")
+    if iso is not None and iso > 0:
+        header["ISOSPEED"] = (int(iso), "[ISO] Camera ISO speed setting")
 
-    header["DEBAYER"] = ("NO", "Preserved as RAW Bayer data — do NOT interpolate")
+    header["DEBAYER"] = ("NO", "Preserved as RAW Bayer data - do NOT interpolate")
     header.add_comment(
         "Linearity correction not applied. "
         "Canon 6D2 linearity error < 0.5% in 30%-85% full-well range "
@@ -683,6 +691,83 @@ def run_calibration(config_path: str | Path) -> None:
         tz_offset = int(
             cfg.get("calibration", {}).get("tz_offset_hours", 8)
         )
+
+        # ── Master 幀：同一 session 所有 target 共用，只合成一次 ────────────
+        # 路徑解析用 targets_list[0] 代表該 session（calibration 幀共用）
+        _ref_session = dict(session)
+        _ref_session["target"] = targets_list[0]
+        paths_ref = resolve_session_paths(cfg, _ref_session)
+
+        # ── ISO fallback：yaml → 第一張 light 檔 EXIF/標頭 → 0（[WARN]）──
+        # yaml 填 iso > 0：直接使用，最優先
+        # yaml 未填或填 0：從第一張 light 檔讀取
+        #   CR2  → exifread EXIF ISOSpeedRatings
+        #   FITS → astropy FITS 標頭 ISOSPEED
+        # 兩者都失敗：iso = 0，發出 [WARN]
+        if iso == 0:
+            _light_dir = paths_ref["light_dir"]
+            _first_light: Optional[Path] = None
+            if _light_dir.exists():
+                for _ext in ("*.CR2", "*.cr2", "*.fits", "*.FITS", "*.fit", "*.FIT"):
+                    _found = next(_light_dir.glob(_ext), None)
+                    if _found:
+                        _first_light = _found
+                        break
+
+            if _first_light is None:
+                print(
+                    f"  [WARN] yaml 未填 iso，且找不到 light 幀"
+                    f"（搜尋路徑：{_light_dir}），"
+                    "GAIN/RDNOISE 標頭將空白。"
+                )
+            elif _first_light.suffix.lower() == ".cr2":
+                try:
+                    with open(_first_light, "rb") as _fh:
+                        _tags = exifread.process_file(_fh, details=False)
+                    _iso_tag = _tags.get("EXIF ISOSpeedRatings")
+                    if _iso_tag:
+                        iso = int(str(_iso_tag))
+                        print(
+                            f"  [INFO] yaml 未填 iso，"
+                            f"從 CR2 EXIF 讀取：ISO {iso}"
+                        )
+                    else:
+                        print(
+                            "  [WARN] yaml 未填 iso，"
+                            "CR2 EXIF 無 ISOSpeedRatings，"
+                            "GAIN/RDNOISE 標頭將空白。"
+                        )
+                except Exception as _exc:
+                    print(
+                        f"  [WARN] yaml 未填 iso，"
+                        f"CR2 EXIF 讀取失敗（{_exc}），"
+                        "GAIN/RDNOISE 標頭將空白。"
+                    )
+            else:
+                # FITS：讀 ISOSPEED 標頭
+                try:
+                    _hdr = fits.getheader(_first_light)
+                    _iso_val = _hdr.get("ISOSPEED", 0)
+                    if _iso_val and int(_iso_val) > 0:
+                        iso = int(_iso_val)
+                        print(
+                            f"  [INFO] yaml 未填 iso，"
+                            f"從 FITS 標頭 ISOSPEED 讀取：ISO {iso}"
+                        )
+                    else:
+                        print(
+                            "  [WARN] yaml 未填 iso，"
+                            "FITS 標頭無 ISOSPEED，"
+                            "GAIN/RDNOISE 標頭將空白。"
+                        )
+                except Exception as _exc:
+                    print(
+                        f"  [WARN] yaml 未填 iso，"
+                        f"FITS 標頭讀取失敗（{_exc}），"
+                        "GAIN/RDNOISE 標頭將空白。"
+                    )
+
+        # ── sensor_db 查詢（iso 確定後）──────────────────────────────────────
         sensor_db = cam_cfg.get("sensor_db", {})
         iso_entry = sensor_db.get(iso, {})
         # sensor_db 值為 [gain, read_noise] 列表或 dict 兩種格式均相容
@@ -698,12 +783,6 @@ def run_calibration(config_path: str | Path) -> None:
             print(f"  [WARN] sensor_db 缺少 ISO {iso} 的 gain，FITS GAIN 標頭將空白。")
         if rn_e is None:
             print(f"  [WARN] sensor_db 缺少 ISO {iso} 的 read_noise，FITS RDNOISE 標頭將空白。")
-
-        # ── Master 幀：同一 session 所有 target 共用，只合成一次 ────────────
-        # 路徑解析用 targets_list[0] 代表該 session（calibration 幀共用）
-        _ref_session = dict(session)
-        _ref_session["target"] = targets_list[0]
-        paths_ref = resolve_session_paths(cfg, _ref_session)
 
         dark_temp_c: Optional[float] = paths_ref.get("dark_temp_c")
         light_temp_c_val: Optional[float] = paths_ref.get("light_temp_c")
@@ -821,6 +900,7 @@ def run_calibration(config_path: str | Path) -> None:
                         gain_e_per_adu=gain_e,
                         read_noise_e=rn_e,
                         saturation_adu=sat_adu,
+                        iso=iso if iso > 0 else None,
                     )
 
                     # ── 天文校正公式 ────────────────────────────────────────

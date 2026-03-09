@@ -55,6 +55,7 @@ obs_sessions:
     calibration_date: "20251122"
     dark_temp_c: 5.3    # 或 null
     light_temp_c: 7  # 或 null
+    iso: 3200     
 
   - date: "20251220"
     telescope: "VixenR200SS"
