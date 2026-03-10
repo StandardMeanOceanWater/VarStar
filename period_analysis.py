@@ -858,11 +858,20 @@ def run_pre_whitening(
         for fig in fig_rows:
             plt.close(fig)
 
-    # CSV 預留（目前停用）
-    if save_csv:
-        # TODO：啟用時在此實作 CSV 輸出
-        # _save_prewhitening_csv(extracted, out_dir, target_name, channel)
-        logger.info("[Pre-whitening] save_csv=True 但函式尚未實作，略過。")
+    # CSV 輸出
+    if save_csv and extracted:
+        csv_path = out_dir / f"prewhitening_{target_name}_{channel}.csv"
+        rows = []
+        for i, e in enumerate(extracted, 1):
+            rows.append({
+                "iter": i,
+                "freq_d": e["freq"],
+                "period_d": e["period"],
+                "amplitude_mag": e["amplitude"],
+                "sn": e["sn"],
+            })
+        pd.DataFrame(rows).to_csv(csv_path, index=False, float_format="%.8f")
+        logger.info("[Pre-whitening] CSV 已儲存：%s", csv_path)
 
     return extracted
 
@@ -1016,7 +1025,11 @@ def run_period_analysis(
     )
 
     # 資料篩選
-    valid_cols = {"ok", "bjd_tdb", "m_var", "v_err"}
+    # ensemble_normalize 啟用時優先用 m_var_norm；否則退回 m_var
+    mag_col = "m_var_norm" if "m_var_norm" in df.columns else "m_var"
+    logger.info("週期分析使用欄位：%s", mag_col)
+
+    valid_cols = {"ok", "bjd_tdb", mag_col, "v_err"}
     missing = valid_cols - set(df.columns)
     if missing:
         raise ValueError(f"DataFrame 缺少必要欄位：{missing}")
@@ -1024,7 +1037,7 @@ def run_period_analysis(
     d = df[
         (df["ok"] == 1)
         & np.isfinite(df["bjd_tdb"])
-        & np.isfinite(df["m_var"])
+        & np.isfinite(df[mag_col])
         & np.isfinite(df["v_err"])
     ].copy()
 
@@ -1036,7 +1049,7 @@ def run_period_analysis(
         )
 
     t = d["bjd_tdb"].values
-    mag = d["m_var"].values
+    mag = d[mag_col].values
     err = d["v_err"].values
 
     logger.info(

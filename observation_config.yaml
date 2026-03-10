@@ -72,11 +72,31 @@ obs_sessions:
     obs_lon_deg: 120.885415
     obs_height_m: 2610
 
+# -----------------------------------------------------------------------------
+# 5. 目標星 hint 座標 (Targets)
+# plate_solve.py 用此區段傳 -ra / -spd 給 ASTAP，將盲搜範圍縮至 5°。
+# ra_hint_h  : RA（小時，十進制）
+# dec_hint_deg: Dec（度，十進制，南天為負）
+# display_name: AAVSO 查詢用星名（需有空格）
+# vmag_approx : 目標星亮度，影響比較星篩選範圍
+# -----------------------------------------------------------------------------
 targets:
   V1162Ori:
-    ra_hint_h: 5.5339     # 5h32m02.12s = 5.5339h
-    dec_hint_deg: -7.260  # -7°15'35"
- 
+    ra_hint_h: 5.572917      # astrometry.net 實測確認
+    dec_hint_deg: -6.971604
+    display_name: "V1162 Ori"
+    vmag_approx: 9.0
+  AlVel:
+    ra_hint_h: 8.745064
+    dec_hint_deg: -54.708833
+  CCAnd:
+    ra_hint_h: 23.647767
+    dec_hint_deg: 38.583972
+  SXPhe:
+    ra_hint_h: 23.775797
+    dec_hint_deg: -41.581667
+
+
 # -----------------------------------------------------------------------------
 # 5. 校正參數 (Calibration)
 # -----------------------------------------------------------------------------
@@ -126,9 +146,11 @@ comparison_stars:
   min_stars: 3
   max_stars: 15
   min_separation_arcsec: 10.0
-  mag_range_delta: 2.0
+  mag_range_delta: 5.0
+  comp_mag_min: 6.0         # 固定下限（不飽和）
+  comp_mag_max: 13.0        # 固定上限
   catalog_priority: ["AAVSO", "APASS"]
-  aavso_min_stars: 5
+  aavso_min_stars: 3
   aavso_fov_arcmin: 100
   aavso_maglimit: 15.0
   apass_radius_deg: 1.0
@@ -149,6 +171,10 @@ photometry:
   sky_annulus_inner_px: 15
   sky_annulus_outer_px: 25
   max_fwhm_px: 8.0
+  ensemble_normalize: true
+  ensemble_min_comp: 3
+  ensemble_max_iter: 10
+  ensemble_convergence_tol: 0.0001
 
 
 # -----------------------------------------------------------------------------
@@ -212,7 +238,7 @@ period_analysis:
     sn_threshold: 4.0               # 殘差 S/N < 此值停止（Breger et al., 1993）
     max_frequencies: 10             # 最多萃取頻率數（防止無窮迴圈）
     # CSV 輸出預留（目前停用）
-    save_csv: false                 # 待日後啟用：每個萃取頻率的參數
+    save_csv: true                  # 每個萃取頻率輸出至 prewhitening_{target}_{ch}.csv
 
 # -----------------------------------------------------------------------------
 # 13. 輸出設定 (Output)

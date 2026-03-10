@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 DeBayer_RGGB.py  —  Bayer 拆色模組
-專案：變星測光管線 v1.0
+專案：變星測光管線 v0.99
 描述：讀取 plate solve 後的 WCS FITS，按 Bayer pattern 拆分為
       R / G1 / G2 / B 四個通道，各自輸出為獨立 FITS。
 
@@ -204,8 +204,8 @@ def _build_channel_header(
 
     if "DATE-OBS" not in h:
         print(f"  [WARN] {channel_name}：原始 FITS 缺少 DATE-OBS，BJD_TDB 將無法計算。")
-    if "MID-OBS" not in h:
-        print(f"  [WARN] {channel_name}：原始 FITS 缺少 MID-OBS。")
+    #if "MID-OBS" not in h:
+    #    print(f"  [WARN] {channel_name}：原始 FITS 缺少 MID-OBS。")
 
     proc_time = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
     h["PROCDATE"] = (proc_time, "UTC time of Bayer split processing")

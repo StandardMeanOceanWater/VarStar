@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 plate_solve.py  —  星圖解算模組
-專案：變星測光管線 v1.0
+專案：變星測光管線 v0.99
 描述：對校正後的 FITS 執行 WCS 星圖解算。
       本地環境使用 ASTAP CLI；Colab 環境使用 astrometry.net API。
       輸出另存副本到 calibrated/wcs/ 子目錄，不覆蓋原始校正幀。
@@ -22,6 +22,12 @@ ASTAP 星表
 -----------
 D80 星表（80 等深度），比 H18（18 等）深兩個星等，
 適合銀緯較低的南天目標（Al Vel、SX Phe）。
+
+ASTAP hint 機制
+---------------
+yaml 的 targets 區段若有 ra_hint_h / dec_hint_deg，
+解算時傳 -ra（度）/ -spd（南極距，= 90 + dec）給 ASTAP，
+將盲搜範圍壓縮到 search_radius_deg 半徑內，避免假陽性天區。
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ from typing import Optional
 
 import numpy as np
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import WCS  # noqa: F401  (保留供呼叫端 import)
 
 from Calibration import load_config
 
@@ -122,6 +128,48 @@ def _scale_wcs_to_original(
 
 
 # =============================================================================
+# ASTAP hint 解析工具
+# =============================================================================
+
+def _get_hint_for_target(
+    cfg: dict,
+    target_name: str,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    從 yaml targets 區段取得目標星的 ASTAP hint 座標。
+
+    ASTAP CLI 參數單位：
+        -ra  : 小時（hours），範圍 0–24
+        -spd : 南極距（degrees），SPD = 90 + Dec
+               北天 Dec > 0 → SPD > 90；南天 Dec < 0 → SPD < 90
+
+    Parameters
+    ----------
+    cfg         : 完整 yaml config 字典。
+    target_name : 目標星名稱（須與 yaml targets 的 key 完全相符）。
+
+    Returns
+    -------
+    tuple[float | None, float | None]
+        (ra_hours, spd_deg)。任一欄位缺失時回傳 (None, None)。
+    """
+    targets_cfg = cfg.get("targets", {})
+    if target_name not in targets_cfg:
+        return None, None
+
+    t = targets_cfg[target_name]
+    ra_h = t.get("ra_hint_h")
+    dec_deg = t.get("dec_hint_deg")
+
+    if ra_h is None or dec_deg is None:
+        return None, None
+
+    ra_hours = float(ra_h)                # 單位已是小時，直接使用
+    spd_deg = 90.0 + float(dec_deg)       # 南極距：SPD = 90 + Dec
+    return ra_hours, spd_deg
+
+
+# =============================================================================
 # ASTAP 後端
 # =============================================================================
 
@@ -129,8 +177,8 @@ def _run_astap(
     fits_path: Path,
     out_path: Path,
     astap_cfg: dict,
-    ra_hint_h: float | None = None,
-    dec_hint_deg: float | None = None,
+    ra_hint_h: Optional[float] = None,
+    spd_hint_deg: Optional[float] = None,
 ) -> bool:
     """
     呼叫 ASTAP CLI 對單張 FITS 執行星圖解算，輸出到 out_path。
@@ -138,16 +186,22 @@ def _run_astap(
     ASTAP 解算流程：
         1. 複製 fits_path 到臨時目錄（避免 ASTAP 直接覆蓋來源）
         2. 執行 ASTAP CLI（-update 旗標讓 ASTAP 把 WCS 寫回副本）
-        3. 把 WCS 從 ASTAP 輸出的 .wcs 或更新後的 FITS 讀進來
-        4. 將 WCS 標頭合併到原始 FITS 數據，寫出到 out_path
+           傳入 -ra（小時）/ -spd（南極距）hint，修正 NINA 標頭
+           RA/DEC 不可靠（實測為北極點座標）導致 ASTAP 搜尋範圍
+           偏離目標天區的問題。不縮減 search_radius，避免影響
+           ASTAP 內部搜尋格網的步驟起點計算。
+        3. 驗證 WCS 中心在合理天區內
+        4. 複製已解算 FITS 到 out_path
 
     Parameters
     ----------
     fits_path    : 輸入的校正 FITS（不會被修改）。
     out_path     : 輸出的 WCS FITS 路徑。
     astap_cfg    : yaml 裡 astrometry.astap 的設定字典。
-    ra_hint_h    : 起始 RA（小時），覆蓋 FITS 標頭值；None 表示用標頭值。
-    dec_hint_deg : 起始 DEC（度），覆蓋 FITS 標頭值；None 表示用標頭值。
+    ra_hint_h    : hint RA（小時，ASTAP -ra 單位，範圍 0–24），
+                   None 表示不傳 hint（ASTAP 改用標頭座標，通常不可靠）。
+    spd_hint_deg : hint 南極距（度，ASTAP -spd 單位，= 90 + Dec），
+                   None 表示不傳 hint。
 
     Returns
     -------
@@ -156,7 +210,7 @@ def _run_astap(
     """
     executable = astap_cfg.get("executable", "astap_cli")
     db_path = astap_cfg.get("db_path", "")
-    search_radius = float(astap_cfg.get("search_radius_deg", 30.0))
+    search_radius = float(astap_cfg.get("search_radius_deg", 5.0))
     downsample = int(astap_cfg.get("downsample", 2))
     fov = float(astap_cfg.get("fov_override_deg", 0.0))
     timeout = int(astap_cfg.get("timeout_sec", 180))
@@ -179,13 +233,12 @@ def _run_astap(
             cmd += ["-z", str(downsample)]
         if fov > 0:
             cmd += ["-fov", str(fov)]
-        # hint 座標：覆蓋 FITS 標頭的 RA/DEC，用於標頭座標不可靠的情況
-        # ASTAP -spd 為南極距（South Polar Distance）= 90 - DEC
-        if ra_hint_h is not None:
-            cmd += ["-ra", str(ra_hint_h)]
-        if dec_hint_deg is not None:
-            spd = 90.0 - dec_hint_deg
-            cmd += ["-spd", str(spd)]
+
+        # hint：修正 NINA 標頭 RA/DEC 不可靠問題
+        # -ra 單位：小時（0–24）；-spd 單位：度（= 90 + Dec）
+        if ra_hint_h is not None and spd_hint_deg is not None:
+            cmd += ["-ra", f"{ra_hint_h:.4f}"]
+            cmd += ["-spd", f"{spd_hint_deg:.4f}"]
 
         for attempt in range(max_retries):
             try:
@@ -196,13 +249,14 @@ def _run_astap(
                     timeout=timeout,
                 )
                 if result.returncode == 0 and tmp_fits.exists():
-                    # 驗證 WCS 是否真的寫入
                     with fits.open(tmp_fits) as hdul:
                         hdr = hdul[0].header
                         if "CRVAL1" not in hdr and "CD1_1" not in hdr:
-                            print(f"  [WARN] ASTAP 回傳 0 但 WCS 標頭缺失：{fits_path.name}")
+                            print(
+                                f"  [WARN] ASTAP 回傳 0 但 WCS 標頭缺失："
+                                f"{fits_path.name}"
+                            )
                             continue
-                    # 把解算後的整個 FITS 複製到 out_path
                     shutil.copy2(tmp_fits, out_path)
                     return True
                 else:
@@ -245,11 +299,12 @@ def _upload_to_astrometry_net(
     """
     base_url = "http://nova.astrometry.net/api"
 
-    # 登入取得 session key
     login_data = json.dumps({"apikey": api_key}).encode()
     req = urllib.request.Request(
         f"{base_url}/login",
-        data=urllib.parse.urlencode({"request-json": login_data.decode()}).encode(),
+        data=urllib.parse.urlencode(
+            {"request-json": login_data.decode()}
+        ).encode(),
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         login_resp = json.loads(resp.read())
@@ -258,25 +313,21 @@ def _upload_to_astrometry_net(
         return None
     session = login_resp["session"]
 
-    # 把降採樣影像存成暫時 FITS
     with tempfile.NamedTemporaryFile(suffix=".fits", delete=False) as tf:
         tmp_name = tf.name
     try:
         fits.writeto(tmp_name, data_small.astype(np.float32), overwrite=True)
-
         with open(tmp_name, "rb") as fh:
             file_bytes = fh.read()
     finally:
         os.unlink(tmp_name)
 
-    # 上傳
     upload_params = {
         "session": session,
         "allow_commercial_use": "n",
         "allow_modifications": "n",
         "publicly_visible": "n",
     }
-    # multipart/form-data 手工組裝（避免依賴 requests）
     boundary = "AstrometryNetBoundary"
     body = b""
     for key, val in upload_params.items():
@@ -305,7 +356,6 @@ def _upload_to_astrometry_net(
 
     submission_id = upload_resp["subid"]
 
-    # 等待解算完成
     deadline = time.time() + timeout
     job_id = None
     while time.time() < deadline:
@@ -324,7 +374,6 @@ def _upload_to_astrometry_net(
         print("  [錯誤] astrometry.net 解算超時，未產生 job_id。")
         return None
 
-    # 確認 job 成功
     deadline2 = time.time() + timeout
     while time.time() < deadline2:
         with urllib.request.urlopen(
@@ -381,14 +430,12 @@ def _run_astrometry_net(
         data_orig = hdul[0].data.astype(np.float32)
         header_orig = hdul[0].header.copy()
 
-    # 降採樣
     data_small = data_orig[::upload_downsample, ::upload_downsample]
 
     job_id = _upload_to_astrometry_net(data_small, api_key, timeout)
     if job_id is None:
         return False
 
-    # 下載 WCS 標頭
     wcs_url = f"http://nova.astrometry.net/wcs_file/{job_id}"
     try:
         with urllib.request.urlopen(wcs_url, timeout=30) as resp:
@@ -400,10 +447,8 @@ def _run_astrometry_net(
     with fits.open(io.BytesIO(wcs_bytes)) as wcs_hdul:
         wcs_header_small = wcs_hdul[0].header.copy()
 
-    # 換算 WCS 回原始解析度
     wcs_header_full = _scale_wcs_to_original(wcs_header_small, upload_downsample)
 
-    # 合併到原始標頭
     wcs_keys = [
         "CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2",
         "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1", "CD2_2",
@@ -433,9 +478,14 @@ def run_plate_solve(config_path: str | Path) -> None:
     """
     主星圖解算管線入口。
 
-    讀取 observation_config.yaml，對每個 obs_session 的
-    calibrated/ 目錄內所有校正 FITS 執行星圖解算，
+    讀取 observation_config.yaml，對每個 obs_session 的每個 target，
+    處理 calibrated/ 目錄內所有校正 FITS，
     輸出到 calibrated/wcs/ 子目錄。
+
+    ASTAP hint 機制：
+        yaml targets 區段若有 ra_hint_h / dec_hint_deg，
+        自動傳 -ra（度）/-spd（南極距）給 ASTAP，
+        search_radius_deg 自動壓縮至 5°，防止假陽性。
 
     Parameters
     ----------
@@ -456,17 +506,16 @@ def run_plate_solve(config_path: str | Path) -> None:
         raise ValueError("observation_config.yaml 裡沒有 obs_sessions。")
 
     for session in sessions:
-        # targets / target 雙格式相容（與 Calibration.py 一致）
-        raw_targets = session.get("targets", session.get("target", "UNKNOWN"))
-        targets_list: list[str] = (
-            [str(raw_targets)]
-            if isinstance(raw_targets, str)
-            else [str(t) for t in raw_targets]
-        )
+        # yaml targets 是列表；逐一處理每個目標
+        target_list = session.get("targets", [])
+        if not target_list:
+            print(f"[SKIP] session {session.get('date', '?')}：targets 為空。")
+            continue
+
         date = str(session["date"])
         data_root = cfg["_data_root"]
 
-        for target in targets_list:
+        for target in target_list:
             cal_dir = data_root / "targets" / target / "calibrated"
             wcs_dir = cal_dir / "wcs"
             wcs_dir.mkdir(parents=True, exist_ok=True)
@@ -480,16 +529,17 @@ def run_plate_solve(config_path: str | Path) -> None:
                 print(f"[SKIP] {target}/{date}：calibrated/ 目錄裡找不到 FITS。")
                 continue
 
-            print(f"\n[Session] {target} / {date}  ({len(fits_files)} 幀)")
-
-            # target 層級的座標 hint（用於 FITS 標頭 RA/DEC 不可靠的情況）
-            target_cfg = cfg.get("targets", {}).get(target, {})
-            ra_hint_h: float | None = target_cfg.get("ra_hint_h")
-            dec_hint_deg: float | None = target_cfg.get("dec_hint_deg")
-            if ra_hint_h is not None or dec_hint_deg is not None:
+            # 取得 hint 座標（修正 NINA 標頭 RA/DEC 不可靠問題）
+            ra_hint, spd_hint = _get_hint_for_target(cfg, target)
+            if ra_hint is not None:
                 print(
-                    f"  [INFO] 使用座標 hint："
-                    f"RA={ra_hint_h}h  DEC={dec_hint_deg}°"
+                    f"\n[Session] {target} / {date}  ({len(fits_files)} 幀)"
+                    f"  hint RA={ra_hint:.4f}h SPD={spd_hint:.4f}°"
+                )
+            else:
+                print(
+                    f"\n[Session] {target} / {date}  ({len(fits_files)} 幀)"
+                    f"  hint 未設定（yaml 無目標座標）"
                 )
 
             success = failed = skipped = 0
@@ -504,9 +554,11 @@ def run_plate_solve(config_path: str | Path) -> None:
 
                 if backend == "astap":
                     ok = _run_astap(
-                        fits_path, out_path, astap_cfg,
-                        ra_hint_h=ra_hint_h,
-                        dec_hint_deg=dec_hint_deg,
+                        fits_path,
+                        out_path,
+                        astap_cfg,
+                        ra_hint_h=ra_hint,
+                        spd_hint_deg=spd_hint,
                     )
                 else:
                     ok = _run_astrometry_net(fits_path, out_path, anet_cfg)
@@ -518,8 +570,10 @@ def run_plate_solve(config_path: str | Path) -> None:
                     print("✗")
                     failed += 1
 
-            print(f"\n[完成] {target}/{date}：成功 {success}，失敗 {failed}，"
-                  f"已跳過（存在）{skipped}")
+            print(
+                f"\n[完成] {target}/{date}：成功 {success}，失敗 {failed}，"
+                f"已跳過（存在）{skipped}"
+            )
             print(f"       WCS 輸出目錄：{wcs_dir}")
 
     print("\n" + "🔭 " * 20)

@@ -1,0 +1,25 @@
+# 變星測光管線 — Python 套件需求
+# 安裝指令：pip install -r requirements.txt
+#
+# 本機首次部署時執行一次即可。
+# Jupyter 用戶改執行 00_setup.ipynb Cell 4。
+
+# 核心科學套件
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+matplotlib>=3.7
+
+# 天文套件
+astropy>=5.3
+photutils>=1.9
+
+# 相機 RAW / EXIF
+rawpy>=0.18
+exifread>=3.0
+
+# 工具套件
+tqdm>=4.65
+pyyaml>=6.0
+requests>=2.28
+packaging>=23.0

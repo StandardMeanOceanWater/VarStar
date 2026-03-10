@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 原始影像資料（體積大，不放 GitHub）
+../data/
+
+# Jupyter 執行產物
+.ipynb_checkpoints/
+
+# 系統
+.vscode/
+Thumbs.db
+
+# DESIGN_DECISIONS 舊版（只保留 v6）
+DESIGN_DECISIONS_v2.md
+DESIGN_DECISIONS_v3.1.md
+DESIGN_DECISIONS_v4.md
+DESIGN_DECISIONS_v5.docx

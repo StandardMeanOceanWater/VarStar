@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Calibration.py  —  天文科學級單張校正管線
-專案：變星測光管線 v1.0
+專案：變星測光管線 v0.99
 描述：讀取 observation_config.yaml，對 CR2 / FITS 格式的觀測幀執行
       Bias / Dark / Flat 校正，輸出保留 Bayer 排列的 float32 線性 FITS。
 
