@@ -377,8 +377,7 @@ BIC(N) = k·ln(n_data) − 2·ln(L̂)    k = 2N+1，高斯誤差假設
 | masters_dir 修正（§1.2） | Master 幀改存 `shared_calibration/{date}/masters/` | 多 target 共用同一組 masters |
 | ISO fallback 機制（§3.1） | yaml → CR2 EXIF → FITS ISOSPEED 三層 fallback | ISO 3200 自動偵測，GAIN/RDNOISE 標頭正確填入 |
 | 已知限制新增（§5） | #13 SXPhe 1s 曝光；#14 V1162Ori RA/DEC 標頭錯誤 | — |
-- [x] DeBayer_RGGB.py targets 列表支援（已實測通過，2026-03-10）
-- [x] DeBayer_RGGB.py em dash FITS header bug 修正（已實測通過，2026-03-10）
+
 ---
 
 ## 第八部分：實測結果彙整

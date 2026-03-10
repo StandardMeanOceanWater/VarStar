@@ -1,5 +1,5 @@
 # 變星測光管線 — 狀態快照
-**最後更新：2026-03-10 00:35 UTC+8 | 本檔永遠只有一份，直接覆蓋更新**
+**最後更新：2026-03-10 02:00 UTC+8 | 本檔永遠只有一份，直接覆蓋更新**
 
 ---
 
@@ -47,6 +47,8 @@
 - 背景：背景環中位數
 - 測光誤差：Merline & Howell (1995)
 - Airmass：Young (1994)
+- 高度角截斷：altitude < 45°（airmass > 1.413）的幀跳過，不寫入 CSV；location 未設定（airmass=NaN）時不截斷
+- APASS 波段對應：R→r'、G1/G2→V、B→B（決定零點回歸用哪個星等欄位）
 
 ### 週期分析
 - 主方法：Lomb-Scargle（astropy），DFT 交叉驗證
@@ -86,6 +88,8 @@
 - [ ] 預白化 CSV 輸出（yaml `save_csv: true` 時啟用，code 已預留）
 - [ ] Gaia DR3 比較星介面（目前輸出警告，未實作查詢）
 - [ ] `quality_report.py` 實作（第二批 D 組）
+- [x] DeBayer_RGGB.py targets 列表支援（已實測通過，2026-03-10）
+- [x] DeBayer_RGGB.py em dash FITS header bug 修正（已實測通過，2026-03-10）
 
 ---
 
@@ -104,6 +108,20 @@
 ---
 
 ## 5. 修訂歷程
+
+---
+
+### 2026-03-10 02:00 UTC+8
+
+**對話主題：photometry.py 高度角截斷、WARN 顯示修正**
+
+**`photometry.py` 修正兩項**
+1. 高度角截斷：altitude < 45°（airmass > 1.413, Young 1994）の幀輸出 `[SKIP]` 並跳過，不寫入 CSV。airmass=NaN（location 未設定）時不截斷。截斷閾值以 `Cfg.alt_min_deg` / `Cfg.alt_min_airmass` 儲存。
+2. WARN 顯示 bug 修正：`time_from_header()` 高 airmass 警告中，`alt_deg` 誤套 `90 - .alt.deg`（把高度角算成天頂距），改為直接取 `.alt.deg`。airmass 數值本身未受影響，僅訊息標籤錯誤。
+
+**不可翻案新增**
+- 高度角截斷 alt < 45° 為不可翻案（B 通道消光每 airmass ≈ 0.2 mag）
+- APASS 波段對應 R→r'、G1/G2→V、B→B 為不可翻案
 
 ---
 

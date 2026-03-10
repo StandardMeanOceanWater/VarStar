@@ -56,6 +56,9 @@ obs_sessions:
     dark_temp_c: 5.3    # 或 null
     light_temp_c: 7  # 或 null
     iso: 3200     
+    obs_lat_deg: 24.076856
+    obs_lon_deg: 121.171665
+    obs_height_m: 2106
 
   - date: "20251220"
     telescope: "VixenR200SS"
@@ -65,11 +68,14 @@ obs_sessions:
     dark_temp_c: 3.7    # 或 null
     light_temp_c: 4     # 或 null
     iso: 3200
+    obs_lat_deg: 23.481197
+    obs_lon_deg: 120.885415
+    obs_height_m: 2610
 
 targets:
   V1162Ori:
-    ra_hint_h: 5.507
-    dec_hint_deg: 5.11
+    ra_hint_h: 5.5339     # 5h32m02.12s = 5.5339h
+    dec_hint_deg: -7.260  # -7°15'35"
  
 # -----------------------------------------------------------------------------
 # 5. 校正參數 (Calibration)
@@ -143,6 +149,7 @@ photometry:
   sky_annulus_inner_px: 15
   sky_annulus_outer_px: 25
   max_fwhm_px: 8.0
+
 
 # -----------------------------------------------------------------------------
 # 10. 時間系統 (Timing)
