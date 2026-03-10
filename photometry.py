@@ -27,6 +27,9 @@ import subprocess
 import shutil
 import sys
 import os
+import logging
+import warnings
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +42,9 @@ from astropy.stats import sigma_clipped_stats
 from astropy.time import Time
 import matplotlib.pyplot as plt
 from photutils.detection import DAOStarFinder
+
+# ── Module-level logger（__main__ 會加 handler；函數直接用此 logger）──────────
+_phot_logger = logging.getLogger("photometry")
 
 # ── 自動偵測環境，找到 observation_config.yaml ────────────────────────────────
 def _find_config() -> Path:
@@ -173,8 +179,8 @@ class Cfg:
     # 低高度角時大氣消光急增，差分測光精度下降。
     # alt_min_deg=45° 對應 airmass ≈ 1.41（Young 1994）。
     # airmass=NaN（location 未設定）時不截斷。
-    alt_min_deg: float = 45.0
-    alt_min_airmass: float = 1.413   # sec(45°) by Young formula
+    alt_min_deg: float = 20.0
+    alt_min_airmass: float = 2.903   # Young (1994) at alt=20°
 
     # ── 穩健回歸 ──────────────────────────────────────────────────────────────
     robust_regression_sigma: float = 3.0
@@ -665,12 +671,12 @@ CAMERA_SENSOR_DB = {
 }
 
 # Airmass warning threshold  (X > 2.0 → altitude < ~30°)
-AIRMASS_WARN_THRESHOLD = 2.0
 
 ISO_HEADER_KEYS = [
     "ISO", "ISOSPEED", "ISOSPEEDRATINGS", "ISOSPEEDRATING", "ISO_SPEED",
 ]
 
+AIRMASS_WARN_THRESHOLD = 2.0   # alt ≈ 30°；低於此仰角輸出 WARN，仍繼續測光
 # camera_sensor_db 由 cfg_from_yaml() 從 yaml sensor_db 建立；
 # CAMERA_SENSOR_DB 為備用參考值，不在此處注入（避免覆蓋 yaml 設定）
 
@@ -962,8 +968,8 @@ def robust_zero_point(
     r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
     if r2 < 0.95:
-        print(f"[WARN] Zero-point fit R²={r2:.4f} < 0.95. "
-              "Check comparison star quality or airmass spread.")
+        _phot_logger.debug("[WARN] Zero-point fit R²=%.4f < 0.95. "
+                           "Check comparison star quality or airmass spread.", r2)
 
     return {"a": float(a), "b": float(b), "r2": float(r2), "mask": mask}
 
@@ -1323,9 +1329,11 @@ def time_from_header(
                 ))
                 .alt.deg
             )
-            print(f"[WARN] High airmass X={airmass:.2f} "
-                  f"(altitude={alt_deg:.1f}°) in {header.get('FILENAME', 'unknown')}. "
-                  "Differential photometry accuracy may be reduced.")
+            _phot_logger.debug(
+                "[WARN] High airmass X=%.2f (altitude=%.1f°) in %s. "
+                "Differential photometry accuracy may be reduced.",
+                airmass, alt_deg, header.get("FILENAME", "unknown"),
+            )
     except Exception as exc:
         print(f"[WARN] Airmass calculation failed: {exc}")
 
@@ -1725,17 +1733,30 @@ def auto_select_comps(
                 apass_matched["m_inst_matched"] = apass_matched["m_inst"]
 
     # ── 5. 決定使用哪個星表做正式回歸 ─────────────────────────────────────────
-    use_aavso = (
-        aavso_matched is not None
-        and len(aavso_matched) >= cfg.aavso_min_stars
-    )
-    active_df     = aavso_matched if use_aavso else apass_matched
-    active_source = "AAVSO" if use_aavso else "APASS"
+    # 規則：AAVSO 達 aavso_min_stars 顆時才視為有效；
+    # 兩者都有效時取比較星數量較多的（Honeycutt 1992：越多比較星越穩定）。
+    _n_aavso = len(aavso_matched) if aavso_matched is not None else 0
+    _n_apass = len(apass_matched) if apass_matched is not None else 0
+    _aavso_ok = _n_aavso >= cfg.aavso_min_stars
+    _apass_ok = _n_apass > 0
+
+    if _aavso_ok and _apass_ok:
+        # 兩者都有效 → 取數量較多的
+        if _n_aavso >= _n_apass:
+            active_df, active_source = aavso_matched, "AAVSO"
+        else:
+            active_df, active_source = apass_matched, "APASS"
+    elif _aavso_ok:
+        active_df, active_source = aavso_matched, "AAVSO"
+    elif _apass_ok:
+        active_df, active_source = apass_matched, "APASS"
+    else:
+        active_df, active_source = None, "NONE"
 
     if active_df is None or len(active_df) == 0:
         raise RuntimeError(
-            f"AAVSO 和 APASS 都找不到足夠的比較星（AAVSO={len(aavso_matched) if aavso_matched is not None else 0}，"
-            f"APASS={len(apass_matched) if apass_matched is not None else 0}）。\n"
+            f"AAVSO 和 APASS 都找不到足夠的比較星"
+            f"（AAVSO={_n_aavso}，APASS={_n_apass}）。\n"
             "建議：(1) 增大 aavso_fov_arcmin；(2) 放寬 comp_mag_range；"
             "(3) 未來考慮接入 Gaia DR3。"
         )
@@ -1761,8 +1782,7 @@ def auto_select_comps(
 
     print(
         f"[比較星] 使用 {active_source}：{len(comp_refs)} 顆  "
-        f"（AAVSO={len(aavso_matched) if aavso_matched is not None else 0}，"
-        f"APASS={len(apass_matched) if apass_matched is not None else 0}）"
+        f"（AAVSO={_n_aavso}，APASS={_n_apass}）"
     )
     print(f"[選取圓] 半徑 = {radius_px:.0f} px  ε = {epsilon:.4f} arcsec")
 
@@ -1784,6 +1804,7 @@ def run_photometry_on_wcs_dir(
     comp_refs: list,
     check_star=None,
     ap_radius: "float | None" = None,
+    channel: str = "B",
 ) -> pd.DataFrame:
     """
     Per-frame aperture differential photometry.
@@ -1798,11 +1819,11 @@ def run_photometry_on_wcs_dir(
     r_in, r_out = compute_annulus_radii(ap_radius, cfg.annulus_r_in, cfg.annulus_r_out)
     margin = int(np.ceil(r_out + 2))
 
-    # split/B/ 的 FITS 命名規則：*_B.fits
-    wcs_files_sorted = sorted(wcs_dir.glob("*_B.fits"))
+    # split/{channel}/ 的 FITS 命名規則：*_{channel}.fits
+    wcs_files_sorted = sorted(wcs_dir.glob(f"*_{channel}.fits"))
     if not wcs_files_sorted:
         raise FileNotFoundError(
-            f"No split/B FITS found in: {wcs_dir}\n"
+            f"No split/{channel} FITS found in: {wcs_dir}\n"
             "Check that debayer step completed successfully."
         )
 
@@ -1810,6 +1831,7 @@ def run_photometry_on_wcs_dir(
                     if check_star is not None else None)
     target_coord = SkyCoord(ra=ra_t * u.deg, dec=dec_t * u.deg)
     cfg_checked  = False
+    n_skipped    = 0
     rows = []
     _first_frame_diag_data = None   # (comp_m_cat, comp_m_inst, fit) for diag plot
 
@@ -1842,9 +1864,7 @@ def run_photometry_on_wcs_dir(
         # 大氣消光在低高度角時急增，ALT_MIN_DEG=45° 對應 airmass≈1.41。
         # airmass 已知（非 NaN）時才做截斷；location 未設定時不截斷（airmass=NaN）。
         if np.isfinite(airmass) and airmass > cfg.alt_min_airmass:
-            print(f"[SKIP] {f.name}: altitude < {cfg.alt_min_deg:.0f}°"
-                  f"  (airmass={airmass:.2f})")
-            rows.append(rec)
+            n_skipped += 1
             continue
 
         if not in_bounds(img, xt, yt, margin=margin):
@@ -1938,6 +1958,14 @@ def run_photometry_on_wcs_dir(
         )
         snr = float(1.0857 / sigma_mag) if np.isfinite(sigma_mag) and sigma_mag > 0 else np.nan
 
+        # ── FLAG_SLOPE_DEVIATION（§3.8）：|a − 1.0| > 0.05 ──────────────────
+        _slope_flag = int(abs(a - 1.0) > 0.05)
+        if _slope_flag:
+            _phot_logger.debug(
+                "[FLAG] slope_deviation a=%.4f (|a-1|=%.4f > 0.05) in %s",
+                a, abs(a - 1.0), fits_path.name,
+            )
+
         rec.update({
             "ok": 1,
             "t_flux_net": phot_t["flux_net"],
@@ -1955,6 +1983,7 @@ def run_photometry_on_wcs_dir(
             "zp_intercept": b,
             "zp_r2": r2,
             "comp_used": comp_used,
+            "flag_slope_dev": _slope_flag,
             "m_var": m_var,
         })
 
@@ -1996,16 +2025,43 @@ def run_photometry_on_wcs_dir(
               "Check obs_lat_deg / obs_lon_deg in Cfg.")
 
     df = df.sort_values(time_key, na_position="last")
+
+    # ── Sigma-clip m_var：排除零點崩潰造成的極端離群值 ──────────────────────
+    # 對 ok==1 且 m_var 有限的子集，計算 median 和 MAD（robust σ = 1.4826 × MAD）。
+    # |m_var − median| > 3σ 的幀，ok 改為 0，記錄 ok_flag = "sigma_clip"。
+    # CSV 保留所有列，畫圖/週期分析只用 ok==1。
+    _ok_mask = (df["ok"] == 1) & np.isfinite(df["m_var"])
+    _n_before_clip = int(_ok_mask.sum())
+    if _n_before_clip >= 5:
+        _m = df.loc[_ok_mask, "m_var"].values
+        _med = float(np.median(_m))
+        _mad = float(np.median(np.abs(_m - _med)))
+        _robust_sigma = 1.4826 * _mad if _mad > 0 else 1e-9
+        _clip_mask = np.abs(_m - _med) > 3.0 * _robust_sigma
+        _clip_idx = df.index[_ok_mask][_clip_mask]
+        if len(_clip_idx) > 0:
+            df.loc[_clip_idx, "ok"] = 0
+            if "ok_flag" not in df.columns:
+                df["ok_flag"] = ""
+            df.loc[_clip_idx, "ok_flag"] = "sigma_clip"
+            print(f"[sigma-clip] median={_med:.4f}  robust_σ={_robust_sigma:.4f}  "
+                  f"clipped {len(_clip_idx)} frames "
+                  f"(|m_var − median| > 3σ = {3.0 * _robust_sigma:.4f})")
+    _n_after_clip = int((df["ok"] == 1).sum())
+
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    print(f"[CSV] saved → {out_csv}  ({len(df)} rows, "
-          f"{int(df['ok'].sum())} successful)")
+    n_written = len(df)
+    print(f"[CSV] saved → {out_csv}  "
+          f"({n_written} rows written, {_n_after_clip} successful "
+          f"[{_n_before_clip - _n_after_clip} sigma-clipped], "
+          f"{n_skipped} skipped [alt < {cfg.alt_min_deg:.0f}°])")
 
     # ── 零點診斷總覽圖：殘差時序 + 第一幀散佈圖 ─────────────────────────────
     if cfg.save_zeropoint_diagnostic:
         try:
             _zp_diag_path = cfg.zeropoint_diag_dir / (
-                f"zp_overview_{cfg.phot_band}_{out_csv.stem.split('_', 1)[-1]}.png"
+                f"zp_overview_{out_csv.stem.split('_')[1]}_{out_csv.stem.split('_', 1)[-1]}.png"
             )
             _df_ok = df[df["ok"] == 1].copy()
             fig_diag, axes_diag = plt.subplots(
@@ -2126,7 +2182,6 @@ def run_photometry_on_wcs_dir(
 #   VanderPlas (2018) ApJS 236, 16
 #   Press & Rybicki (1989) ApJ 338, 277  (fast implementation)
 
-import warnings
 from astropy.timeseries import LombScargle
 from scipy.optimize import curve_fit
 from scipy.stats import pearsonr
@@ -2369,6 +2424,34 @@ if __name__ == "__main__":
                          help="通道列表（例如 --channels R G1 B）")
     _args = _parser.parse_args()
 
+    # ── Logger 初始化 ──────────────────────────────────────────────────────────
+    _log_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _logger   = logging.getLogger("photometry")
+    _logger.setLevel(logging.DEBUG)
+    # Console：只印重要摘要訊息
+    _con_hdl  = logging.StreamHandler(sys.stdout)
+    _con_hdl.setLevel(logging.INFO)
+    _KEEP_PREFIXES = (
+        "[sigma-clip]", "[CSV]", "[完成]", "[LS]", "[Fourier]",
+        "[比較星]", "[生長曲線]", "[SKIP]", "孔徑",
+        "======", "  通道", "  FITS", "  輸出", "所有通道",
+        "[photometry]", "找到",
+    )
+    class _SummaryFilter(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            return (
+                record.levelno >= logging.ERROR
+                or any(msg.startswith(p) for p in _KEEP_PREFIXES)
+            )
+    _con_hdl.addFilter(_SummaryFilter())
+    _con_hdl.setFormatter(logging.Formatter("%(message)s"))
+    _logger.addHandler(_con_hdl)
+    # FITSFixedWarning → logger DEBUG（只進 log 檔）
+    warnings.showwarning = lambda msg, cat, fn, ln, f=None, li=None: \
+        _logger.debug("[astropy] %s", str(msg))
+    # log 檔 handler 在取得 out_dir 後才加入（下方）
+
     _yaml = load_pipeline_config()
 
     ACTIVE_TARGET = _args.target or "V1162Ori"
@@ -2379,6 +2462,10 @@ if __name__ == "__main__":
 
     if _args.channels:
         CHANNELS = [str(ch).upper() for ch in _args.channels]
+        # G2 自動補入（若使用者指定了 G1 但沒有 G2）
+        if "G1" in CHANNELS and "G2" not in CHANNELS:
+            _g1_idx = CHANNELS.index("G1")
+            CHANNELS.insert(_g1_idx + 1, "G2")
     else:
         _ch_raw = _yaml.get("photometry", {}).get(
             "channels", _yaml.get("photometry", {}).get("channel", ["B"])
@@ -2391,6 +2478,19 @@ if __name__ == "__main__":
 
     # ── 第一通道 cfg（用於比較星選取和孔徑估計）──────────────────────────────
     cfg = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=CHANNELS[0])
+
+    # ── Log 檔 handler（需要 out_dir，在 cfg 取得後才能設定）──────────────────
+    _log_path = cfg.out_dir / f"photometry_{ACTIVE_DATE}_{_log_ts}.log"
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    _file_hdl = logging.FileHandler(_log_path, encoding="utf-8")
+    _file_hdl.setLevel(logging.DEBUG)
+    _file_hdl.setFormatter(
+        logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s",
+                          datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    _logger.addHandler(_file_hdl)
+    print(f"[LOG] {_log_path}")
+
 
     _ch0 = CHANNELS[0]
     wcs_files = sorted(cfg.wcs_dir.glob(f"*_{_ch0}.fits"))
@@ -2461,18 +2561,26 @@ if __name__ == "__main__":
             comp_refs=comp_refs,
             check_star=check_star,
             ap_radius=cfg_ch.aperture_radius,
+            channel=_ch,
         )
         channel_results[_ch] = df_ch
         print(f"  [完成] {_ch}：ok={int(df_ch['ok'].sum())} / {len(df_ch)} 幀")
 
     print(f"\n所有通道完成：{list(channel_results.keys())}")
 
-    # ── LS 分析（使用第一通道結果）────────────────────────────────────────────
-    df = channel_results.get(CHANNELS[0])
-    if df is not None and int(df["ok"].sum()) >= 10:
-        print(f"\n[LS] 對通道 {CHANNELS[0]} 執行 Lomb-Scargle 週期分析")
+    # ── LS 分析：選有效幀數最多的通道，G2 不參與 LS ─────────────────────────
+    # G2 只作交叉驗證用，不獨立做週期分析
+    _ls_candidates = {
+        ch: df for ch, df in channel_results.items()
+        if ch != "G2" and df is not None and int(df["ok"].sum()) >= 10
+    }
+    if _ls_candidates:
+        _ls_ch = max(_ls_candidates, key=lambda ch: int(_ls_candidates[ch]["ok"].sum()))
+        _ls_df = _ls_candidates[_ls_ch]
+        print(f"\n[LS] 對通道 {_ls_ch} 執行 Lomb-Scargle 週期分析"
+              f"（有效幀數最多：{int(_ls_df['ok'].sum())} 幀）")
         try:
-            ls_result  = run_lomb_scargle(df)
+            ls_result  = run_lomb_scargle(_ls_df)
             fit_result = run_fourier_fit(
                 ls_result["t"], ls_result["mag"],
                 ls_result["best_period"], ls_result["err"],
@@ -2480,4 +2588,4 @@ if __name__ == "__main__":
         except Exception as _e:
             print(f"[LS] 失敗：{_e}")
     else:
-        print("[LS] 跳過（有效幀數 < 10）")
+        print("[LS] 跳過（所有通道有效幀數 < 10）")
