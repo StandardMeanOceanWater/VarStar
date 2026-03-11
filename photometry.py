@@ -136,6 +136,7 @@ class Cfg:
     aavso_star_name: str | None = None
     aavso_seq_csv: Path | None = None
     aavso_use_api: bool = True
+    catalog_priority: list = field(default_factory=lambda: ["AAVSO", "APASS"])
     save_zeropoint_diagnostic: bool = True
 
     # ── 孔徑測光 ──────────────────────────────────────────────────────────────
@@ -349,6 +350,7 @@ def cfg_from_yaml(
         aavso_fov_arcmin=float(cmp_cfg.get("aavso_fov_arcmin", 100.0)),
         aavso_maglimit=float(cmp_cfg.get("aavso_maglimit", 15.0)),
         aavso_min_stars=int(cmp_cfg.get("aavso_min_stars", 5)),
+        catalog_priority=list(cmp_cfg.get("catalog_priority", ["AAVSO", "APASS"])),
         save_zeropoint_diagnostic=bool(cmp_cfg.get("save_zeropoint_diagnostic", True)),
 
         # 孔徑測光
@@ -1548,6 +1550,66 @@ def fetch_apass_cone(
         return pd.DataFrame()
 
 
+def fetch_tycho2_cone(
+    ra_deg: float,
+    dec_deg: float,
+    radius_arcmin: float = 40.0,
+    mag_min: float = 6.0,
+    mag_max: float = 13.0,
+) -> pd.DataFrame:
+    """
+    查 Tycho-2（I/259/tyc2），回傳 ra_deg, dec_deg, vmag, e_vmag, source。
+    色彩轉換：V = VT - 0.090 × (BT - VT)（ESA 1997 Vol.1 eq.1.3.20）
+    誤差傳遞：e_V = sqrt(e_VT² + 0.090² × (e_BT² + e_VT²))
+    BT 或 VT 缺失的星跳過。
+    """
+    try:
+        from astroquery.vizier import Vizier
+        from astropy.coordinates import SkyCoord as _SkyCoord
+        import astropy.units as _u
+
+        v = Vizier(
+            columns=["RAmdeg", "DEmdeg", "BTmag", "VTmag", "e_BTmag", "e_VTmag"],
+            row_limit=2000,
+        )
+        result = v.query_region(
+            _SkyCoord(ra_deg, dec_deg, unit="deg"),
+            radius=radius_arcmin * _u.arcmin,
+            catalog="I/259/tyc2",
+        )
+        if not result:
+            print("  [WARN] Tycho-2 查詢無結果。")
+            return pd.DataFrame()
+        df = result[0].to_pandas()
+        rows = []
+        for _, r in df.iterrows():
+            try:
+                bt = float(r["BTmag"]); vt = float(r["VTmag"])
+                e_bt = float(r["e_BTmag"]); e_vt = float(r["e_VTmag"])
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(bt) and np.isfinite(vt) and
+                    np.isfinite(e_bt) and np.isfinite(e_vt)):
+                continue
+            v_mag = vt - 0.090 * (bt - vt)
+            if not (mag_min <= v_mag <= mag_max):
+                continue
+            e_v = float(np.sqrt(e_vt**2 + 0.090**2 * (e_bt**2 + e_vt**2)))
+            rows.append({
+                "ra_deg":  float(r["RAmdeg"]),
+                "dec_deg": float(r["DEmdeg"]),
+                "vmag":    v_mag,
+                "e_vmag":  e_v,
+                "source":  "tycho2",
+            })
+        df_out = pd.DataFrame(rows)
+        print(f"  [Tycho-2] 查詢={len(df)}  色彩轉換後通過 mag 篩選={len(df_out)}")
+        return df_out
+    except Exception as exc:
+        print(f"  [WARN] Tycho-2 查詢失敗：{exc}")
+        return pd.DataFrame()
+
+
 def _match_catalog_to_detected(
     detected_df: pd.DataFrame,
     catalog_df: pd.DataFrame,
@@ -1690,185 +1752,178 @@ def auto_select_comps(
 
     ra_t, dec_t = float(target_radec_deg[0]), float(target_radec_deg[1])
     epsilon = cfg.plate_scale_arcsec / 2.0    # 防零 ε（arcsec）
-    radius_px = _selection_radius_px(img)
-
-    # ── 目標星像素座標診斷 ────────────────────────────────────────────────────
-    _tgt_x, _tgt_y = radec_to_pixel(wcs_obj, ra_t, dec_t)
-    _h, _w = img.shape
-    print(f"[診斷] 影像大小: {_w}x{_h} px  選取圓半徑: {radius_px:.0f} px")
-    print(f"[診斷] 目標星像素座標: ({_tgt_x:.1f}, {_tgt_y:.1f})  "
-          f"在影像內: {0 <= _tgt_x <= _w and 0 <= _tgt_y <= _h}")
-
-    # ── 1. 偵測視場內所有星 ────────────────────────────────────────────────────
-    fwhm_detect = float(np.clip(
-        (cfg.comp_fwhm_min + cfg.comp_fwhm_max) / 2.0, 1.5, cfg.max_fwhm_px
-    ))
-    all_stars_df = detect_stars_with_radec(
-        wcs_fits_path,
-        fwhm=fwhm_detect,
-        threshold_sigma=threshold_sigma,
-        max_stars=max_detect,
-    )
-    print(f"[診斷] 偵測到星數: {len(all_stars_df)}")
-    if len(all_stars_df) > 0:
-        _sample = list(zip(
-            all_stars_df["x"].round(1).head(3),
-            all_stars_df["y"].round(1).head(3)
-        ))
-        print(f"[診斷] 前3星像素座標 (x,y): {_sample}")
-    if len(all_stars_df) == 0:
-        raise RuntimeError("視場內偵測不到任何星，請降低 threshold_sigma。")
-
-    # ── 2. 篩選：圓內 + FWHM + 未飽和 + 最小角距 ──────────────────────────────
-    # 選取圓以影像中心為圓心（非目標星），使比較星空間分布對稱，
-    # 大氣梯度系統誤差互相抵消。
-    _img_center_x = float(_w) / 2.0
-    _img_center_y = float(_h) / 2.0
     tgt_sc = SkyCoord(ra=ra_t * u.deg, dec=dec_t * u.deg)
-    in_circle = _stars_in_circle(
-        all_stars_df, _img_center_x, _img_center_y, radius_px, img.shape
-    )
-    print(f"[診斷] in_circle: {len(in_circle)}  "
-          f"(radius_px={radius_px:.0f}, "
-          f"circle_center=({_img_center_x:.0f},{_img_center_y:.0f}), "
-          f"tgt_px=({_tgt_x:.1f},{_tgt_y:.1f}))")
+    _h, _w = img.shape
 
-    valid_rows = []
-    _diag = {"in_circle": len(in_circle), "psf_fail": 0, "fwhm_fail": 0,
-             "sat_fail": 0, "sep_fail": 0, "pass": 0}
-    _fwhm_samples: list = []
-    for _, r in in_circle.iterrows():
-        x, y = float(r["x"]), float(r["y"])
+    # 孔徑參數：使用 cfg 靜態值（孔徑估算在本函式之後才執行）
+    _ap_r = float(cfg.aperture_radius)
+    _r_in, _r_out = compute_annulus_radii(_ap_r, cfg.annulus_r_in, cfg.annulus_r_out)
+    _margin = int(np.ceil(_r_out + 2))
 
-        fit = fit_gaussian_psf(img, x, y, box=psf_box)
-        if fit.get("ok") != 1:
-            _diag["psf_fail"] += 1
-            continue
-        fwhm = 0.5 * (fit["fwhm_x"] + fit["fwhm_y"])
-        _fwhm_samples.append(round(fwhm, 2))
-        if not (cfg.comp_fwhm_min <= fwhm <= cfg.comp_fwhm_max):
-            _diag["fwhm_fail"] += 1
-            continue
+    def _catalog_direct_phot(cat_df, ra_col, dec_col, mag_col, err_col, mag_min, mag_max):
+        """從星表座標直接做孔徑測光，回傳通過篩選的 DataFrame。
+        排除條件：(a) 超出影像邊界+孔徑；(b) aperture 內 max_pix >= 飽和閾值。
+        """
+        rows = []
+        n_bounds, n_sat, n_phot = 0, 0, 0
+        for _, row in cat_df.iterrows():
+            try:
+                ra_c  = float(row[ra_col])
+                dec_c = float(row[dec_col])
+                m_c   = float(row[mag_col])
+                m_e   = float(row[err_col]) if (err_col and err_col in row.index
+                                                and np.isfinite(row[err_col])) else np.nan
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (mag_min <= m_c <= mag_max):
+                continue
+            xc, yc = radec_to_pixel(wcs_obj, ra_c, dec_c)
+            if not in_bounds(img, xc, yc, margin=_margin):
+                n_bounds += 1
+                continue
+            phot = aperture_photometry(img, xc, yc, _ap_r, _r_in, _r_out)
+            if phot.get("ok") != 1 or not np.isfinite(phot.get("flux_net", np.nan)):
+                n_phot += 1
+                continue
+            if is_saturated(phot.get("max_pix", np.nan), cfg.saturation_threshold):
+                n_sat += 1
+                continue
+            m_inst = m_inst_from_flux(phot["flux_net"])
+            if not np.isfinite(m_inst):
+                continue
+            rows.append({
+                "ra_deg": ra_c, "dec_deg": dec_c,
+                "m_cat": m_c, "m_err": m_e,
+                "m_inst": m_inst, "m_inst_matched": m_inst,
+            })
+        print(f"  [直接測光] 星表={len(cat_df)}  mag範圍外跳過  "
+              f"邊界排除={n_bounds}  飽和排除={n_sat}  測光失敗={n_phot}  通過={len(rows)}")
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-        max_pix = max_pixel_in_box(img, x, y, box=cfg.saturation_box)
-        if is_saturated(max_pix, cfg.saturation_threshold):
-            _diag["sat_fail"] += 1
-            continue
+    # ── 3–5. 依 catalog_priority 查詢並合併比較星 ─────────────────────────────
+    # 查詢順序由 cfg.catalog_priority 決定（yaml 設定，預設 [AAVSO, APASS]）。
+    # 各星表結果合併後去重（位置 < 3 arcsec 保留優先順序較前的來源）。
+    # 合併後統一進強制孔徑測光流程（_catalog_direct_phot）。
 
-        sc = SkyCoord(ra=float(r["ra_deg"]) * u.deg, dec=float(r["dec_deg"]) * u.deg)
-        sep_arcsec = float(tgt_sc.separation(sc).arcsec)
-        if sep_arcsec < cfg.comp_min_sep_arcsec:
-            _diag["sep_fail"] += 1
-            continue
+    _catalog_raws: "list[pd.DataFrame]" = []   # 各星表查詢結果（標準化欄位）
+    _sources_used: "list[str]" = []
 
-        _diag["pass"] += 1
-        row = r.to_dict()
-        row.update({
-            "fwhm": fwhm,
-            "max_pix": max_pix,
-            "sep_arcsec": sep_arcsec,
-            "m_inst": float(m_inst_from_flux(fit["flux_net"])),
-            "m_inst_matched": float(m_inst_from_flux(fit["flux_net"])),
-        })
-        valid_rows.append(row)
+    for _cat_name in cfg.catalog_priority:
+        _cat_name_up = str(_cat_name).upper()
 
-    print(f"[比較星篩選診斷] {_diag}")
-    if _fwhm_samples:
-        import statistics
-        _fwhm_sorted = sorted(_fwhm_samples)
-        print(f"[FWHM 樣本] n={len(_fwhm_sorted)}  "
-              f"min={_fwhm_sorted[0]}  median={statistics.median(_fwhm_sorted):.2f}  "
-              f"max={_fwhm_sorted[-1]}  "
-              f"cfg範圍=[{cfg.comp_fwhm_min}, {cfg.comp_fwhm_max}]")
+        if _cat_name_up == "AAVSO":
+            seq_df = None
+            if cfg.aavso_seq_csv is not None and Path(cfg.aavso_seq_csv).exists():
+                seq_df = read_aavso_seq_csv(Path(cfg.aavso_seq_csv))
+            elif cfg.aavso_star_name and cfg.aavso_use_api:
+                try:
+                    seq_df = fetch_aavso_vsp_api(
+                        cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit
+                    )
+                except Exception as exc:
+                    print(f"  [WARN] AAVSO API 查詢失敗：{exc}")
+            if seq_df is not None and len(seq_df) > 0:
+                _std = seq_df.rename(columns={"m_cat": "vmag", "m_err": "e_vmag"})
+                _std = _std[["ra_deg", "dec_deg", "vmag"] +
+                             (["e_vmag"] if "e_vmag" in _std.columns else [])].copy()
+                _std["source"] = "AAVSO"
+                _catalog_raws.append(_std)
+                _sources_used.append("AAVSO")
 
-    if not valid_rows:
-        raise RuntimeError("篩選後沒有有效的比較星候選。")
-    cand_df = pd.DataFrame(valid_rows)
-
-    # ── 3. 查詢 AAVSO ──────────────────────────────────────────────────────────
-    aavso_matched = None
-    seq_df = None
-    if cfg.aavso_seq_csv is not None and Path(cfg.aavso_seq_csv).exists():
-        seq_df = read_aavso_seq_csv(Path(cfg.aavso_seq_csv))
-    elif cfg.aavso_star_name and cfg.aavso_use_api:
-        try:
-            seq_df = fetch_aavso_vsp_api(
-                cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit
+        elif _cat_name_up == "APASS":
+            apass_raw = fetch_apass_cone(
+                ra_t, dec_t, radius_deg=cfg.apass_radius_deg, maxrec=cfg.apass_maxrec,
             )
-        except Exception as exc:
-            print(f"  [WARN] AAVSO API 查詢失敗：{exc}")
+            if len(apass_raw) > 0:
+                _ra_col  = _pick_col(apass_raw, ["ra", "raj2000", "ra_deg", "ra_icrs"])
+                _dec_col = _pick_col(apass_raw, ["dec", "dej2000", "dec_deg", "dec_icrs"])
+                _band = getattr(cfg, "phot_band", "V")
+                _mag_cands = {
+                    "B": ["mag_b", "bmag", "b", "b_mag"],
+                    "V": ["mag_v", "vmag", "v", "v_mag"],
+                    "r": ["mag_r", "rmag", "r", "r_mag", "r_sloan"],
+                }
+                _err_cands = {
+                    "B": ["err_mag_b", "e_bmag", "e_b", "b_err", "bmag_err"],
+                    "V": ["err_mag_v", "e_vmag", "e_v", "v_err", "vmag_err"],
+                    "r": ["err_mag_r", "e_rmag", "e_r", "r_err", "rmag_err"],
+                }
+                _mag_col = _pick_col(apass_raw, _mag_cands.get(_band, _mag_cands["V"]))
+                _err_col = next(
+                    (c for c in _err_cands.get(_band, _err_cands["V"]) if c in apass_raw.columns),
+                    None,
+                )
+                _cols_needed = [_ra_col, _dec_col, _mag_col] + ([_err_col] if _err_col else [])
+                _std = apass_raw[_cols_needed].copy().rename(columns={
+                    _ra_col: "ra_deg", _dec_col: "dec_deg",
+                    _mag_col: "vmag",
+                    **({_err_col: "e_vmag"} if _err_col else {}),
+                })
+                _std["source"] = "APASS"
+                _catalog_raws.append(_std)
+                _sources_used.append("APASS")
 
-    if seq_df is not None and len(seq_df) > 0:
-        aavso_matched = _match_catalog_to_detected(
-            cand_df, seq_df, "ra_deg", "dec_deg", "m_cat",
-            "m_err" if "m_err" in seq_df.columns else None,
-            cfg.apass_match_arcsec, cfg.comp_mag_min, cfg.comp_mag_max,
-        )
-        if "m_inst_matched" not in aavso_matched.columns and "m_inst" in aavso_matched.columns:
-            aavso_matched["m_inst_matched"] = aavso_matched["m_inst"]
+        elif _cat_name_up == "TYCHO2":
+            tycho_raw = fetch_tycho2_cone(
+                ra_t, dec_t,
+                radius_arcmin=cfg.apass_radius_deg * 60.0,
+                mag_min=cfg.comp_mag_min, mag_max=cfg.comp_mag_max,
+            )
+            if len(tycho_raw) > 0:
+                _std = tycho_raw.rename(columns={"e_vmag": "e_vmag"})[
+                    ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
+                ].copy()
+                _catalog_raws.append(_std)
+                _sources_used.append("Tycho2")
 
-    # ── 4. 查詢 APASS ──────────────────────────────────────────────────────────
-    apass_raw = fetch_apass_cone(
-        ra_t, dec_t,
-        radius_deg=cfg.apass_radius_deg,
-        maxrec=cfg.apass_maxrec,
-    )
-    apass_matched = None
-    if len(apass_raw) > 0:
-        ra_col  = _pick_col(apass_raw, ["ra", "raj2000", "ra_deg", "ra_icrs"])
-        dec_col = _pick_col(apass_raw, ["dec", "dej2000", "dec_deg", "dec_icrs"])
-        # 依通道選 APASS 波段欄位：B→B, G1/G2→V, R→r
-        _band = getattr(cfg, "phot_band", "V")
-        _mag_candidates = {
-            "B": ["mag_b", "bmag", "b", "b_mag"],
-            "V": ["mag_v", "vmag", "v", "v_mag"],
-            "r": ["mag_r", "rmag", "r", "r_mag", "r_sloan"],
-        }
-        _err_candidates = {
-            "B": ["err_mag_b", "e_bmag", "e_b", "b_err", "bmag_err"],
-            "V": ["err_mag_v", "e_vmag", "e_v", "v_err", "vmag_err"],
-            "r": ["err_mag_r", "e_rmag", "e_r", "r_err", "rmag_err"],
-        }
-        mag_col = _pick_col(apass_raw, _mag_candidates.get(_band, _mag_candidates["V"]))
-        err_col = next(
-            (c for c in _err_candidates.get(_band, _err_candidates["V"]) if c in apass_raw.columns),
-            None,
-        )
-        apass_matched = _match_catalog_to_detected(
-            cand_df, apass_raw, ra_col, dec_col, mag_col, err_col,
-            cfg.apass_match_arcsec, cfg.comp_mag_min, cfg.comp_mag_max,
-        )
-        if apass_matched is not None and len(apass_matched) > 0:
-            if "m_inst_matched" not in apass_matched.columns and "m_inst" in apass_matched.columns:
-                apass_matched["m_inst_matched"] = apass_matched["m_inst"]
-
-    # ── 5. 決定使用哪個星表做正式回歸 ─────────────────────────────────────────
-    # 規則：AAVSO 達 aavso_min_stars 顆時才視為有效；
-    # 兩者都有效時取比較星數量較多的（Honeycutt 1992：越多比較星越穩定）。
-    _n_aavso = len(aavso_matched) if aavso_matched is not None else 0
-    _n_apass = len(apass_matched) if apass_matched is not None else 0
-    _aavso_ok = _n_aavso >= cfg.aavso_min_stars
-    _apass_ok = _n_apass > 0
-
-    if _aavso_ok and _apass_ok:
-        # 兩者都有效 → 取數量較多的
-        if _n_aavso >= _n_apass:
-            active_df, active_source = aavso_matched, "AAVSO"
-        else:
-            active_df, active_source = apass_matched, "APASS"
-    elif _aavso_ok:
-        active_df, active_source = aavso_matched, "AAVSO"
-    elif _apass_ok:
-        active_df, active_source = apass_matched, "APASS"
+    # 合併並去重：位置 < 3 arcsec 保留優先順序較前的
+    if not _catalog_raws:
+        combined_raw = pd.DataFrame()
     else:
-        active_df, active_source = None, "NONE"
+        combined_raw = pd.concat(_catalog_raws, ignore_index=True)
+        if len(combined_raw) > 1:
+            from astropy.coordinates import SkyCoord as _SC
+            keep = np.ones(len(combined_raw), dtype=bool)
+            coords = _SC(
+                combined_raw["ra_deg"].values * u.deg,
+                combined_raw["dec_deg"].values * u.deg,
+            )
+            for i in range(len(combined_raw)):
+                if not keep[i]:
+                    continue
+                seps = coords[i].separation(coords).arcsec
+                dups = np.where((seps < 3.0) & (np.arange(len(combined_raw)) > i))[0]
+                keep[dups] = False
+            combined_raw = combined_raw[keep].reset_index(drop=True)
+
+    # 統一欄位名稱：vmag → m_cat，e_vmag → m_err
+    if len(combined_raw) > 0:
+        combined_raw = combined_raw.rename(columns={"vmag": "m_cat", "e_vmag": "m_err"})
+        if "m_err" not in combined_raw.columns:
+            combined_raw["m_err"] = np.nan
+        print(f"  [星表合併] {'+'.join(_sources_used)}：合併後 {len(combined_raw)} 筆")
+
+    # 強制孔徑測光篩選
+    aavso_matched = None   # 保留給 check_star 選取用（診斷）
+    apass_matched = None
+    active_df     = None
+    active_source = "NONE"
+
+    if len(combined_raw) > 0:
+        active_df = _catalog_direct_phot(
+            combined_raw, "ra_deg", "dec_deg", "m_cat", "m_err",
+            cfg.comp_mag_min, cfg.comp_mag_max,
+        )
+        active_source = "+".join(_sources_used) if _sources_used else "NONE"
+        # 供 check_star 診斷用
+        apass_matched = active_df
+        aavso_matched = active_df
 
     if active_df is None or len(active_df) == 0:
         raise RuntimeError(
-            f"AAVSO 和 APASS 都找不到足夠的比較星"
-            f"（AAVSO={_n_aavso}，APASS={_n_apass}）。\n"
-            "建議：(1) 增大 aavso_fov_arcmin；(2) 放寬 comp_mag_range；"
-            "(3) 未來考慮接入 Gaia DR3。"
+            f"所有星表（{cfg.catalog_priority}）都找不到足夠的比較星。\n"
+            "建議：(1) 放寬 comp_mag_range；(2) 增大 apass_radius_deg；"
+            "(3) 確認 catalog_priority 設定。"
         )
 
     # ── 6. 建立 comp_refs（含距離加權 ε）──────────────────────────────────────
@@ -1890,11 +1945,8 @@ def auto_select_comps(
         cfg.target_radec_deg, comp_refs, catalog_for_check
     )
 
-    print(
-        f"[比較星] 使用 {active_source}：{len(comp_refs)} 顆  "
-        f"（AAVSO={_n_aavso}，APASS={_n_apass}）"
-    )
-    print(f"[選取圓] 半徑 = {radius_px:.0f} px  epsilon = {epsilon:.4f} arcsec")
+    print(f"[比較星] 使用 {active_source}：{len(comp_refs)} 顆")
+    print(f"[比較星] epsilon = {epsilon:.4f} arcsec")
 
     return comp_refs, active_df, check_star, aavso_matched, apass_matched, active_source
 
@@ -2935,7 +2987,7 @@ if __name__ == "__main__":
         print(f"\n[LS] 對通道 {_ls_ch} 執行 Lomb-Scargle 週期分析"
               f"（有效幀數最多：{int(_ls_df['ok'].sum())} 幀）")
         try:
-            _ls_png = cfg_ch.out_dir / f"periodogram_{_ls_ch}_{session_date}.png"
+            _ls_png = cfg_ch.out_dir / f"periodogram_{_ls_ch}_{ACTIVE_DATE}.png"
             ls_result  = run_lomb_scargle(_ls_df, out_png=_ls_png)
             fit_result = run_fourier_fit(
                 ls_result["t"], ls_result["mag"],

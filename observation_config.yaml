@@ -82,8 +82,8 @@ obs_sessions:
 # -----------------------------------------------------------------------------
 targets:
   V1162Ori:
-    ra_hint_h: 5.572917      # astrometry.net 實測確認
-    dec_hint_deg: -6.971604
+    ra_hint_h: 5.533886      # V1162 Ori SIMBAD 05h32m01.9s (83.0083 deg)
+    dec_hint_deg: -7.256849  # V1162 Ori SIMBAD -7° 15' 24.7"
     display_name: "V1162 Ori"
     vmag_approx: 9.0
   AlVel:
@@ -149,7 +149,7 @@ comparison_stars:
   mag_range_delta: 5.0
   comp_mag_min: 6.0         # 固定下限（不飽和）
   comp_mag_max: 13.0        # 固定上限
-  catalog_priority: ["AAVSO", "APASS"]
+  catalog_priority: ["AAVSO", "APASS", "Tycho2"]
   aavso_min_stars: 3
   aavso_fov_arcmin: 100
   aavso_maglimit: 15.0
