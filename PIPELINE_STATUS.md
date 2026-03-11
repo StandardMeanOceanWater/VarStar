@@ -1,5 +1,5 @@
 # 變星測光管線 — 狀態快照
-**最後更新：2026-03-11 17:00 UTC+8 | 版號 v0.99 | 本檔永遠只有一份，直接覆蓋更新**
+**最後更新：2026-03-12 UTC+8 | 版號 v0.99.2 | 本檔永遠只有一份，直接覆蓋更新**
 
 ---
 
@@ -10,7 +10,7 @@
 | 校正 | `Calibration.py` | ✅ 完成（已實測） | Bug 修正 v2；297 幀全數通過 |
 | 星圖解算 | `plate_solve.py` | ✅ 完成（已實測） | hint 單位修正；V1162Ori 187/190 |
 | Bayer 拆色 | `DeBayer_RGGB.py` | ✅ 完成 | WCS 子採樣修正已實作 |
-| 測光（含標準 LS） | `photometry.py` + `Photometry.ipynb` | ✅ 完成實測 | V1162Ori R=113/187、G1=110/187、G2=123/187、B=91/187；LS 週期 1.17 h |
+| 測光（含標準 LS） | `photometry.py` + `Photometry.ipynb` | ⚠️ 尚未測試（v0.99.2 修改後） | V1162Ori 20251220 舊版實測：G1 ok=155/165、G2 ok=153/165、R ok=156/165、B ok=152/165；LS 週期 2.01 h（G1）；本版新增 Gaia DR3 / 飽和篩除 / 星表儲存 / 相位折疊圖存檔，待重新實測 |
 | 進階週期分析 | `period_analysis.py` | ✅ 完成 | 相對路徑支援已加入 |
 | 管線入口 | `run_pipeline.py` | ✅ 完成 | period_analysis 選用步驟已整合 |
 | 環境設定 | `00_setup.ipynb` | ✅ 完成 | Cell 5 無 `light/`、Cell 6 支援 `.1476` |
@@ -48,11 +48,14 @@
 
 ### 測光
 - 時間系統：BJD_TDB，曝光中點，de432s
-- 比較星星表順序：AAVSO → APASS
+- 比較星星表階層：AAVSO → Tycho-2（vmag≤11，comp_mag_min=7.0）→ APASS → Gaia DR3
+- G1/G2：Gaia G→V（Riello 2021）；R：Gaia G→Rc（Riello 2021）+ 強制附加 R_GAIA；B：Gaia G→B（使用者公式，BP-RP<2）
 - 孔徑：生長曲線法，固定孔徑
 - 背景：背景環中位數
 - 測光誤差：Merline & Howell (1995)
 - Airmass：Young (1994)
+- 飽和篩除：peak_flux > 11469 DN 的候選比較星強制排除
+- 星表存檔：`output/catalogs/catalog_{source}.csv`（每個星表一份）
 
 ### 週期分析
 - 主方法：Lomb-Scargle（astropy），DFT 交叉驗證
@@ -99,7 +102,7 @@
 - [x] `comp_mag_min/max` yaml 覆蓋機制（固定 6–13 mag，避免依賴 `vmag_approx` 估算）
 - [ ] 觀測站實際座標待填入（目前填台北預設值）
 - [ ] 診斷 EXIF ISO 讀出為 0（FITS GAIN/RDNOISE 空白），在 photometry 前處理
-- [ ] Gaia DR3 比較星介面（astroquery 已可用，列為第三層 fallback 待實作）
+- [x] Gaia DR3 比較星介面（`fetch_gaia_dr3_cone`，G→V/Rc/B 三通道轉換，⚠️ 尚未實測）
 - [ ] APASS 本機星表（約 1.5 GB，離線環境備用，低優先）
 - [ ] `quality_report.py` 實作（第二批 D 組）
 - [ ] SXPhe 4 幀全部失敗（1s 曝光，星點太少），評估是否補觀測
@@ -126,6 +129,24 @@
 ---
 
 ## 5. 修訂歷程
+
+---
+
+### 2026-03-12 UTC+8
+
+**對話主題：Gaia DR3 整合、星表儲存、相位折疊圖存檔修正**
+
+**修正問題清單**
+1. `run_fourier_fit`：相位折疊圖有畫但未存檔（`plt.close()` 前缺少 `savefig`）→ 新增 `out_png` 參數，輸出 `phase_fold_{ch}_{date}.png`
+2. 新增 `fetch_gaia_dr3_cone`：支援 G1/G2（G→V）、R（G→Rc）、B（G→B）三通道轉換（Riello et al. 2021）
+3. B 通道：BP-RP ≥ 2 時標記 `warn_color` 並印出警告
+4. `fetch_tycho2_cone`：保留 BT/VT 欄位；亮星下限收緊至 7.0 等（Tycho-2 V<7 不可靠）
+5. `auto_select_comps`：加入 GAIA 分支（支援 yaml 寫 `"GAIA"` / `"GAIADR3"` / `"GAIA_DR3"`）
+6. 星表儲存：`output/catalogs/catalog_{source}.csv`，一個星表一個 CSV
+7. R 通道強制附加 Gaia RP→Rc，儲存 `catalog_GaiaDR3_Rc.csv`
+8. 飽和篩除機制：peak_flux > 11469 DN 的候選比較星強制排除
+
+**⚠️ 尚未實測，photometry.py 所有通道（AlVel / CCAnd / SXPhe / V1162Ori）需重新跑**
 
 ---
 

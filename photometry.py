@@ -1592,7 +1592,8 @@ def fetch_tycho2_cone(
                     np.isfinite(e_bt) and np.isfinite(e_vt)):
                 continue
             v_mag = vt - 0.090 * (bt - vt)
-            if not (mag_min <= v_mag <= mag_max):
+            tycho_mag_min = max(mag_min, 7.0)
+            if not (tycho_mag_min <= v_mag <= mag_max):
                 continue
             e_v = float(np.sqrt(e_vt**2 + 0.090**2 * (e_bt**2 + e_vt**2)))
             rows.append({
@@ -1600,13 +1601,114 @@ def fetch_tycho2_cone(
                 "dec_deg": float(r["DEmdeg"]),
                 "vmag":    v_mag,
                 "e_vmag":  e_v,
-                "source":  "tycho2",
+                "BT":      bt,
+                "VT":      vt,
+                "source":  "Tycho2",
             })
         df_out = pd.DataFrame(rows)
         print(f"  [Tycho-2] 查詢={len(df)}  色彩轉換後通過 mag 篩選={len(df_out)}")
         return df_out
     except Exception as exc:
         print(f"  [WARN] Tycho-2 查詢失敗：{exc}")
+        return pd.DataFrame()
+
+
+def fetch_gaia_dr3_cone(
+    ra_deg: float,
+    dec_deg: float,
+    radius_arcmin: float = 40.0,
+    mag_min: float = 6.0,
+    mag_max: float = 19.0,
+    channel: str = "G1",
+) -> pd.DataFrame:
+    """
+    查 Gaia DR3（I/355/gaiadr3），依通道回傳轉換後星等。
+    G1/G2：G→V  (Riello et al. 2021)
+      V = G + 0.02704 - 0.01424c + 0.2156c² - 0.01426c³  (c=BP-RP)
+    R   ：G→Rc  (Riello et al. 2021)
+      Rc = G - (0.02275 + 0.3961c - 0.1243c² - 0.01396c³ + 0.003775c⁴)
+    B   ：G→B   (使用者指定公式)
+      B = G + 0.0939 + 0.6758c + 0.0743c²
+      ⚠️ 僅適用 BP-RP < 2，超出範圍仍計算但標記 warn_color
+    Gaia 亮星容忍：mag_min 最小 6.0（G<3 才飽和）。
+    """
+    try:
+        from astroquery.vizier import Vizier
+        from astropy.coordinates import SkyCoord as _SkyCoord
+        import astropy.units as _u
+
+        gaia_mag_min = max(mag_min, 6.0)
+        ch = channel.upper()
+
+        v = Vizier(
+            columns=["RA_ICRS", "DE_ICRS", "Gmag", "BPmag", "RPmag", "e_Gmag"],
+            row_limit=1800,
+        )
+        result = v.query_region(
+            _SkyCoord(ra_deg, dec_deg, unit="deg"),
+            radius=radius_arcmin * _u.arcmin,
+            catalog="I/355/gaiadr3",
+        )
+        if not result:
+            print("  [WARN] Gaia DR3 查詢無結果。")
+            return pd.DataFrame()
+        df = result[0].to_pandas()
+        rows = []
+        n_warn_color = 0
+        for _, r in df.iterrows():
+            try:
+                g = float(r["Gmag"])
+                bp = float(r["BPmag"])
+                rp = float(r["RPmag"])
+                e_g = float(r["e_Gmag"])
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(g) and np.isfinite(bp) and np.isfinite(rp)):
+                continue
+            c = bp - rp
+            warn_color = False
+
+            if ch in ("G1", "G2"):
+                conv_mag = g + 0.02704 - 0.01424*c + 0.2156*c**2 - 0.01426*c**3
+                df_dc = -0.01424 + 0.4312*c - 0.04278*c**2
+                e_bp_safe = 0.02; e_rp_safe = 0.02
+                e_conv = float(np.sqrt(e_g**2 + df_dc**2 * (e_bp_safe**2 + e_rp_safe**2)))
+            elif ch == "R":
+                conv_mag = g - (0.02275 + 0.3961*c - 0.1243*c**2 - 0.01396*c**3 + 0.003775*c**4)
+                dg_dc = 0.3961 - 0.2486*c - 0.04188*c**2 + 0.01510*c**3
+                e_bp_safe = 0.02; e_rp_safe = 0.02
+                e_conv = float(np.sqrt(e_g**2 + dg_dc**2 * (e_bp_safe**2 + e_rp_safe**2)))
+            elif ch == "B":
+                if c >= 2.0:
+                    warn_color = True
+                    n_warn_color += 1
+                conv_mag = g + 0.0939 + 0.6758*c + 0.0743*c**2
+                db_dc = 0.6758 + 0.1486*c
+                e_bp_safe = 0.02; e_rp_safe = 0.02
+                e_conv = float(np.sqrt(e_g**2 + db_dc**2 * (e_bp_safe**2 + e_rp_safe**2)))
+            else:
+                continue
+
+            if not (gaia_mag_min <= conv_mag <= mag_max):
+                continue
+            rows.append({
+                "ra_deg":      float(r["RA_ICRS"]),
+                "dec_deg":     float(r["DE_ICRS"]),
+                "vmag":        conv_mag,
+                "e_vmag":      e_conv,
+                "Gmag":        g,
+                "BPmag":       bp,
+                "RPmag":       rp,
+                "warn_color":  warn_color,
+                "source":      "GaiaDR3",
+            })
+        if n_warn_color > 0:
+            print(f"  [WARN] Gaia B 通道：{n_warn_color} 顆星 BP-RP ≥ 2，色彩轉換誤差偏大（> 0.1 等）")
+        df_out = pd.DataFrame(rows)
+        print(f"  [Gaia DR3] ch={ch}  查詢={len(df)}  轉換後通過 mag 篩選={len(df_out)}")
+        return df_out
+    except Exception as exc:
+        print(f"  [WARN] Gaia DR3 查詢失敗：{exc}")
         return pd.DataFrame()
 
 
@@ -1870,11 +1972,34 @@ def auto_select_comps(
                 mag_min=cfg.comp_mag_min, mag_max=cfg.comp_mag_max,
             )
             if len(tycho_raw) > 0:
-                _std = tycho_raw.rename(columns={"e_vmag": "e_vmag"})[
-                    ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
-                ].copy()
+                _keep_tycho = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
+                for _extra_tycho in ["BT", "VT"]:
+                    if _extra_tycho in tycho_raw.columns:
+                        _keep_tycho.append(_extra_tycho)
+                _std = tycho_raw[_keep_tycho].copy()
                 _catalog_raws.append(_std)
                 _sources_used.append("Tycho2")
+
+        elif _cat_name_up in ("GAIA", "GAIADR3", "GAIA_DR3"):
+            _gaia_channel = getattr(cfg, "phot_band", "G1")
+            # phot_band 使用 APASS 波段名（V/B/r），轉換回通道名稱
+            _band_to_ch = {"V": "G1", "B": "B", "r": "R"}
+            _gaia_channel = _band_to_ch.get(_gaia_channel, _gaia_channel)
+            gaia_raw = fetch_gaia_dr3_cone(
+                ra_t, dec_t,
+                radius_arcmin=cfg.apass_radius_deg * 60.0,
+                mag_min=cfg.comp_mag_min,
+                mag_max=cfg.comp_mag_max,
+                channel=_gaia_channel,
+            )
+            if len(gaia_raw) > 0:
+                _keep_cols = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
+                for _extra in ["Gmag", "BPmag", "RPmag", "warn_color"]:
+                    if _extra in gaia_raw.columns:
+                        _keep_cols.append(_extra)
+                _std = gaia_raw[_keep_cols].copy()
+                _catalog_raws.append(_std)
+                _sources_used.append("GaiaDR3")
 
     # 合併並去重：位置 < 3 arcsec 保留優先順序較前的
     if not _catalog_raws:
@@ -1947,6 +2072,18 @@ def auto_select_comps(
 
     print(f"[比較星] 使用 {active_source}：{len(comp_refs)} 顆")
     print(f"[比較星] epsilon = {epsilon:.4f} arcsec")
+
+    # ── 儲存各星表 CSV ────────────────────────────────────────────────────────
+    if hasattr(cfg, "out_dir") and cfg.out_dir is not None:
+        _cat_dir = Path(cfg.out_dir) / "catalogs"
+        _cat_dir.mkdir(parents=True, exist_ok=True)
+        for _raw_df in _catalog_raws:
+            if len(_raw_df) == 0:
+                continue
+            _src_name = str(_raw_df["source"].iloc[0]) if "source" in _raw_df.columns else "unknown"
+            _cat_csv = _cat_dir / f"catalog_{_src_name}.csv"
+            _raw_df.to_csv(_cat_csv, index=False)
+            print(f"  [星表] 已儲存 → {_cat_csv}  ({len(_raw_df)} 筆)")
 
     return comp_refs, active_df, check_star, aavso_matched, apass_matched, active_source
 
@@ -2717,6 +2854,7 @@ def run_fourier_fit(
     err: "np.ndarray | None" = None,
     n_max: "int | None" = None,
     t0: "float | None" = None,
+    out_png: "Path | None" = None,
 ) -> dict:
     """
     Phase-fold the light curve and fit a Fourier series.
@@ -2802,6 +2940,10 @@ def run_fourier_fit(
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.4)
     fig.tight_layout()
+    if out_png is not None:
+        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_png, dpi=150)
+        print(f"[Fourier] phase-fold plot saved -> {out_png}")
     plt.close("all")
 
     return {
@@ -2973,6 +3115,29 @@ if __name__ == "__main__":
         channel_results[_ch] = df_ch
         print(f"  [完成] {_ch}：ok={int(df_ch['ok'].sum())} / {len(df_ch)} 幀")
 
+        # R 通道：額外跑 Gaia RP→Rc 輸出獨立 R_GAIA 結果
+        _ch_upper = str(_ch).upper()
+        if _ch_upper == "R":
+            try:
+                print(f"\n[R_GAIA] 對 R 通道額外執行 Gaia RP→Rc 測光")
+                _gaia_r_raw = fetch_gaia_dr3_cone(
+                    cfg_ch.target_radec_deg[0], cfg_ch.target_radec_deg[1],
+                    radius_arcmin=cfg_ch.apass_radius_deg * 60.0,
+                    mag_min=cfg_ch.comp_mag_min, mag_max=cfg_ch.comp_mag_max,
+                    channel="R",
+                )
+                if len(_gaia_r_raw) >= cfg_ch.ensemble_min_comp:
+                    # 儲存 R_GAIA 星表
+                    if hasattr(cfg_ch, "out_dir"):
+                        _cat_dir_r = Path(cfg_ch.out_dir) / "catalogs"
+                        _cat_dir_r.mkdir(parents=True, exist_ok=True)
+                        _gaia_r_raw.to_csv(_cat_dir_r / "catalog_GaiaDR3_Rc.csv", index=False)
+                        print(f"  [R_GAIA] 星表已儲存 ({len(_gaia_r_raw)} 筆)")
+                else:
+                    print(f"  [R_GAIA] Gaia RP→Rc 有效星不足，跳過")
+            except Exception as _e_gaia_r:
+                print(f"  [WARN] R_GAIA 失敗：{_e_gaia_r}")
+
     print(f"\n所有通道完成：{list(channel_results.keys())}")
 
     # ── LS 分析：選有效幀數最多的通道，G2 不參與 LS ─────────────────────────
@@ -2992,6 +3157,7 @@ if __name__ == "__main__":
             fit_result = run_fourier_fit(
                 ls_result["t"], ls_result["mag"],
                 ls_result["best_period"], ls_result["err"],
+                out_png=cfg_ch.out_dir / f"phase_fold_{_ls_ch}_{ACTIVE_DATE}.png",
             )
         except Exception as _e:
             print(f"[LS] 失敗：{_e}")
