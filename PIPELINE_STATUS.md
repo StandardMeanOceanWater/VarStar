@@ -1,5 +1,5 @@
 # 變星測光管線 — 狀態快照
-**最後更新：2026-03-12 20:30 UTC+8 | 版號 v1.01 | 本檔永遠只有一份，直接覆蓋更新**
+**最後更新：2026-03-12 UTC+8 | 版號 v1.02 | 本檔永遠只有一份，直接覆蓋更新**
 
 ---
 
@@ -131,7 +131,7 @@
 - [x] 預白化 CSV 輸出實作（`save_csv: true` 時輸出 `prewhitening_{target}_{ch}.csv`）
 - [x] `observation_config.yaml` 加入 `observatory:` 區塊（`latitude_deg/longitude_deg/elevation_m`）
 - [x] `comp_mag_min/max` yaml 覆蓋機制（固定 6–13 mag，避免依賴 `vmag_approx` 估算）
-- [ ] 觀測站實際座標待填入（目前填台北預設值）
+- [x] 觀測站實際座標已填入：Tataka Shandonpu Parking / Cingjing Observatory
 - [ ] 診斷 EXIF ISO 讀出為 0（FITS GAIN/RDNOISE 空白），在 photometry 前處理
 - [x] Gaia DR3 比較星介面（`fetch_gaia_dr3_cone`，G→V/Rc/B 三通道轉換，⚠️ 尚未實測）
 - [ ] APASS 本機星表（約 1.5 GB，離線環境備用，低優先）
@@ -154,12 +154,29 @@
 10. NINA 望遠鏡指向座標未同步，FITS 標頭 `RA/DEC` 實測為北極點（RA≈5.39h, Dec≈+89.84°），`OBJCTRA/OBJCTDEC` 為零；plate_solve 依賴 yaml `targets` hint 修正
 11. V1162Ori AAVSO 比較星僅 4 顆（aavso_min_stars 調降至 3），改用 APASS 43 顆
 12. 改機 Canon 6D2 R 通道帶通延伸至近紅外，APASS Rc 僅為近似；嚴格轉換係數需 Landolt 標準場標定
-13. Windows cp950 編碼限制：`photometry.py` print 語句不可含 Unicode 數學符號（σ、−、ε、⁻、≥ 等），已全數替換為 ASCII
-14. `observatory:` 區塊座標目前為台北預設值，需填入實際觀測地點才能正確計算 BJD_TDB 與 airmass
+13. Windows cp950 編碼：`photometry.py` 已在 import 區塊加入 `sys.stdout/stderr.reconfigure(encoding='utf-8')`，所有 Unicode 字符可正常輸出
+14. `observatory:` 區塊座標：已更正為實際觀測站（塔塔加 / 清境觀星園）
 
 ---
 
 ## 5. 修訂歷程
+
+---
+
+### 2026-03-12（v1.02）UTC+8
+
+**對話主題：輸出表格整理、格式問題修正**
+
+**修正項目**
+1. `photometry.py`：加入 `sys.stdout/stderr.reconfigure(encoding='utf-8', errors='replace')`，一次解決 Windows cp950 Unicode crash（38 行受影響，含 `²`、`≥`、`−`、`⚠️` 等）
+2. `photometry.py`：統一所有診斷圖 DPI 為 150（原 `zp_diag` 逐幀圖為 100，`zp_overview` 為 120）
+3. `photometry.py` Sharpness Index 篩選：改為掃描 `comp_refs` 找最亮未飽和比較星計算 S（原用目標星）
+4. 輸出項目彙整（共 12 項）：CSV 3 種 × 通道、PNG 9 種、LOG 1 種
+
+**確認無問題**
+- 剔除統計表格（L2702–2714）已包含 sharpness 行，共六項
+- Log 路徑使用 `photometry_{date}_{ts}.log` 存於 out_dir，yaml 的 `pipeline_{date}.log` 目前未使用（無衝突）
+- `batch_detect_stars` 獨立函式，不在主測光流程中呼叫
 
 ---
 

@@ -1855,7 +1855,7 @@ def _save_zeropoint_diagnostic(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     out_path = diag_dir / f"zp_diag_{Path(frame_name).stem}.png"
-    fig.savefig(out_path, dpi=100)
+    fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
@@ -2783,7 +2783,7 @@ def run_photometry_on_wcs_dir(
                 fontsize=10
             )
             fig_diag.tight_layout()
-            fig_diag.savefig(_zp_diag_path, dpi=120)
+            fig_diag.savefig(_zp_diag_path, dpi=150)
             plt.close(fig_diag)
             print(f"[診斷圖] saved → {_zp_diag_path}")
         except Exception as _e:

@@ -1,5 +1,5 @@
 # CLAUDE.md — 變星測光管線專案指引
-**版號：v1.01 | 最後更新：2026-03-12 | 修訂規則見 PIPELINE_STATUS.md 開頭**
+**版號：v1.02 | 最後更新：2026-03-12 | 修訂規則見 PIPELINE_STATUS.md 開頭**
 
 ## 專案目的
 Canon EOS 6D Mark II 改機（移除 IR cut filter）+ 800mm 望遠鏡的變星差分測光自動管線。
