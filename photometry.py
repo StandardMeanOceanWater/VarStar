@@ -204,6 +204,7 @@ class Cfg:
     # ── 幀品質篩選 ────────────────────────────────────────────────────────────
     sharpness_min: float = 0.3        # Sharpness index 下限（0.0 = 停用）
     zp_r2_min: float = 0.0            # ZP 回歸 R² 下限（0.0 = 停用）
+    peak_ratio_min: float = 0.0       # 峰值比 t_max_pix/t_flux_net 下限（0.0 = 停用）；次鏡起霧/甜甜圈偵測
 
     # ── 舊版相容（ASTAP 板塊解算，保留供 Cell 5 使用）────────────────────────
     fits_dir: Path = Path(".")
@@ -422,6 +423,7 @@ def cfg_from_yaml(
         # 幀品質篩選
         sharpness_min=float(phot_cfg.get("sharpness_min", 0.3)),
         zp_r2_min=float(phot_cfg.get("zp_r2_min", 0.0)),
+        peak_ratio_min=float(phot_cfg.get("peak_ratio_min", 0.0)),
 
         # 舊版相容
         fits_dir=wcs_dir,
@@ -2352,6 +2354,7 @@ def run_photometry_on_wcs_dir(
     n_skipped        = 0
     n_high_fwhm      = 0
     n_low_sharpness  = 0
+    n_low_peak_ratio = 0
     n_low_zp_r2      = 0
     rows = []
     _first_frame_diag_data = None   # (comp_m_cat, comp_m_inst, fit) for diag plot
@@ -2476,6 +2479,26 @@ def run_photometry_on_wcs_dir(
             rec["ok"] = 0
             rec["ok_flag"] = "low_sharpness"
             n_low_sharpness += 1
+            rows.append(rec)
+            continue
+
+        # ── [2b] Peak-ratio 篩選（次鏡起霧 / 甜甜圈 PSF 偵測）─────────────────
+        # peak_ratio = t_max_pix / t_flux_net
+        # 次鏡起霧時中心被掏空，峰值相對總通量驟降。
+        # peak_ratio_min: 0.0 = 停用；建議值 0.090（由資料驅動設定）。
+        _peak_ratio_min = float(getattr(cfg, "peak_ratio_min", 0.0))
+        _peak_ratio = np.nan
+        if _peak_ratio_min > 0:
+            phot_t_pr = aperture_photometry(img, xt, yt, ap_radius, r_in, r_out)
+            _flux_pr  = phot_t_pr.get("flux_net", np.nan)
+            _peak_pr  = phot_t_pr.get("max_pix",  np.nan)
+            if np.isfinite(_flux_pr) and np.isfinite(_peak_pr) and _flux_pr > 0:
+                _peak_ratio = float(_peak_pr / _flux_pr)
+        rec["peak_ratio"] = _peak_ratio
+        if _peak_ratio_min > 0 and np.isfinite(_peak_ratio) and _peak_ratio < _peak_ratio_min:
+            rec["ok"] = 0
+            rec["ok_flag"] = "low_peak_ratio"
+            n_low_peak_ratio += 1
             rows.append(rec)
             continue
 
@@ -2691,11 +2714,13 @@ def run_photometry_on_wcs_dir(
     _n_alt_skip    = n_skipped  # alt_too_low（未進 df）
     _n_sigma_clip  = int(((df["ok"] == 0) & (df.get("ok_flag", pd.Series("", index=df.index)) == "sigma_clip")).sum()) if "ok_flag" in df.columns else (_n_before_clip - _n_after_clip)
 
-    _n_high_fwhm_val    = n_high_fwhm
+    _n_high_fwhm_val     = n_high_fwhm
     _n_low_sharpness_val = n_low_sharpness
-    _n_low_zp_r2_val    = n_low_zp_r2
-    # 重新計算 _n_phot_fail：排除三層篩選計數
-    _n_qual_filtered = _n_high_fwhm_val + _n_low_sharpness_val + _n_low_zp_r2_val
+    _n_low_peak_ratio_val = n_low_peak_ratio
+    _n_low_zp_r2_val     = n_low_zp_r2
+    # 重新計算 _n_phot_fail：排除四層篩選計數
+    _n_qual_filtered = (_n_high_fwhm_val + _n_low_sharpness_val
+                        + _n_low_peak_ratio_val + _n_low_zp_r2_val)
     _n_phot_fail   = _n_in_df - _n_ok_final - _n_sigma_clip - _n_qual_filtered
 
     _sep = "-" * 68
@@ -2706,6 +2731,7 @@ def run_photometry_on_wcs_dir(
     print(f"  {'高氣團跳過':<24} {_n_alt_skip:>6}    airmass > {cfg.alt_min_airmass:.2f}")
     print(f"  {'高 FWHM 幀剔除':<24} {_n_high_fwhm_val:>6}    frame_fwhm_median > {cfg.comp_fwhm_max:.1f} px")
     print(f"  {'低 Sharpness 剔除':<24} {_n_low_sharpness_val:>6}    S=flux(r=3)/flux(r=8) < {float(getattr(cfg,'sharpness_min',0.3)):.2f}")
+    print(f"  {'低 Peak Ratio 剔除':<24} {_n_low_peak_ratio_val:>6}    peak/flux < {float(getattr(cfg,'peak_ratio_min',0.0)):.3f} (0=停用)")
     print(f"  {'低 ZP R2 剔除':<24} {_n_low_zp_r2_val:>6}    zp_r2 < {float(getattr(cfg,'zp_r2_min',0.0)):.2f} (0=停用)")
     print(f"  {'孔徑/WCS/邊界失敗':<24} {_n_phot_fail:>6}    flux/位置無效")
     print(f"  {'sigma_clip':<24} {_n_sigma_clip:>6}    |m_var - median| > 3 * 1.4826 * MAD")

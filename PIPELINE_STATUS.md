@@ -163,6 +163,8 @@
 - [ ] APASS 本機星表（約 1.5 GB，離線環境備用，低優先）
 - [ ] `quality_report.py` 實作（第二批 D 組）
 - [ ] SXPhe 4 幀全部失敗（1s 曝光，星點太少），評估是否補觀測
+- [ ] 逐幀生長曲線孔徑（per-frame aperture）：次鏡起霧時孔徑增大，可作為甜甜圈偵測的獨立指標；目前孔徑為全 session 共用，需在幀迴圈內呼叫 estimate_aperture_radius
+- [ ] FWHM 估計器（DAOStarFinder）對拆色 FITS 全部回傳 NaN，需調整 threshold 或換用 photutils 的 fit_2dgaussian
 
 ---
 

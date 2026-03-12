@@ -197,6 +197,7 @@ photometry:
   # 幀品質篩選（三層）
   sharpness_min: 0.3    # S=flux(r=3px)/flux(r=8px) 下限；0.0=停用
   zp_r2_min: 0.0        # ZP 回歸 R2 下限；0.0=停用（保留 WARN 輸出）
+  peak_ratio_min: 0.0   # peak_ratio=t_max_pix/t_flux_net 下限；0.0=停用；次鏡起霧偵測用，V1162Ori 建議 0.090
 
 
 # -----------------------------------------------------------------------------
