@@ -28,7 +28,14 @@ import shutil
 import sys
 import os
 import logging
+
 import warnings
+
+# Windows cp950 終端機：強制 stdout/stderr 使用 UTF-8，防止 Unicode crash
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2382,7 +2389,7 @@ def run_photometry_on_wcs_dir(
             "ok": 0,
             "m_var": np.nan,
             "frame_fwhm_median": np.nan,
-            "sharpness": np.nan,
+            "sharpness_index": np.nan,
         }
 
         # ── 高度角截斷（altitude < ALT_MIN_DEG の幀は除外）────────────────────
@@ -2433,22 +2440,38 @@ def run_photometry_on_wcs_dir(
             continue
 
         # ── [2] Sharpness Index 篩選 ─────────────────────────────────────────
-        # S = flux(r=3px) / flux(r=8px)（均扣背景）
+        # S = flux(r=3px) / flux(r=8px)（均扣背景，對象：最亮未飽和比較星）
         # S < sharpness_min 代表星點過度擴散或拖影，剔除該幀。
         _sharpness = np.nan
         _sharpness_min = float(getattr(cfg, "sharpness_min", 0.3))
-        if _sharpness_min > 0:
-            try:
-                _phot_3 = aperture_photometry(img, xt, yt, 3.0, r_in, r_out)
-                _phot_8 = aperture_photometry(img, xt, yt, 8.0, r_in, r_out)
-                if (_phot_3.get("ok") == 1 and _phot_8.get("ok") == 1
-                        and np.isfinite(_phot_3.get("flux_net", np.nan))
-                        and np.isfinite(_phot_8.get("flux_net", np.nan))
-                        and _phot_8["flux_net"] > 0):
-                    _sharpness = float(_phot_3["flux_net"] / _phot_8["flux_net"])
-            except Exception:
-                pass
-        rec["sharpness"] = _sharpness
+        if _sharpness_min > 0 and comp_refs:
+            # 找視場內最亮（m_cat 最小）且未飽和的比較星
+            _s_bright_x, _s_bright_y = None, None
+            _s_bright_mag = np.inf
+            for _sref in comp_refs:
+                _s_ra, _s_dec, _s_m = float(_sref[0]), float(_sref[1]), float(_sref[2])
+                if not np.isfinite(_s_m) or _s_m >= _s_bright_mag:
+                    continue
+                _s_xc, _s_yc = radec_to_pixel(wcs_obj, _s_ra, _s_dec)
+                if not in_bounds(img, _s_xc, _s_yc, margin=margin):
+                    continue
+                _s_phot8 = aperture_photometry(img, _s_xc, _s_yc, 8.0, r_in, r_out)
+                if is_saturated(_s_phot8.get("max_pix", np.nan), cfg.saturation_threshold):
+                    continue
+                _s_bright_x, _s_bright_y = _s_xc, _s_yc
+                _s_bright_mag = _s_m
+            if _s_bright_x is not None:
+                try:
+                    _phot_s3 = aperture_photometry(img, _s_bright_x, _s_bright_y, 3.0, r_in, r_out)
+                    _phot_s8 = aperture_photometry(img, _s_bright_x, _s_bright_y, 8.0, r_in, r_out)
+                    if (_phot_s3.get("ok") == 1 and _phot_s8.get("ok") == 1
+                            and np.isfinite(_phot_s3.get("flux_net", np.nan))
+                            and np.isfinite(_phot_s8.get("flux_net", np.nan))
+                            and _phot_s8["flux_net"] > 0):
+                        _sharpness = float(_phot_s3["flux_net"] / _phot_s8["flux_net"])
+                except Exception:
+                    pass
+        rec["sharpness_index"] = _sharpness
         if np.isfinite(_sharpness) and _sharpness < _sharpness_min:
             rec["ok"] = 0
             rec["ok_flag"] = "low_sharpness"
