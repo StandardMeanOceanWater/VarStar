@@ -163,8 +163,8 @@
 - [ ] APASS 本機星表（約 1.5 GB，離線環境備用，低優先）
 - [ ] `quality_report.py` 實作（第二批 D 組）
 - [ ] SXPhe 4 幀全部失敗（1s 曝光，星點太少），評估是否補觀測
-- [ ] 逐幀生長曲線孔徑（per-frame aperture）：次鏡起霧時孔徑增大，可作為甜甜圈偵測的獨立指標；目前孔徑為全 session 共用，需在幀迴圈內呼叫 estimate_aperture_radius
-- [ ] FWHM 估計器（DAOStarFinder）對拆色 FITS 全部回傳 NaN，需調整 threshold 或換用 photutils 的 fit_2dgaussian
+- [ ] 起霧偵測完整方案：peak_ratio 已實作（門檻需逐 session 校定）；待辦：(a) 逐幀生長曲線孔徑（PSF 擴散時孔徑增大），(b) FWHM 估計器修復（DAOStarFinder 對拆色 FITS 全 NaN，需調整 threshold 或換 fit_2dgaussian），(c) 整合三指標為加權評分，避免單一指標誤殺
+- [ ] ZP R² 門檻評估：V1162Ori R 通道 median=0.83，31 幀落在 0.50–0.70；起霧後 median 降至 0.79，有訊號但重疊度高；建議先累積多目標資料再定門檻，目前維持停用
 
 ---
 
