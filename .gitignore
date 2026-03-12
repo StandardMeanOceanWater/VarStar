@@ -12,10 +12,12 @@ __pycache__/
 
 # 系統
 .vscode/
+.claude/
 Thumbs.db
 
-# DESIGN_DECISIONS 舊版（只保留 v6）
+# DESIGN_DECISIONS 舊版 (目前最新6.2)
 DESIGN_DECISIONS_v2.md
 DESIGN_DECISIONS_v3.1.md
 DESIGN_DECISIONS_v4.md
 DESIGN_DECISIONS_v5.docx
+DESIGN_DECISIONS_v6.1.docx

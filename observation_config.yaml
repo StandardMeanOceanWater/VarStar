@@ -87,14 +87,20 @@ targets:
     display_name: "V1162 Ori"
     vmag_approx: 9.0
   AlVel:
-    ra_hint_h: 8.745064
-    dec_hint_deg: -54.708833
+    ra_hint_h: 9.458297      # Al Vel (HD 83953) Hipparcos 09h 27m 29.87s
+    dec_hint_deg: -44.681583  # -44° 40' 53.7"
+    display_name: "Al Vel"
+    vmag_approx: 6.4          # GCVS: 極大 6.17, 極小 6.67 V；HADS 變星
   CCAnd:
     ra_hint_h: 23.647767
     dec_hint_deg: 38.583972
+    display_name: "CC And"
+    vmag_approx: 10.8
   SXPhe:
     ra_hint_h: 23.775797
     dec_hint_deg: -41.581667
+    display_name: "SX Phe"
+    vmag_approx: 7.1
 
 
 # -----------------------------------------------------------------------------
@@ -175,6 +181,9 @@ photometry:
   ensemble_min_comp: 3
   ensemble_max_iter: 10
   ensemble_convergence_tol: 0.0001
+  # 幀品質篩選（三層）
+  sharpness_min: 0.3    # S=flux(r=3px)/flux(r=8px) 下限；0.0=停用
+  zp_r2_min: 0.0        # ZP 回歸 R2 下限；0.0=停用（保留 WARN 輸出）
 
 
 # -----------------------------------------------------------------------------

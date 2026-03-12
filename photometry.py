@@ -180,8 +180,8 @@ class Cfg:
     # 低高度角時大氣消光急增，差分測光精度下降。
     # alt_min_deg=45° 對應 airmass ≈ 1.41（Young 1994）。
     # airmass=NaN（location 未設定）時不截斷。
-    alt_min_deg: float = 20.0
-    alt_min_airmass: float = 2.903   # Young (1994) at alt=20°
+    alt_min_deg: float = 30.0
+    alt_min_airmass: float = 1.994   # Young (1994) at alt=30°
 
     # ── 穩健回歸 ──────────────────────────────────────────────────────────────
     robust_regression_sigma: float = 3.0
@@ -193,6 +193,10 @@ class Cfg:
     ensemble_min_comp: int = 3             # 啟用 ensemble 所需最少比較星數
     ensemble_max_iter: int = 10            # Broeg 迭代上限
     ensemble_convergence_tol: float = 1e-4  # 收斂閾值（mag）
+
+    # ── 幀品質篩選 ────────────────────────────────────────────────────────────
+    sharpness_min: float = 0.3        # Sharpness index 下限（0.0 = 停用）
+    zp_r2_min: float = 0.0            # ZP 回歸 R² 下限（0.0 = 停用）
 
     # ── 舊版相容（ASTAP 板塊解算，保留供 Cell 5 使用）────────────────────────
     fits_dir: Path = Path(".")
@@ -214,6 +218,7 @@ def cfg_from_yaml(
     target: str,
     session_date: str,
     channel: str = "B",
+    split_subdir: str = "split",
 ) -> Cfg:
     """
     從 yaml 字典建立 Cfg 物件。
@@ -313,7 +318,7 @@ def cfg_from_yaml(
     # ── 路徑 ───────────────────────────────────────────────────────────────────
     # 測光通道：split/B/（拆色後 B 通道；FITS 內含 WCS，由 DeBayer_RGGB.py 傳遞）
     channel = str(channel).upper()   # 使用傳入參數，不從 yaml 讀
-    wcs_dir  = target_root / "split" / channel
+    wcs_dir  = target_root / split_subdir / channel
     out_dir  = target_root / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
     diag_dir = out_dir / "zeropoint_diag"
@@ -406,6 +411,10 @@ def cfg_from_yaml(
         ensemble_convergence_tol=float(
             phot_cfg.get("ensemble_convergence_tol", 1e-4)
         ),
+
+        # 幀品質篩選
+        sharpness_min=float(phot_cfg.get("sharpness_min", 0.3)),
+        zp_r2_min=float(phot_cfg.get("zp_r2_min", 0.0)),
 
         # 舊版相容
         fits_dir=wcs_dir,
@@ -1134,13 +1143,36 @@ def read_aavso_seq_csv(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fetch_aavso_vsp_api(star_name: str, fov_arcmin: float, maglimit: float) -> pd.DataFrame:
-    params = {"star": star_name, "fov": fov_arcmin, "maglimit": maglimit, "format": "json"}
+def fetch_aavso_vsp_api(
+    star_name: str,
+    fov_arcmin: float,
+    maglimit: float,
+    ra_deg: "float | None" = None,
+    dec_deg: "float | None" = None,
+) -> pd.DataFrame:
     # www.aavso.org/apps/vsp/api/chart/ 是正確的匿名可用 endpoint
-    # app.aavso.org/vsp/api/ 需要登入 token，不使用
+    # 優先用星名查詢；若 400（星名不在 AAVSO）則 fallback 到 ra/dec 座標查詢
+    params = {"star": star_name, "fov": fov_arcmin, "maglimit": maglimit, "format": "json"}
     url = "https://www.aavso.org/apps/vsp/api/chart/?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as _e:
+        # 星名查詢失敗（例如 400 Bad Request）→ 改用 ra/dec 座標查詢
+        if ra_deg is None or dec_deg is None:
+            raise
+        _ra_hms = f"{ra_deg / 15:.6f}"  # AAVSO 接受小時制或度制；用度直接傳
+        params_coord = {
+            "ra": f"{ra_deg:.6f}",
+            "dec": f"{dec_deg:.6f}",
+            "fov": fov_arcmin,
+            "maglimit": maglimit,
+            "format": "json",
+        }
+        url_coord = "https://www.aavso.org/apps/vsp/api/chart/?" + urllib.parse.urlencode(params_coord)
+        print(f"  [AAVSO] 星名查詢失敗({_e})，改用座標查詢：RA={ra_deg:.4f} Dec={dec_deg:.4f}")
+        with urllib.request.urlopen(url_coord, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
     phot = data.get("photometry", [])
     rows = []
     for item in phot:
@@ -1920,7 +1952,8 @@ def auto_select_comps(
             elif cfg.aavso_star_name and cfg.aavso_use_api:
                 try:
                     seq_df = fetch_aavso_vsp_api(
-                        cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit
+                        cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit,
+                        ra_deg=ra_t, dec_deg=dec_t,
                     )
                 except Exception as exc:
                     print(f"  [WARN] AAVSO API 查詢失敗：{exc}")
@@ -2308,8 +2341,11 @@ def run_photometry_on_wcs_dir(
     check_coord  = (SkyCoord(ra=check_star[0] * u.deg, dec=check_star[1] * u.deg)
                     if check_star is not None else None)
     target_coord = SkyCoord(ra=ra_t * u.deg, dec=dec_t * u.deg)
-    cfg_checked  = False
-    n_skipped    = 0
+    cfg_checked      = False
+    n_skipped        = 0
+    n_high_fwhm      = 0
+    n_low_sharpness  = 0
+    n_low_zp_r2      = 0
     rows = []
     _first_frame_diag_data = None   # (comp_m_cat, comp_m_inst, fit) for diag plot
 
@@ -2345,6 +2381,8 @@ def run_photometry_on_wcs_dir(
             "xt": xt, "yt": yt,
             "ok": 0,
             "m_var": np.nan,
+            "frame_fwhm_median": np.nan,
+            "sharpness": np.nan,
         }
 
         # ── 高度角截斷（altitude < ALT_MIN_DEG の幀は除外）────────────────────
@@ -2352,6 +2390,27 @@ def run_photometry_on_wcs_dir(
         # airmass 已知（非 NaN）時才做截斷；location 未設定時不截斷（airmass=NaN）。
         if np.isfinite(airmass) and airmass > cfg.alt_min_airmass:
             n_skipped += 1
+            continue
+
+        # ── [1] 幀層級 FWHM 篩選 ─────────────────────────────────────────────
+        # 用 DAOStarFinder 估算全幀中位數 FWHM，剔除模糊/拖影幀。
+        _frame_fwhm_median = np.nan
+        try:
+            _f_mean, _f_med, _f_std = sigma_clipped_stats(img, sigma=3.0, maxiters=3)
+            if _f_std > 0:
+                _dao_fwhm = DAOStarFinder(fwhm=4.0, threshold=5.0 * _f_std)
+                _tbl_fwhm = _dao_fwhm(img - _f_med)
+                if _tbl_fwhm is not None and len(_tbl_fwhm) > 0:
+                    _frame_fwhm_median = float(np.median(_tbl_fwhm["fwhm"]))
+        except Exception:
+            pass
+        rec["frame_fwhm_median"] = _frame_fwhm_median
+        if (np.isfinite(_frame_fwhm_median)
+                and _frame_fwhm_median > cfg.comp_fwhm_max):
+            rec["ok"] = 0
+            rec["ok_flag"] = "high_fwhm"
+            n_high_fwhm += 1
+            rows.append(rec)
             continue
 
         if not in_bounds(img, xt, yt, margin=margin):
@@ -2370,6 +2429,30 @@ def run_photometry_on_wcs_dir(
 
         m_inst_t = m_inst_from_flux(phot_t["flux_net"])
         if not np.isfinite(m_inst_t):
+            rows.append(rec)
+            continue
+
+        # ── [2] Sharpness Index 篩選 ─────────────────────────────────────────
+        # S = flux(r=3px) / flux(r=8px)（均扣背景）
+        # S < sharpness_min 代表星點過度擴散或拖影，剔除該幀。
+        _sharpness = np.nan
+        _sharpness_min = float(getattr(cfg, "sharpness_min", 0.3))
+        if _sharpness_min > 0:
+            try:
+                _phot_3 = aperture_photometry(img, xt, yt, 3.0, r_in, r_out)
+                _phot_8 = aperture_photometry(img, xt, yt, 8.0, r_in, r_out)
+                if (_phot_3.get("ok") == 1 and _phot_8.get("ok") == 1
+                        and np.isfinite(_phot_3.get("flux_net", np.nan))
+                        and np.isfinite(_phot_8.get("flux_net", np.nan))
+                        and _phot_8["flux_net"] > 0):
+                    _sharpness = float(_phot_3["flux_net"] / _phot_8["flux_net"])
+            except Exception:
+                pass
+        rec["sharpness"] = _sharpness
+        if np.isfinite(_sharpness) and _sharpness < _sharpness_min:
+            rec["ok"] = 0
+            rec["ok_flag"] = "low_sharpness"
+            n_low_sharpness += 1
             rows.append(rec)
             continue
 
@@ -2445,6 +2528,26 @@ def run_photometry_on_wcs_dir(
             rows.append(rec)
             continue
 
+        # ── [3] ZP R² 幀層級篩選 ─────────────────────────────────────────────
+        # zp_r2_min 預設 0.0（停用）；> 0 時才自動剔除，保留 WARN 輸出。
+        _zp_r2_min = float(getattr(cfg, "zp_r2_min", 0.0))
+        if np.isfinite(r2) and _zp_r2_min > 0 and r2 < _zp_r2_min:
+            _phot_logger.warning(
+                "[WARN] low ZP R2=%.4f < %.4f in %s (channel=%s)",
+                r2, _zp_r2_min, f.name, channel,
+            )
+            rec["zp_r2"] = r2
+            rec["ok"] = 0
+            rec["ok_flag"] = "low_zp_r2"
+            n_low_zp_r2 += 1
+            rows.append(rec)
+            continue
+        elif np.isfinite(r2) and r2 < max(_zp_r2_min, 0.5):
+            _phot_logger.warning(
+                "[WARN] low ZP R2=%.4f in %s (channel=%s) — consider raising zp_r2_min",
+                r2, f.name, channel,
+            )
+
         m_var       = (m_inst_t - b) / a
         comp_used   = int(np.count_nonzero(mask))
         sigma_mag   = mag_error_from_flux(
@@ -2515,13 +2618,23 @@ def run_photometry_on_wcs_dir(
 
     df = pd.DataFrame(rows)
 
+    if len(df) == 0:
+        print("[WARN] 所有幀均被跳過（airmass），無任何資料列。")
+        df = pd.DataFrame(columns=["file", "mjd", "bjd_tdb", "airmass", "ok", "m_var",
+                                    "m_var_norm", "delta_ensemble"])
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+        return df, {}
+
     # ── Choose time axis: prefer BJD_TDB ─────────────────────────────────────
     if "bjd_tdb" in df.columns and np.isfinite(df["bjd_tdb"]).any():
         time_key = "bjd_tdb"
-    else:
+    elif "mjd" in df.columns:
         time_key = "mjd"
         print("[WARN] BJD_TDB not available; falling back to MJD. "
               "Check obs_lat_deg / obs_lon_deg in Cfg.")
+    else:
+        time_key = "bjd_tdb"   # 保險 fallback，sort 會忽略 NaN
 
     df = df.sort_values(time_key, na_position="last")
 
@@ -2547,6 +2660,35 @@ def run_photometry_on_wcs_dir(
                   f"clipped {len(_clip_idx)} frames "
                   f"(|m_var - median| > 3sigma = {3.0 * _robust_sigma:.4f})")
     _n_after_clip = int((df["ok"] == 1).sum())
+
+    # ── 剔除統計表 ────────────────────────────────────────────────────────────
+    _n_total_fits  = len(wcs_files_sorted)
+    _n_in_df       = len(df)
+    _n_ok_final    = int((df["ok"] == 1).sum())
+    _n_alt_skip    = n_skipped  # alt_too_low（未進 df）
+    _n_sigma_clip  = int(((df["ok"] == 0) & (df.get("ok_flag", pd.Series("", index=df.index)) == "sigma_clip")).sum()) if "ok_flag" in df.columns else (_n_before_clip - _n_after_clip)
+
+    _n_high_fwhm_val    = n_high_fwhm
+    _n_low_sharpness_val = n_low_sharpness
+    _n_low_zp_r2_val    = n_low_zp_r2
+    # 重新計算 _n_phot_fail：排除三層篩選計數
+    _n_qual_filtered = _n_high_fwhm_val + _n_low_sharpness_val + _n_low_zp_r2_val
+    _n_phot_fail   = _n_in_df - _n_ok_final - _n_sigma_clip - _n_qual_filtered
+
+    _sep = "-" * 68
+    print(f"\n[剔除統計] 通道 {channel}  {getattr(cfg, 'target_name', '')}  {str(out_csv.stem).split('_')[-1]}")
+    print(_sep)
+    print(f"  {'原因':<24} {'幀數':>6}    公式")
+    print(_sep)
+    print(f"  {'高氣團跳過':<24} {_n_alt_skip:>6}    airmass > {cfg.alt_min_airmass:.2f}")
+    print(f"  {'高 FWHM 幀剔除':<24} {_n_high_fwhm_val:>6}    frame_fwhm_median > {cfg.comp_fwhm_max:.1f} px")
+    print(f"  {'低 Sharpness 剔除':<24} {_n_low_sharpness_val:>6}    S=flux(r=3)/flux(r=8) < {float(getattr(cfg,'sharpness_min',0.3)):.2f}")
+    print(f"  {'低 ZP R2 剔除':<24} {_n_low_zp_r2_val:>6}    zp_r2 < {float(getattr(cfg,'zp_r2_min',0.0)):.2f} (0=停用)")
+    print(f"  {'孔徑/WCS/邊界失敗':<24} {_n_phot_fail:>6}    flux/位置無效")
+    print(f"  {'sigma_clip':<24} {_n_sigma_clip:>6}    |m_var - median| > 3 * 1.4826 * MAD")
+    print(_sep)
+    print(f"  {'保留 (ok=1)':<24} {_n_ok_final:>6} / {_n_total_fits} 幀")
+    print()
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
@@ -2599,7 +2741,7 @@ def run_photometry_on_wcs_dir(
                 if _fit and np.isfinite(_fit.get("a", np.nan)):
                     _xl = np.linspace(_mc[_ok_pts].min(), _mc[_ok_pts].max(), 100)
                     ax_sc.plot(_xl, _fit["a"] * _xl + _fit["b"], "r-", lw=1.5,
-                               label=f"a={_fit['a']:.3f} b={_fit['b']:.3f} R²={_fit['r2']:.3f}")
+                               label=f"a={_fit['a']:.3f} b={_fit['b']:.3f} R2={_fit['r2']:.3f}")
                 _xr = np.array([_mc[_ok_pts].min(), _mc[_ok_pts].max()])
                 ax_sc.plot(_xr, _xr, "k--", lw=0.8, alpha=0.4)
                 ax_sc.invert_yaxis()
@@ -2628,22 +2770,115 @@ def run_photometry_on_wcs_dir(
     d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
     if len(d) == 0:
         print("[PLOT] No valid photometry points to plot.")
-        return df
+        df["m_var_norm"] = df["m_var"]
+        df["delta_ensemble"] = np.nan
+        return df, {}
 
-    fig, ax = plt.subplots(figsize=(10, 4))
+    import matplotlib.ticker as mticker
+    from astropy.time import Time as ATime
+
+    # 從 csv 檔名取觀測日期
+    _lc_obs_date = str(out_csv.stem).split("_")[-1]
+
+    bjd_arr = d[time_key].values
+    bjd_min = float(bjd_arr.min())
+    bjd_max = float(bjd_arr.max())
+
+    # 本地時間（UTC+8）換算：BJD_TDB ≈ BJD_UTC + 67.2s（微小），近似用 UTC+8
+    _tz_offset_h = float(getattr(cfg, "tz_offset_hours", 8))
+
+    def _bjd_to_local_hm(bjd_val):
+        """BJD → 本地時間 HH:MM（近似，UTC+8）"""
+        try:
+            t_utc = ATime(bjd_val, format="jd", scale="tdb").to_datetime()
+            import datetime
+            t_local = t_utc + datetime.timedelta(hours=_tz_offset_h)
+            return t_local
+        except Exception:
+            return None
+
+    # 計算 Local Time 整點刻度位置（BJD）
+    _t_local_min = _bjd_to_local_hm(bjd_min)
+    _t_local_max = _bjd_to_local_hm(bjd_max)
+
+    _major_bjd_ticks = []
+    _major_labels = []
+    _minor_bjd_ticks = []
+    if _t_local_min is not None and _t_local_max is not None:
+        import datetime
+        # 整點刻度
+        _cur = _t_local_min.replace(minute=0, second=0, microsecond=0)
+        if _cur < _t_local_min:
+            _cur += datetime.timedelta(hours=1)
+        while _cur <= _t_local_max + datetime.timedelta(minutes=1):
+            # 反算回 BJD
+            _utc = _cur - datetime.timedelta(hours=_tz_offset_h)
+            _bjd_tick = ATime(_utc).jd
+            _major_bjd_ticks.append(_bjd_tick)
+            _major_labels.append(_cur.strftime("%H:%M"))
+            _cur += datetime.timedelta(hours=1)
+        # 每 10 分鐘小刻度
+        _cur = _t_local_min.replace(second=0, microsecond=0)
+        _min_round = (_cur.minute // 10) * 10
+        _cur = _cur.replace(minute=_min_round)
+        while _cur <= _t_local_max + datetime.timedelta(minutes=1):
+            _utc = _cur - datetime.timedelta(hours=_tz_offset_h)
+            _bjd_tick = ATime(_utc).jd
+            _minor_bjd_ticks.append(_bjd_tick)
+            _cur += datetime.timedelta(minutes=10)
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+
     if "t_sigma_mag" in d.columns and np.isfinite(d["t_sigma_mag"]).any():
-        ax.errorbar(d[time_key], d["m_var"], yerr=d["t_sigma_mag"],
-                    fmt="o", ms=4, capsize=2, lw=0.8, label="target")
+        ax.errorbar(bjd_arr, d["m_var"].values, yerr=d["t_sigma_mag"].values,
+                    fmt="o", ms=4, capsize=2, lw=0.8, label="target", zorder=3)
     else:
-        ax.plot(d[time_key], d["m_var"], "o-", ms=4, lw=0.8, label="target")
+        ax.plot(bjd_arr, d["m_var"].values, "o-", ms=4, lw=0.8, label="target", zorder=3)
 
     ax.invert_yaxis()
-    xlabel = "BJD_TDB" if time_key == "bjd_tdb" else "MJD"
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Apparent magnitude (mag)")
-    ax.set_title("Light Curve")
+    ax.set_xlim(bjd_min - 0.002, bjd_max + 0.002)
+
+    # 主 x 軸（下方）：本地時間 HH:MM，黑色，刻度朝外（預設）
+    if _major_bjd_ticks:
+        ax.set_xticks(_major_bjd_ticks)
+        ax.set_xticklabels(_major_labels, color="black", fontsize=9)
+    if _minor_bjd_ticks:
+        ax.set_xticks(_minor_bjd_ticks, minor=True)
+    ax.tick_params(axis="x", which="major", direction="out", colors="black", length=6)
+    ax.tick_params(axis="x", which="minor", direction="out", colors="black", length=3)
+
+    # 副 x 軸（上方）：BJD，淺藍色，刻度朝內
+    ax2 = ax.twiny()
+    ax2.set_xlim(ax.get_xlim())
+    # 使用與主軸相同的整點刻度位置，但顯示 BJD 值
+    if _major_bjd_ticks:
+        ax2.set_xticks(_major_bjd_ticks)
+        _bjd_labels = [f"{v:.4f}" for v in _major_bjd_ticks]
+        ax2.set_xticklabels(_bjd_labels, color="lightblue", fontsize=7, rotation=30, ha="left")
+    ax2.tick_params(axis="x", which="major", direction="in",
+                    colors="lightblue", length=8)
+
+    # 軸標題：黃色，靠左
+    ax.set_xlabel("Local Time (HH:MM)", color="yellow", loc="left", fontsize=9)
+    ax2.set_xlabel("BJD", color="yellow", loc="left", fontsize=9)
+
+    ax.set_ylabel("Differential magnitude (mag)")
+
+    # 標題：星名 通道 日期
+    _lc_tname = getattr(cfg, "target_name", "")
+    _lc_title = f"{_lc_tname}  [{channel}]  {_lc_obs_date}"
+    ax.set_title(_lc_title)
+
+    # 右上角：觀測站座標
+    _lat = getattr(cfg, "obs_lat_deg", None)
+    _lon = getattr(cfg, "obs_lon_deg", None)
+    if _lat is not None and _lon is not None:
+        ax.text(0.99, 0.97, f"{_lat:.2f}  {_lon:.2f}",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=7, color="gray")
+
     ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.4)
+    ax.grid(True, alpha=0.3)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
@@ -2655,12 +2890,14 @@ def run_photometry_on_wcs_dir(
         k = df[(df["ok"] == 1) & np.isfinite(df[time_key])
                & np.isfinite(df["k_minus_c"])].copy()
         if len(k) > 1:
+            k["t_rel_d"] = k[time_key] - t0
             sigma_k = float(np.nanstd(k["k_minus_c"]))
             flag    = " [!] EXCEEDS THRESHOLD" if sigma_k > cfg.check_star_max_sigma else ""
             print(f"[CHECK] K-C sigma = {sigma_k:.5f} mag "
                   f"(threshold = {cfg.check_star_max_sigma}){flag}")
             fig2, ax2 = plt.subplots(figsize=(10, 3))
-            ax2.plot(k[time_key], k["k_minus_c"], "o-", ms=4, lw=0.8)
+            ax2.plot(k["t_rel_d"], k["k_minus_c"], "o-", ms=4, lw=0.8)
+            ax2.xaxis.set_major_formatter(plt.FuncFormatter(_fmt_dhm))
             ax2.invert_yaxis()
             ax2.set_xlabel(xlabel)
             ax2.set_ylabel("K - C  (mag)")
@@ -2745,6 +2982,11 @@ def run_lomb_scargle(
     samples_per_peak: int = LS_SAMPLES_PER_PEAK,
     fap_threshold: float = FAP_THRESHOLD,
     out_png: "Path | None" = None,
+    target_name: str = "",
+    channel: str = "",
+    obs_date: str = "",
+    lat_deg: "float | None" = None,
+    lon_deg: "float | None" = None,
 ) -> dict:
     """
     Run a Lomb-Scargle periodogram on the light-curve DataFrame.
@@ -2789,15 +3031,40 @@ def run_lomb_scargle(
               "Period detection may not be significant.")
 
     # ── Plot periodogram ──────────────────────────────────────────────────────
+    # ── X 軸單位：天 → 小時，刻度格式化為 H:MM:SS ────────────────────────────
+    period_h = 1.0 / frequency * 24.0   # 天 → 小時
+
+    def _fmt_hms(h_val, _pos=None):
+        """將小時數格式化為 H:MM:SS，去掉前置零。"""
+        total_s = int(round(abs(h_val) * 3600))
+        hh = total_s // 3600
+        mm = (total_s % 3600) // 60
+        ss = total_s % 60
+        if hh > 0:
+            return f"{hh}:{mm:02d}:{ss:02d}"
+        return f"{mm}:{ss:02d}"
+
+    best_period_h = best_period * 24.0
+    _p_min_h = float(period_h.min())
+    _p_max_h = float(period_h.max())
+
     fig, ax = plt.subplots(figsize=(10, 3))
-    ax.plot(1.0 / frequency, power, lw=0.8)
-    ax.axvline(best_period, color="red", lw=1.2, ls="--",
-               label=f"P = {best_period:.4f} d")
-    ax.set_xlabel("Period (days)")
+    ax.plot(period_h, power, lw=0.8)
+    ax.axvline(best_period_h, color="red", lw=1.2, ls="--",
+               label=f"P = {_fmt_hms(best_period_h)}")
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(_fmt_hms))
+    ax.set_xlabel("Period (H:MM:SS)")
     ax.set_ylabel("Lomb-Scargle power")
-    ax.set_title("Lomb-Scargle Periodogram")
-    ax.legend(fontsize=9)
+    _ls_title = f"{target_name}  [{channel}]  {obs_date}" if target_name else "Lomb-Scargle Periodogram"
+    ax.set_title(_ls_title + "\nLomb-Scargle Periodogram")
+    ax.set_xlim(_p_min_h, _p_max_h)
+    ax.legend(fontsize=9, loc="upper left")
     ax.grid(True, alpha=0.4)
+    # 右上角：觀測站座標
+    if lat_deg is not None and lon_deg is not None:
+        ax.text(0.99, 0.97, f"{lat_deg:.2f}  {lon_deg:.2f}",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=7, color="gray")
     fig.tight_layout()
     if out_png is not None:
         Path(out_png).parent.mkdir(parents=True, exist_ok=True)
@@ -2855,6 +3122,11 @@ def run_fourier_fit(
     n_max: "int | None" = None,
     t0: "float | None" = None,
     out_png: "Path | None" = None,
+    target_name: str = "",
+    channel: str = "",
+    obs_date: str = "",
+    lat_deg: "float | None" = None,
+    lon_deg: "float | None" = None,
 ) -> dict:
     """
     Phase-fold the light curve and fit a Fourier series.
@@ -2886,7 +3158,7 @@ def run_fourier_fit(
     n_cycles = (t.max() - t.min()) / period
     if n_max is None:
         n_max = _auto_fourier_order(n_cycles)
-    print(f"[Fourier] n_cycles ≈ {n_cycles:.1f}  →  using {n_max} harmonics")
+    print(f"[Fourier] n_cycles ~= {n_cycles:.1f}  ->  using {n_max} harmonics")
 
     # Initial guess: all coefficients = 0, constant = mean magnitude
     p0 = [float(np.nanmean(mag))] + [0.0] * (2 * n_max)
@@ -2915,7 +3187,7 @@ def run_fourier_fit(
     amplitude  = float(fit_dense.max() - fit_dense.min())
 
     print(f"[Fourier] Amplitude = {amplitude:.4f} mag")
-    print(f"[Fourier] R²        = {r2:.4f}")
+    print(f"[Fourier] R2        = {r2:.4f}")
     print(f"[Fourier] RMS resid = {rms_resid:.4f} mag")
 
     # ── Phase-folded plot ─────────────────────────────────────────────────────
@@ -2932,13 +3204,20 @@ def run_fourier_fit(
                s=12, alpha=0.7, label="data")
     ax.plot(phi_ext[:len(phi_ext) // PHASE_FOLD_CYCLES * n_show],
             fit_ext[:len(fit_ext) // PHASE_FOLD_CYCLES * n_show],
-            "r-", lw=1.5, label=f"Fourier n={n_max}  R²={r2:.3f}")
+            "r-", lw=1.5, label=f"Fourier n={n_max}  R2={r2:.3f}")
     ax.invert_yaxis()
-    ax.set_xlabel(f"Phase  (P = {period:.6f} d = {period * 24:.4f} h)")
+    ax.set_xlabel(f"Phase  (P = {period:.6f} d = {period * 24:.4f} h)",
+                  loc="center")
     ax.set_ylabel("Differential magnitude")
-    ax.set_title("Phase-Folded Light Curve + Fourier Fit")
-    ax.legend(fontsize=9)
+    _ff_title = f"{target_name}  [{channel}]  {obs_date}" if target_name else "Phase-Folded Light Curve"
+    ax.set_title(_ff_title + "\nPhase-Folded Light Curve + Fourier Fit")
+    ax.legend(fontsize=9, loc="upper left")
     ax.grid(True, alpha=0.4)
+    # 右上角：觀測站座標
+    if lat_deg is not None and lon_deg is not None:
+        ax.text(0.99, 0.97, f"{lat_deg:.2f}  {lon_deg:.2f}",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=7, color="gray")
     fig.tight_layout()
     if out_png is not None:
         Path(out_png).parent.mkdir(parents=True, exist_ok=True)
@@ -2971,6 +3250,10 @@ if __name__ == "__main__":
                          help="觀測日期（例如 20251220）")
     _parser.add_argument("--channels", default=None, nargs="+",
                          help="通道列表（例如 --channels R G1 B）")
+    _parser.add_argument("--split_subdir", default="split",
+                         help="split 子目錄名稱（例如 splitNINA）")
+    _parser.add_argument("--all", action="store_true",
+                         help="處理 yaml 中所有 obs_sessions 的全部目標")
     _args = _parser.parse_args()
 
     # ── Logger 初始化 ──────────────────────────────────────────────────────────
@@ -3003,15 +3286,9 @@ if __name__ == "__main__":
 
     _yaml = load_pipeline_config()
 
-    ACTIVE_TARGET = _args.target or "V1162Ori"
-    ACTIVE_DATE   = _args.date   or "20251220"
-
-    # ── 初始 cfg（第一通道，用於比較星和孔徑估計）────────────────────────────
-    # channels 在後面確定，先用臨時值建 cfg 以取得路徑、gain 等設定
-
+    # ── 通道清單（所有目標共用）──────────────────────────────────────────────
     if _args.channels:
         CHANNELS = [str(ch).upper() for ch in _args.channels]
-        # G2 自動補入（若使用者指定了 G1 但沒有 G2）
         if "G1" in CHANNELS and "G2" not in CHANNELS:
             _g1_idx = CHANNELS.index("G1")
             CHANNELS.insert(_g1_idx + 1, "G2")
@@ -3022,144 +3299,277 @@ if __name__ == "__main__":
         if isinstance(_ch_raw, str):
             _ch_raw = [_ch_raw]
         CHANNELS = [str(ch).upper() for ch in _ch_raw]
+        # G2 自動補入（G1 存在但 G2 未列時）
+        if "G1" in CHANNELS and "G2" not in CHANNELS:
+            _g1_idx = CHANNELS.index("G1")
+            CHANNELS.insert(_g1_idx + 1, "G2")
 
-    print(f"[photometry] 目標={ACTIVE_TARGET}  日期={ACTIVE_DATE}  通道={CHANNELS}")
+    # ── 建立要處理的 (target, date) 列表 ─────────────────────────────────────
+    if _args.all or (_args.target is None and _args.date is None):
+        _targets_list = [
+            (str(_t), str(_sess["date"]))
+            for _sess in _yaml.get("obs_sessions", [])
+            for _t in _sess.get("targets", [])
+        ]
+        if not _targets_list:
+            _targets_list = [("V1162Ori", "20251220")]
+    else:
+        _targets_list = [(_args.target or "V1162Ori", _args.date or "20251220")]
 
-    # ── 第一通道 cfg（用於比較星選取和孔徑估計）──────────────────────────────
-    cfg = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=CHANNELS[0])
+    print(f"[photometry] 待處理目標：{_targets_list}  通道：{CHANNELS}")
 
-    # ── Log 檔 handler（需要 out_dir，在 cfg 取得後才能設定）──────────────────
-    _log_path = cfg.out_dir / f"photometry_{ACTIVE_DATE}_{_log_ts}.log"
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    _file_hdl = logging.FileHandler(_log_path, encoding="utf-8")
-    _file_hdl.setLevel(logging.DEBUG)
-    _file_hdl.setFormatter(
-        logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s",
-                          datefmt="%Y-%m-%d %H:%M:%S")
-    )
-    _logger.addHandler(_file_hdl)
-    print(f"[LOG] {_log_path}")
+    # ── 各目標迴圈 ────────────────────────────────────────────────────────────
+    for (ACTIVE_TARGET, ACTIVE_DATE) in _targets_list:
+        print(f"\n{'#'*60}")
+        print(f"# 目標：{ACTIVE_TARGET}  日期：{ACTIVE_DATE}  通道：{CHANNELS}")
+        print(f"{'#'*60}")
 
+        # 關閉前一目標的 log 檔 handler
+        for _h in list(_logger.handlers):
+            if isinstance(_h, logging.FileHandler):
+                _h.close()
+                _logger.removeHandler(_h)
 
-    _ch0 = CHANNELS[0]
-    wcs_files = sorted(cfg.wcs_dir.glob(f"*_{_ch0}.fits"))
-    if not wcs_files:
-        raise FileNotFoundError(
-            f"找不到 split/{_ch0} FITS：{cfg.wcs_dir}\n"
-            "請確認 debayer 步驟已完成。"
-        )
-    print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
-
-    # ── 比較星選取（天球座標，通道無關，只做一次）────────────────────────────
-    (comp_refs, comp_df_matched, check_star,
-     aavso_matched, apass_matched, active_source) = auto_select_comps(
-        wcs_files[0], cfg.target_radec_deg
-    )
-    print(f"check_star：{check_star}")
-
-    # ── 孔徑估計（以第一通道為準，所有通道共用）──────────────────────────────
-    if cfg.aperture_auto:
-        ap_r = estimate_aperture_radius(
-            wcs_files[0], comp_df_matched,
-            cfg.aperture_min_radius, cfg.aperture_max_radius,
-            cfg.aperture_growth_fraction,
-            max_stars=(
-                max(10, min(30, len(comp_df_matched)))
-                if comp_df_matched is not None else 20
-            ),
-        )
-        if ap_r is not None:
-            cfg.aperture_radius = ap_r
-            print(
-                f"[生長曲線] 自動孔徑半徑 = {cfg.aperture_radius:.2f} px"
-                "（所有通道共用）"
-            )
-
-    ap_r_in, ap_r_out = compute_annulus_radii(
-        cfg.aperture_radius, cfg.annulus_r_in, cfg.annulus_r_out
-    )
-    print(f"孔徑 r={cfg.aperture_radius:.2f}  r_in={ap_r_in:.2f}  r_out={ap_r_out:.2f}")
-    _shared_aperture_radius = cfg.aperture_radius
-
-    # ── 多通道測光迴圈 ────────────────────────────────────────────────────────
-    channel_results: dict = {}
-
-    for _ch in CHANNELS:
-        print(f"\n{'='*55}")
-        print(f"  通道 {_ch}  ({CHANNELS.index(_ch) + 1}/{len(CHANNELS)})")
-        print(f"{'='*55}")
-
-        cfg_ch = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=_ch)
-        cfg_ch.aperture_radius = _shared_aperture_radius
-        cfg_ch.gain_e_per_adu  = cfg.gain_e_per_adu
-        cfg_ch.read_noise_e    = cfg.read_noise_e
-
-        _split_dir = cfg_ch.wcs_dir
-        _fits_ch   = sorted(_split_dir.glob(f"*_{_ch}.fits"))
-        if not _fits_ch:
-            print(f"  [SKIP] split/{_ch}/ 找不到 FITS，跳過此通道")
+        # ── 第一通道 cfg（用於比較星選取和孔徑估計）──────────────────────────
+        try:
+            cfg = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=CHANNELS[0],
+                                split_subdir=_args.split_subdir)
+        except Exception as _e_cfg:
+            print(f"[SKIP] {ACTIVE_TARGET}/{ACTIVE_DATE} cfg 建立失敗：{_e_cfg}")
             continue
 
-        print(f"  FITS 張數：{len(_fits_ch)}")
-        print(f"  輸出 CSV ：{cfg_ch.phot_out_csv}")
-
-        df_ch, _comp_lc_ch = run_photometry_on_wcs_dir(
-            _split_dir,
-            cfg_ch.phot_out_csv,
-            cfg_ch.phot_out_png,
-            comp_refs=comp_refs,
-            check_star=check_star,
-            ap_radius=cfg_ch.aperture_radius,
-            channel=_ch,
+        # ── Log 檔 handler（每個目標獨立 log 檔）─────────────────────────────
+        _log_path = cfg.out_dir / f"photometry_{ACTIVE_DATE}_{_log_ts}.log"
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        _file_hdl = logging.FileHandler(_log_path, encoding="utf-8")
+        _file_hdl.setLevel(logging.DEBUG)
+        _file_hdl.setFormatter(
+            logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s",
+                              datefmt="%Y-%m-%d %H:%M:%S")
         )
-        channel_results[_ch] = df_ch
-        print(f"  [完成] {_ch}：ok={int(df_ch['ok'].sum())} / {len(df_ch)} 幀")
+        _logger.addHandler(_file_hdl)
+        print(f"[LOG] {_log_path}")
 
-        # R 通道：額外跑 Gaia RP→Rc 輸出獨立 R_GAIA 結果
-        _ch_upper = str(_ch).upper()
-        if _ch_upper == "R":
-            try:
-                print(f"\n[R_GAIA] 對 R 通道額外執行 Gaia RP→Rc 測光")
-                _gaia_r_raw = fetch_gaia_dr3_cone(
-                    cfg_ch.target_radec_deg[0], cfg_ch.target_radec_deg[1],
-                    radius_arcmin=cfg_ch.apass_radius_deg * 60.0,
-                    mag_min=cfg_ch.comp_mag_min, mag_max=cfg_ch.comp_mag_max,
-                    channel="R",
-                )
-                if len(_gaia_r_raw) >= cfg_ch.ensemble_min_comp:
-                    # 儲存 R_GAIA 星表
-                    if hasattr(cfg_ch, "out_dir"):
-                        _cat_dir_r = Path(cfg_ch.out_dir) / "catalogs"
-                        _cat_dir_r.mkdir(parents=True, exist_ok=True)
-                        _gaia_r_raw.to_csv(_cat_dir_r / "catalog_GaiaDR3_Rc.csv", index=False)
-                        print(f"  [R_GAIA] 星表已儲存 ({len(_gaia_r_raw)} 筆)")
-                else:
-                    print(f"  [R_GAIA] Gaia RP→Rc 有效星不足，跳過")
-            except Exception as _e_gaia_r:
-                print(f"  [WARN] R_GAIA 失敗：{_e_gaia_r}")
+        _ch0 = CHANNELS[0]
+        wcs_files = sorted(cfg.wcs_dir.glob(f"*_{_ch0}.fits"))
+        if not wcs_files:
+            print(f"[SKIP] 找不到 split/{_ch0} FITS：{cfg.wcs_dir}，跳過此目標")
+            continue
+        print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
 
-    print(f"\n所有通道完成：{list(channel_results.keys())}")
-
-    # ── LS 分析：選有效幀數最多的通道，G2 不參與 LS ─────────────────────────
-    # G2 只作交叉驗證用，不獨立做週期分析
-    _ls_candidates = {
-        ch: df for ch, df in channel_results.items()
-        if ch != "G2" and df is not None and int(df["ok"].sum()) >= 10
-    }
-    if _ls_candidates:
-        _ls_ch = max(_ls_candidates, key=lambda ch: int(_ls_candidates[ch]["ok"].sum()))
-        _ls_df = _ls_candidates[_ls_ch]
-        print(f"\n[LS] 對通道 {_ls_ch} 執行 Lomb-Scargle 週期分析"
-              f"（有效幀數最多：{int(_ls_df['ok'].sum())} 幀）")
+        # ── 比較星選取（天球座標，通道無關，只做一次）────────────────────────
         try:
-            _ls_png = cfg_ch.out_dir / f"periodogram_{_ls_ch}_{ACTIVE_DATE}.png"
-            ls_result  = run_lomb_scargle(_ls_df, out_png=_ls_png)
-            fit_result = run_fourier_fit(
-                ls_result["t"], ls_result["mag"],
-                ls_result["best_period"], ls_result["err"],
-                out_png=cfg_ch.out_dir / f"phase_fold_{_ls_ch}_{ACTIVE_DATE}.png",
+            (comp_refs, comp_df_matched, check_star,
+             aavso_matched, apass_matched, active_source) = auto_select_comps(
+                wcs_files[0], cfg.target_radec_deg
             )
-        except Exception as _e:
-            print(f"[LS] 失敗：{_e}")
-    else:
-        print("[LS] 跳過（所有通道有效幀數 < 10）")
+        except RuntimeError as _e:
+            print(f"[SKIP] {ACTIVE_TARGET} 比較星選取失敗，跳過此目標：{_e}")
+            continue
+        print(f"check_star：{check_star}")
+
+        # ── 孔徑估計（以第一通道為準，所有通道共用）──────────────────────────
+        if cfg.aperture_auto:
+            ap_r = estimate_aperture_radius(
+                wcs_files[0], comp_df_matched,
+                cfg.aperture_min_radius, cfg.aperture_max_radius,
+                cfg.aperture_growth_fraction,
+                max_stars=(
+                    max(10, min(30, len(comp_df_matched)))
+                    if comp_df_matched is not None else 20
+                ),
+            )
+            if ap_r is not None:
+                cfg.aperture_radius = ap_r
+                print(
+                    f"[生長曲線] 自動孔徑半徑 = {cfg.aperture_radius:.2f} px"
+                    "（所有通道共用）"
+                )
+
+        ap_r_in, ap_r_out = compute_annulus_radii(
+            cfg.aperture_radius, cfg.annulus_r_in, cfg.annulus_r_out
+        )
+        print(f"孔徑 r={cfg.aperture_radius:.2f}  r_in={ap_r_in:.2f}  r_out={ap_r_out:.2f}")
+        _shared_aperture_radius = cfg.aperture_radius
+
+        # ── 多通道測光迴圈 ────────────────────────────────────────────────────
+        channel_results: dict = {}
+
+        for _ch in CHANNELS:
+            print(f"\n{'='*55}")
+            print(f"  通道 {_ch}  ({CHANNELS.index(_ch) + 1}/{len(CHANNELS)})")
+            print(f"{'='*55}")
+
+            cfg_ch = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=_ch,
+                                   split_subdir=_args.split_subdir)
+            cfg_ch.aperture_radius = _shared_aperture_radius
+            cfg_ch.gain_e_per_adu  = cfg.gain_e_per_adu
+            cfg_ch.read_noise_e    = cfg.read_noise_e
+
+            _split_dir = cfg_ch.wcs_dir
+            _fits_ch   = sorted(_split_dir.glob(f"*_{_ch}.fits"))
+            if not _fits_ch:
+                print(f"  [SKIP] split/{_ch}/ 找不到 FITS，跳過此通道")
+                continue
+
+            print(f"  FITS 張數：{len(_fits_ch)}")
+            print(f"  輸出 CSV ：{cfg_ch.phot_out_csv}")
+
+            df_ch, _comp_lc_ch = run_photometry_on_wcs_dir(
+                _split_dir,
+                cfg_ch.phot_out_csv,
+                cfg_ch.phot_out_png,
+                comp_refs=comp_refs,
+                check_star=check_star,
+                ap_radius=cfg_ch.aperture_radius,
+                channel=_ch,
+            )
+            channel_results[_ch] = df_ch
+            _ok_cnt = int(df_ch['ok'].sum()) if 'ok' in df_ch.columns else 0
+            print(f"  [完成] {_ch}：ok={_ok_cnt} / {len(df_ch)} 幀")
+
+            # R 通道：額外跑 Gaia RP→Rc 輸出獨立 R_GAIA 結果
+            if str(_ch).upper() == "R":
+                try:
+                    print(f"\n[R_GAIA] 對 R 通道額外執行 Gaia RP→Rc 測光")
+                    _gaia_r_raw = fetch_gaia_dr3_cone(
+                        cfg_ch.target_radec_deg[0], cfg_ch.target_radec_deg[1],
+                        radius_arcmin=cfg_ch.apass_radius_deg * 60.0,
+                        mag_min=cfg_ch.comp_mag_min, mag_max=cfg_ch.comp_mag_max,
+                        channel="R",
+                    )
+                    if len(_gaia_r_raw) >= cfg_ch.ensemble_min_comp:
+                        if hasattr(cfg_ch, "out_dir"):
+                            _cat_dir_r = Path(cfg_ch.out_dir) / "catalogs"
+                            _cat_dir_r.mkdir(parents=True, exist_ok=True)
+                            _gaia_r_raw.to_csv(_cat_dir_r / "catalog_GaiaDR3_Rc.csv", index=False)
+                            print(f"  [R_GAIA] 星表已儲存 ({len(_gaia_r_raw)} 筆)")
+                    else:
+                        print(f"  [R_GAIA] Gaia RP→Rc 有效星不足，跳過")
+                except Exception as _e_gaia_r:
+                    print(f"  [WARN] R_GAIA 失敗：{_e_gaia_r}")
+
+        print(f"\n所有通道完成：{list(channel_results.keys())}")
+
+        # ── LS + Fourier 分析：全部通道（含 G2）──────────────────────────────
+        _ls_results_all: dict = {}
+        for _ls_ch, _ls_df in channel_results.items():
+            if _ls_df is None:
+                continue
+            _n_ok = int(_ls_df["ok"].sum())
+            if _n_ok < 10:
+                print(f"[LS] {_ls_ch} 有效幀數 {_n_ok} < 10，跳過")
+                continue
+            print(f"\n[LS] 通道 {_ls_ch}（有效幀數：{_n_ok}）")
+            try:
+                _pa_dir  = cfg_ch.out_dir / "period_analysis"
+                _pa_dir.mkdir(parents=True, exist_ok=True)
+                _ls_png  = _pa_dir / f"periodogram_{_ls_ch}_{ACTIVE_DATE}.png"
+                _fit_png = _pa_dir / f"phase_fold_{_ls_ch}_{ACTIVE_DATE}.png"
+                _ls_r  = run_lomb_scargle(
+                    _ls_df, out_png=_ls_png,
+                    target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
+                    lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
+                )
+                _fit_r = run_fourier_fit(
+                    _ls_r["t"], _ls_r["mag"],
+                    _ls_r["best_period"], _ls_r["err"],
+                    out_png=_fit_png,
+                    target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
+                    lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
+                )
+                _ls_results_all[_ls_ch] = {"ls": _ls_r, "fit": _fit_r}
+            except Exception as _e_ls:
+                print(f"[LS] {_ls_ch} 失敗：{_e_ls}")
+
+        if not _ls_results_all:
+            print("[LS] 跳過（所有通道有效幀數 < 10）")
+
+        # ── G1/G2 比值光變曲線 ────────────────────────────────────────────────
+        _dg1 = channel_results.get("G1")
+        _dg2 = channel_results.get("G2")
+        if _dg1 is not None and _dg2 is not None:
+            _need_cols = ["bjd_tdb", "t_flux_net", "m_var", "ok"]
+            _g1_ok = all(c in _dg1.columns for c in _need_cols)
+            _g2_ok = all(c in _dg2.columns for c in _need_cols)
+            if _g1_ok and _g2_ok:
+                _mg = pd.merge(
+                    _dg1[_need_cols].rename(columns={
+                        "t_flux_net": "flux_G1", "m_var": "m_G1", "ok": "ok_G1"
+                    }),
+                    _dg2[_need_cols].rename(columns={
+                        "t_flux_net": "flux_G2", "m_var": "m_G2", "ok": "ok_G2"
+                    }),
+                    on="bjd_tdb", how="inner",
+                )
+                _mg = _mg[(_mg["ok_G1"] == 1) & (_mg["ok_G2"] == 1)].copy()
+                if len(_mg) >= 3:
+                    _mg["flux_ratio_G1G2"] = (
+                        _mg["flux_G1"] / _mg["flux_G2"].replace(0, np.nan)
+                    )
+                    _mg["mag_diff_G1G2"] = _mg["m_G1"] - _mg["m_G2"]
+                    # CSV 輸出
+                    _ratio_csv = cfg_ch.out_dir / f"G1G2_ratio_{ACTIVE_DATE}.csv"
+                    _mg[["bjd_tdb", "flux_ratio_G1G2", "mag_diff_G1G2",
+                          "flux_G1", "flux_G2", "m_G1", "m_G2"]].to_csv(
+                        _ratio_csv, index=False, float_format="%.8f"
+                    )
+                    print(f"[G1/G2] 比值 CSV：{_ratio_csv}（{len(_mg)} 幀）")
+                    # 繪圖：flux ratio + mag diff
+                    _ratio_png = cfg_ch.out_dir / f"G1G2_ratio_{ACTIVE_DATE}.png"
+                    _fig_r, _ax_r = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+                    _med_ratio = float(np.nanmedian(_mg["flux_ratio_G1G2"]))
+                    _med_mag   = float(np.nanmedian(_mg["mag_diff_G1G2"]))
+                    _ax_r[0].plot(_mg["bjd_tdb"], _mg["flux_ratio_G1G2"], "g.", ms=4)
+                    _ax_r[0].axhline(_med_ratio, color="k", ls="--", lw=0.8,
+                                     label=f"median={_med_ratio:.4f}")
+                    _ax_r[0].set_ylabel("G1 / G2 flux ratio")
+                    _ax_r[0].set_title(f"{ACTIVE_TARGET} {ACTIVE_DATE} — G1/G2 flux ratio")
+                    _ax_r[0].legend(fontsize=8)
+                    _ax_r[1].plot(_mg["bjd_tdb"], _mg["mag_diff_G1G2"], "g.", ms=4)
+                    _ax_r[1].axhline(_med_mag, color="k", ls="--", lw=0.8,
+                                     label=f"median={_med_mag:.4f} mag")
+                    _ax_r[1].set_ylabel("G1 − G2 (mag)")
+                    _ax_r[1].set_xlabel("BJD_TDB")
+                    _ax_r[1].legend(fontsize=8)
+                    plt.tight_layout()
+                    _fig_r.savefig(_ratio_png, dpi=150)
+                    plt.close("all")
+                    print(f"[G1/G2] 比值圖：{_ratio_png}")
+                    # LS on G1/G2 ratio
+                    if len(_mg) >= 10:
+                        try:
+                            _ratio_df = pd.DataFrame({
+                                "bjd_tdb":     _mg["bjd_tdb"].values,
+                                "m_var":       _mg["mag_diff_G1G2"].values,
+                                "t_sigma_mag": np.full(len(_mg), 0.001),
+                                "ok":          1,
+                            })
+                            _pa_dir_r = cfg_ch.out_dir / "period_analysis"
+                            _pa_dir_r.mkdir(parents=True, exist_ok=True)
+                            _ls_ratio = run_lomb_scargle(
+                                _ratio_df,
+                                out_png=_pa_dir_r / f"periodogram_G1G2ratio_{ACTIVE_DATE}.png",
+                                target_name=ACTIVE_TARGET, channel="G1/G2 ratio",
+                                obs_date=ACTIVE_DATE,
+                                lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
+                            )
+                            run_fourier_fit(
+                                _ls_ratio["t"], _ls_ratio["mag"],
+                                _ls_ratio["best_period"], _ls_ratio["err"],
+                                out_png=_pa_dir_r / f"phase_fold_G1G2ratio_{ACTIVE_DATE}.png",
+                                target_name=ACTIVE_TARGET, channel="G1/G2 ratio",
+                                obs_date=ACTIVE_DATE,
+                                lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
+                            )
+                            print("[G1/G2] ratio LS + Fourier 完成")
+                        except Exception as _e_ratio:
+                            print(f"[G1/G2] LS 失敗：{_e_ratio}")
+                else:
+                    print(f"[G1/G2] 對齊幀數 {len(_mg)} < 3，跳過比值計算")
+            else:
+                print("[G1/G2] 欄位不完整（需要 t_flux_net、m_var、ok），跳過比值計算")
+        else:
+            print("[G1/G2] G1 或 G2 通道資料不存在，跳過比值計算")
+
+        print(f"\n[完成] {ACTIVE_TARGET} {ACTIVE_DATE} 全部通道週期分析完成")
