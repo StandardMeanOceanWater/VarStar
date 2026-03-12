@@ -100,8 +100,8 @@ targets:
     display_name: "V1162 Ori"
     vmag_approx: 9.0
   AlVel:
-    ra_hint_h: 9.458297      # Al Vel (HD 83953) Hipparcos 09h 27m 29.87s
-    dec_hint_deg: -44.681583  # -44° 40' 53.7"
+    ra_hint_h: 8.519801      # Al Vel SIMBAD 08h31m11.28s (127.797 deg)
+    dec_hint_deg: -47.665948  # -47° 39' 57.4"  (修正前錯填為 9.458297h / -44.682°)
     display_name: "Al Vel"
     vmag_approx: 6.4          # GCVS: 極大 6.17, 極小 6.67 V；HADS 變星
   CCAnd:
