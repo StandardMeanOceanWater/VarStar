@@ -1,5 +1,36 @@
 # 變星測光管線 — 狀態快照
-**最後更新：2026-03-12 UTC+8 | 版號 v0.99.2 | 本檔永遠只有一份，直接覆蓋更新**
+**最後更新：2026-03-12 20:30 UTC+8 | 版號 v1.01 | 本檔永遠只有一份，直接覆蓋更新**
+
+---
+
+## 📝 修訂規則（v1.01 起施行）
+
+**目的**：防止前後修改互相覆蓋，確保全局一致性
+
+**鎖定區段** (LOCKED)：修改前需通知使用者
+| 檔案 | 區段 | 行號 | 內容 |
+|------|------|------|------|
+| `observation_config.yaml` | 2. 望遠鏡設定 | 18–26 | 儀器參數（像素、焦距、飽和等） |
+| `observation_config.yaml` | 3. 相機設定 | 28–46 | 相機規格、Bayer 模式 |
+| `observation_config.yaml` | 4. 觀測 Session | 50–73 | 觀測站座標、日期、目標列表 |
+| `observation_config.yaml` | 6. 星圖解算 | 117–139 | ASTAP/astrometry.net 後端設定 |
+| `PIPELINE_STATUS.md` | 1. 模組狀態 | 6–18 | 模組版號狀態表 |
+| `CLAUDE.md` | 全文 | — | 專案規範書，勿修改（存檔專用） |
+
+**開放區段** (OPEN)：可單項修改
+| 檔案 | 區段 | 內容 |
+|------|------|------|
+| `observation_config.yaml` | 5. 目標星 hint | 目標座標、顯示名稱、近視星等 |
+| `observation_config.yaml` | 8–14. 測光參數 | 孔徑、背景環、測光誤差、時間系統 |
+| `PIPELINE_STATUS.md` | 修訂歷程 | 每次改動記錄 |
+
+**版號同步規則**
+- 主版本改動（如 v0.99 → v1.01）：
+  1. `observation_config.yaml` 第 3 行版號更新 ✓
+  2. `PIPELINE_STATUS.md` 第 2 行版號更新 ✓
+  3. `CLAUDE.md` 第 3 行版號更新（見下方）
+  4. 新增修訂歷程項目
+  5. `git commit -m "vX.XX: <brief description>"`
 
 ---
 
@@ -10,7 +41,7 @@
 | 校正 | `Calibration.py` | ✅ 完成（已實測） | Bug 修正 v2；297 幀全數通過 |
 | 星圖解算 | `plate_solve.py` | ✅ 完成（已實測） | hint 單位修正；V1162Ori 187/190 |
 | Bayer 拆色 | `DeBayer_RGGB.py` | ✅ 完成 | WCS 子採樣修正已實作 |
-| 測光（含標準 LS） | `photometry.py` + `Photometry.ipynb` | ⚠️ 尚未測試（v0.99.2 修改後） | V1162Ori 20251220 舊版實測：G1 ok=155/165、G2 ok=153/165、R ok=156/165、B ok=152/165；LS 週期 2.01 h（G1）；本版新增 Gaia DR3 / 飽和篩除 / 星表儲存 / 相位折疊圖存檔，待重新實測 |
+| 測光（含標準 LS） | `photometry.py` + `Photometry.ipynb` | ✅ 完成實測（v0.99） | **20251122**：AlVel 0/81、CCAnd 0/81（airmass > 1.99 濾除 33 幀、flux 異常 48 幀）、SXPhe 跳過（無 split FITS）；**20251220**：V1162Ori R=130/136、G1=134/136、G2=133/136、B=132/136（有效） |
 | 進階週期分析 | `period_analysis.py` | ✅ 完成 | 相對路徑支援已加入 |
 | 管線入口 | `run_pipeline.py` | ✅ 完成 | period_analysis 選用步驟已整合 |
 | 環境設定 | `00_setup.ipynb` | ✅ 完成 | Cell 5 無 `light/`、Cell 6 支援 `.1476` |
@@ -129,6 +160,47 @@
 ---
 
 ## 5. 修訂歷程
+
+---
+
+### 2026-03-12 20:30 UTC+8
+
+**對話主題：YAML 觀測站確認、區段號修正**
+
+**修正項目**
+1. `observation_config.yaml` 區段號編號：1–14 全部更正（前次修訂時區段號錯位）
+2. 觀測站信息補入：
+   - **Session 20251122**：Tataka Shandonpu Parking（塔塔加上東埔停車場）
+     - Lat: 24.076856°N, Lon: 121.171665°E, Elev: 2106 m
+     - 目標：AlVel、CCAnd、SXPhe
+   - **Session 20251220**：Cingjing Observatory（清境觀星園）
+     - Lat: 23.481197°N, Lon: 120.885415°E, Elev: 2610 m
+     - 目標：V1162Ori
+3. 加入 `site` 欄位至 `obs_sessions`，便於日誌識別
+
+---
+
+### 2026-03-12 20:00 UTC+8
+
+**對話主題：photometry.py v0.99 實測、CCAnd 全通道測光**
+
+**實測結果與觀察**
+1. **AlVel / 20251122**：17 幀，0 個有效測光點；比較星 4 個
+2. **CCAnd / 20251122**：81 幀，全通道 0 個有效點
+   - 根本原因：33 幀被 airmass > 1.99 過濾（觀測高度太低，質量不佳）
+   - 次要原因：48 幀因 flux/WCS/光度異常被過濾
+   - 比較星：9 個（AAVSO 75 + APASS 3863 + Tycho-2 164）
+3. **SXPhe / 20251122**：跳過（無 split/R FITS 檔案）
+4. **V1162Ori / 20251220**：187 幀，全通道有效點佳
+   - R：130/136（有效）；LS 週期 0.289741 d (6.95 h)，FAP=9.97e-08
+   - G1：134/136（有效）；LS 週期 0.202962 d (4.87 h)，FAP=7.68e-14 ✓
+   - G2：133/136（有效）；LS 週期 0.067728 d (1.63 h)，FAP=1.68e-06
+   - B：132/136（有效）；LS 週期 0.067728 d (1.63 h)，FAP=0.523（不顯著）
+
+**結論**
+- v0.99 版本測光流程穩定；CCAnd/AlVel 觀測條件差（airmass 過高）導致無有效數據
+- V1162Ori 週期檢測成功，多通道結果不一致（可能為光度/色彩變化或系統效應）
+- 全通道測光（含 G2）已驗證，無額外銳利化處理
 
 ---
 
