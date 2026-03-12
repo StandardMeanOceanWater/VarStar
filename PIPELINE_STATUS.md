@@ -156,6 +156,7 @@
 - [x] `observation_config.yaml` 加入 `observatory:` 區塊（`latitude_deg/longitude_deg/elevation_m`）
 - [x] `comp_mag_min/max` yaml 覆蓋機制（固定 6–13 mag，避免依賴 `vmag_approx` 估算）
 - [x] 觀測站實際座標已填入：Tataka Shandonpu Parking / Cingjing Observatory
+- [x] CCAnd yaml hint 座標修正：原值錯填 23.647767h/38.584°，正確為 0.730003h/42.282°（V* CC And, SIMBAD）
 - [ ] 診斷 EXIF ISO 讀出為 0（FITS GAIN/RDNOISE 空白），在 photometry 前處理
 - [x] Gaia DR3 比較星介面（`fetch_gaia_dr3_cone`，G→V/Rc/B 三通道轉換，⚠️ 尚未實測）
 - [ ] APASS 本機星表（約 1.5 GB，離線環境備用，低優先）

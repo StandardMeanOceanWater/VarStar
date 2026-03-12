@@ -105,8 +105,8 @@ targets:
     display_name: "Al Vel"
     vmag_approx: 6.4          # GCVS: 極大 6.17, 極小 6.67 V；HADS 變星
   CCAnd:
-    ra_hint_h: 23.647767
-    dec_hint_deg: 38.583972
+    ra_hint_h: 0.730003      # V* CC And SIMBAD 00h43m48.01s (10.950052 deg)
+    dec_hint_deg: 42.282157  # +42° 16' 55.8"  (修正前錯填為 23.647767h / 38.584°)
     display_name: "CC And"
     vmag_approx: 10.8
   SXPhe:
