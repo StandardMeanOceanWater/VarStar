@@ -135,12 +135,11 @@ def _run_calibration(config_path: Path) -> bool:
         return False
 
 
-def _run_plate_solve(config_path: Path) -> bool:
-    """呼叫 plate_solve.run_plate_solve()。"""
+def _run_plate_solve(config_path: Path, auto_yes: bool = False) -> bool:
+    """呼叫 plate_solve.run_plate_solve()，完成後自動執行 VSX 查詢。"""
     try:
         from plate_solve import run_plate_solve
         run_plate_solve(config_path)
-        return True
     except ImportError as exc:
         print(
             f"[ERROR] 無法匯入 plate_solve.py：{exc}\n"
@@ -150,6 +149,219 @@ def _run_plate_solve(config_path: Path) -> bool:
     except Exception as exc:
         print(f"[ERROR] plate_solve 步驟失敗：{exc}")
         return False
+
+    # plate_solve 成功後自動執行 VSX 查詢（失敗不中斷 pipeline）
+    _run_vsx_query(config_path, auto_yes=auto_yes)
+    return True
+
+
+def _run_vsx_query(config_path: Path, auto_yes: bool = False) -> None:
+    """
+    plate_solve 完成後，從 WCS 結果取視場中心，查詢 AAVSO VSX。
+
+    流程
+    ----
+    1. 讀 yaml，找出所有 session 的 WCS 目錄
+    2. 讀 CRVAL1/CRVAL2，取中位數作為視場中心
+    3. 呼叫 vsx_query.query_vsx()
+    4. 符合條件的目標寫入 yaml（人工確認或 --yes 跳過）
+    失敗只印 WARN，不中斷 pipeline。
+    """
+    import re
+
+    import numpy as np
+    import yaml
+    from astropy.io import fits
+
+    # ── 讀設定 ─────────────────────────────────────────────────────────────
+    try:
+        with config_path.open("r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+    except Exception as exc:
+        print(f"[WARN] VSX：無法讀取設定檔：{exc}")
+        return
+
+    vsx_cfg = cfg.get("vsx", {})
+    if not vsx_cfg.get("auto_query", True):
+        return
+
+    radius = float(vsx_cfg.get("search_radius_deg", 1.55))
+    mag_max = float(vsx_cfg.get("auto_add_mag_max", 13.0))
+    add_types = [t.upper() for t in vsx_cfg.get("auto_add_types", [])]
+
+    try:
+        import google.colab  # noqa: F401
+        project_root = Path(cfg["paths"]["colab"]["project_root"])
+    except ImportError:
+        project_root = Path(cfg["paths"]["local"]["project_root"])
+
+    sessions = cfg.get("obs_sessions", [])
+    if not sessions:
+        print("[WARN] VSX：yaml 無 obs_sessions，跳過。")
+        return
+
+    existing_keys = set((cfg.get("targets") or {}).keys())
+
+    for session in sessions:
+        date = str(session.get("date", ""))
+        targets = session.get("targets", [])
+
+        for target in targets:
+            wcs_dir = (
+                project_root / "data" / "targets" / target
+                / "calibrated" / "wcs"
+            )
+            wcs_files = sorted(wcs_dir.glob("*_wcs.fits")) if wcs_dir.exists() else []
+            if not wcs_files:
+                print(f"[WARN] VSX [{target}]：找不到 WCS 檔案，跳過。")
+                continue
+
+            # ── 取 CRVAL 中位數 ─────────────────────────────────────────
+            ra_vals, dec_vals = [], []
+            for wf in wcs_files:
+                try:
+                    hdr = fits.getheader(wf)
+                    if "CRVAL1" in hdr and "CRVAL2" in hdr:
+                        ra_vals.append(float(hdr["CRVAL1"]))
+                        dec_vals.append(float(hdr["CRVAL2"]))
+                except Exception:
+                    continue
+
+            if not ra_vals:
+                print(f"[WARN] VSX [{target}]：所有 WCS 檔案均無 CRVAL，跳過。")
+                continue
+
+            center_ra  = float(np.median(ra_vals))
+            center_dec = float(np.median(dec_vals))
+            print(f"\n[VSX] {target} 視場中心：RA={center_ra:.4f}°  Dec={center_dec:+.4f}°  r={radius}°")
+
+            # ── 呼叫 VSX ────────────────────────────────────────────────
+            try:
+                from vsx_query import query_vsx, print_table, save_csv
+            except ImportError as exc:
+                print(f"[WARN] VSX：無法匯入 vsx_query.py：{exc}")
+                return
+
+            out_dir = project_root / "data" / "targets" / target / "output"
+            df = query_vsx(center_ra, center_dec, radius)
+            if df is None or df.empty:
+                print(f"[VSX] {target}：查詢結果為空。")
+                continue
+
+            print_table(df)
+
+            # CSV 存成 vsx_candidates_{date}.csv
+            out_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = out_dir / f"vsx_candidates_{date}.csv"
+            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            print(f"[VSX] saved → {csv_path}")
+
+            # ── 篩選符合條件的候選 ──────────────────────────────────────
+            candidates = df[df["max_mag_num"] <= mag_max].copy()
+            if add_types:
+                candidates = candidates[
+                    candidates["var_type"].str.upper().isin(add_types)
+                ]
+            # 排除已在 yaml 的目標（key = name 去空白）
+            def _to_key(name: str) -> str:
+                return re.sub(r"\s+", "", str(name))
+
+            new_candidates = candidates[
+                ~candidates["name"].apply(_to_key).isin(existing_keys)
+            ]
+
+            if new_candidates.empty:
+                print(f"[VSX] {target}：無符合條件的新目標需要加入。")
+                continue
+
+            # ── 確認提示 ────────────────────────────────────────────────
+            print(f"\n[VSX] 以下 {len(new_candidates)} 筆符合條件，準備寫入 yaml：")
+            for _, row in new_candidates.iterrows():
+                print(f"  {row['name']:<20} {row['var_type']:<10} "
+                      f"MaxMag={row['max_mag']} {row['max_band']}  "
+                      f"Period={row['period']}d  AUID={row['auid']}")
+
+            if not auto_yes:
+                ans = input("\n確認寫入 observation_config.yaml？[y/N] ").strip().lower()
+                if ans != "y":
+                    print("[VSX] 跳過寫入。")
+                    continue
+
+            # ── 寫入 yaml（字串 append，保留現有註解）──────────────────
+            _vsx_append_targets(
+                config_path, new_candidates, date, existing_keys
+            )
+            # 更新 existing_keys 避免同一次執行重複加入
+            for _, row in new_candidates.iterrows():
+                existing_keys.add(_to_key(str(row["name"])))
+
+
+def _vsx_append_targets(
+    config_path: Path,
+    candidates: "pd.DataFrame",
+    obs_date: str,
+    existing_keys: set,
+) -> None:
+    """
+    將 VSX 候選目標以字串 append 方式寫入 yaml targets 區塊末尾。
+    保留現有所有註解與格式，不使用 yaml.dump()。
+    """
+    import re
+
+    text = config_path.read_text(encoding="utf-8")
+
+    new_blocks = []
+    for _, row in candidates.iterrows():
+        raw_name = str(row["name"]).strip()
+        key = re.sub(r"\s+", "", raw_name)
+        if key in existing_keys:
+            continue
+        ra_h = row["ra_deg"] / 15.0 if row["ra_deg"] == row["ra_deg"] else 0.0
+        dec  = row["dec_deg"] if row["dec_deg"] == row["dec_deg"] else 0.0
+        period_str = str(row["period"]).strip()
+        try:
+            period_val = f"{float(period_str):.5f}"
+        except (ValueError, TypeError):
+            period_val = period_str or "null"
+        mag_str = str(row["max_mag"]).strip()
+        try:
+            vmag_val = f"{float(mag_str):.2f}"
+        except (ValueError, TypeError):
+            vmag_val = mag_str
+        block = (
+            f"  {key}:  # auto_added: true — VSX 自動加入，需人工審核後正式納入\n"
+            f"    ra_hint_h: {ra_h:.6f}    # {row['ra_deg']:.4f} deg\n"
+            f"    dec_hint_deg: {dec:.4f}\n"
+            f"    display_name: \"{raw_name}\"\n"
+            f"    vmag_approx: {vmag_val}    # {row['max_band']} band\n"
+            f"    var_type: \"{row['var_type']}\"\n"
+            f"    period_d: {period_val}\n"
+            f"    auid: \"{row['auid']}\"\n"
+            f"    obs_date: \"{obs_date}\"\n"
+        )
+        new_blocks.append(block)
+
+    if not new_blocks:
+        return
+
+    # 找到 targets: 區塊最後一個有效條目的結尾，插入新條目
+    # 策略：在下一個頂層區塊（^[a-z]）之前插入
+    insert_marker = re.compile(r"^(?=\S)", re.MULTILINE)
+    # 找 targets: 之後第一個頂層 key（非 targets 本身）
+    targets_pos = text.find("\ntargets:")
+    if targets_pos == -1:
+        targets_pos = text.find("targets:")
+    after_targets = text[targets_pos:]
+    next_section = re.search(r"\n(?=[a-z_]+:\s*\n)", after_targets[9:])
+
+    if next_section:
+        insert_at = targets_pos + 9 + next_section.start() + 1
+        new_text = text[:insert_at] + "\n" + "".join(new_blocks) + text[insert_at:]
+    else:
+        new_text = text.rstrip() + "\n\n" + "".join(new_blocks) + "\n"
+
+    config_path.write_text(new_text, encoding="utf-8")
+    print(f"[VSX] {len(new_blocks)} 筆目標已寫入 {config_path.name}（標注 auto_added）")
 
 
 def _run_debayer(config_path: Path) -> bool:
@@ -421,6 +633,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="stop_on_error",
         help="任一步驟失敗時立即中止後續步驟（預設：繼續執行）。",
     )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        dest="auto_yes",
+        help="VSX 自動新增目標時跳過確認提示（預設：互動確認）。",
+    )
     return parser.parse_args(argv)
 
 
@@ -519,7 +737,10 @@ def main(argv: list[str] | None = None) -> int:
 
         step_start = time.monotonic()
         runner = _STEP_RUNNERS[step]
-        ok: bool = runner(config_path)
+        if step == "plate_solve":
+            ok: bool = runner(config_path, auto_yes=args.auto_yes)
+        else:
+            ok: bool = runner(config_path)
         elapsed = time.monotonic() - step_start
 
         status = "✓ 完成" if ok else "✗ 失敗"

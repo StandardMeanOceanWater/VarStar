@@ -59,6 +59,7 @@ _DEFAULT_CONFIG: Dict = {
             "normalization": "standard",
             "period_min_hr": 0.5,
             "period_max_hr": 24.0,
+            "period_max_hours": 12.0,
             "oversampling": 10,
             "fap_method": "bootstrap",
             "fap_bootstrap_max_iter": 1000,
@@ -403,7 +404,12 @@ def run_ls_and_dft(
     """
     ls_cfg = _get(cfg, "period_analysis", "lomb_scargle", default={})
     period_min_days = _get(ls_cfg, "period_min_hr", default=0.5) / 24.0
-    period_max_days = _get(ls_cfg, "period_max_hr", default=24.0) / 24.0
+    # period_max_hours 優先覆蓋 period_max_hr（同步限制搜尋上限與圖形顯示上限）
+    _pmh = _get(ls_cfg, "period_max_hours", default=None)
+    if _pmh is not None:
+        period_max_days = float(_pmh) / 24.0
+    else:
+        period_max_days = _get(ls_cfg, "period_max_hr", default=24.0) / 24.0
     oversampling = _get(ls_cfg, "oversampling", default=10)
     max_iter = _get(ls_cfg, "fap_bootstrap_max_iter", default=1000)
     converge_window = _get(ls_cfg, "fap_bootstrap_converge_window", default=100)
@@ -466,6 +472,7 @@ def run_ls_and_dft(
         "fap": fap,
         "fap_n_iter": fap_n_iter,
         "fap_status": fap_status,
+        "period_max_days": period_max_days,
     }
 
 
@@ -921,14 +928,47 @@ def plot_period_analysis(
     fig, axes = plt.subplots(1, 3, figsize=(15, 4), dpi=dpi)
     fig.suptitle(
         f"Period Analysis: {target_name} [{channel}]",
-        fontsize=12,
+        fontsize=14, x=0.02, ha="left",
+    )
+    _sigma_med = float(np.nanmedian(err)) if len(err) > 0 else float("nan")
+    fig.text(
+        0.98, 0.98,
+        f"Reliability: σ_med = {_sigma_med:.4f} mag",
+        ha="right", va="top",
+        fontsize=14, color="saddlebrown",
     )
 
     # 子圖 1：LS 週期圖
     ax = axes[0]
-    ax.plot(1.0 / freqs, ls_result["ls_power"], "k-", lw=0.5)
-    ax.axvline(best_p, color="r", ls="--", lw=1, alpha=0.8, label=f"P={best_p:.4f} d")
-    ax.set_xlabel("Period (days)")
+    periods_days = 1.0 / freqs
+    periods_hr = periods_days * 24.0
+    best_p_hr = best_p * 24.0
+    _best_h = int(best_p_hr)
+    _best_m = int((best_p_hr - _best_h) * 60)
+    ax.plot(periods_hr, ls_result["ls_power"], "k-", lw=0.5)
+    ax.axvline(best_p_hr, color="r", ls="--", lw=1, alpha=0.8,
+               label=f"P = {_best_h}:{_best_m:02d}")
+
+    # x 軸顯示上限（period_max_days，來自 period_max_hours）
+    _plot_xmax_days = ls_result.get("period_max_days", periods_days.max())
+    _plot_xmax_hr = _plot_xmax_days * 24.0
+    ax.set_xlim(0.0, _plot_xmax_hr)
+
+    # 第二高峰：與最高峰距離 >= 20% * best_p，在顯示範圍內
+    _min_sep_hr = 0.20 * best_p_hr
+    _mask_p2 = (
+        (np.abs(periods_hr - best_p_hr) >= _min_sep_hr)
+        & (periods_hr <= _plot_xmax_hr)
+    )
+    if _mask_p2.any():
+        _p2_idx = int(np.argmax(ls_result["ls_power"][_mask_p2]))
+        _p2_hr = float(periods_hr[_mask_p2][_p2_idx])
+        _p2_h = int(_p2_hr)
+        _p2_m = int((_p2_hr - _p2_h) * 60)
+        ax.axvline(_p2_hr, color="orange", ls="--", lw=1, alpha=0.8,
+                   label=f"P2 = {_p2_h}:{_p2_m:02d}")
+
+    ax.set_xlabel("Period (hours)")
     ax.set_ylabel("LS Power")
     ax.set_title(
         f"Lomb-Scargle\nFAP={fap:.2e}  ({fap_n_iter} iter, {fap_status})"
@@ -937,9 +977,10 @@ def plot_period_analysis(
 
     # 子圖 2：DFT 振幅譜
     ax = axes[1]
-    ax.plot(1.0 / freqs, ls_result["dft_amp"], "b-", lw=0.5)
-    ax.axvline(best_p, color="r", ls="--", lw=1, alpha=0.8)
-    ax.set_xlabel("Period (days)")
+    ax.plot(periods_hr, ls_result["dft_amp"], "b-", lw=0.5)
+    ax.axvline(best_p_hr, color="r", ls="--", lw=1, alpha=0.8)
+    ax.set_xlim(0.0, _plot_xmax_hr)
+    ax.set_xlabel("Period (hours)")
     ax.set_ylabel("Amplitude (mag)")
     ax.set_title("DFT Amplitude (cross-check)")
 
@@ -968,7 +1009,7 @@ def plot_period_analysis(
     )
     ax.invert_yaxis()
     ax.set_xlabel("Phase (phi=0: max brightness)")
-    ax.set_ylabel("Diff Magnitude")
+    ax.set_ylabel("Calibrated magnitude")
     ax.set_title(
         f"P = {best_p:.6f} ± {best_p_err:.1e} d\n"
         f"Amp = {fit_result['amplitude']:.3f} mag"

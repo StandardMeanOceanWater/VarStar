@@ -1,5 +1,5 @@
 # 變星測光管線 — 狀態快照
-**最後更新：2026-03-12 UTC+8 | 版號 v1.02 | 本檔永遠只有一份，直接覆蓋更新**
+**最後更新：2026-03-14 UTC+8 | 版號 v1.03 | 本檔永遠只有一份，直接覆蓋更新**
 
 ---
 
@@ -158,6 +158,7 @@
 - [x] 觀測站實際座標已填入：Tataka Shandonpu Parking / Cingjing Observatory
 - [x] CCAnd yaml hint 座標修正：原值錯填 23.647767h/38.584°，正確為 0.730003h/42.282°（V* CC And, SIMBAD）
 - [x] AlVel yaml hint 座標修正：原值錯填 9.458297h/-44.682°，正確為 8.519801h/-47.666°（Al Vel, SIMBAD）；WCS 像素驗證確認解星正確
+- [ ] **V1162Ori plate_solve 重跑**：所有 FITS CRVAL 錯指 V1643Ori（83.56°, −6.98°），需用正確 hint（ra=5.7374h, dec=+12.763°）重新解算，再重跑拆色 → 測光
 - [ ] 診斷 EXIF ISO 讀出為 0（FITS GAIN/RDNOISE 空白），在 photometry 前處理
 - [x] Gaia DR3 比較星介面（`fetch_gaia_dr3_cone`，G→V/Rc/B 三通道轉換，⚠️ 尚未實測）
 - [ ] APASS 本機星表（約 1.5 GB，離線環境備用，低優先）
@@ -191,7 +192,121 @@
 
 ---
 
-### 2026-03-12（v1.02）UTC+8
+### 2026-03-14 凌晨 UTC+8
+
+**對話主題：AlVel 盲解驗證、管線自動化處理**
+
+**AlVel 盲解結果**
+- 用 PowerShell 以 `-r 180`（全天）對 17 張 calibrated FITS 盲解
+- 17/17 全部 PLTSOLVD=True，CRVAL≈(128.0°, −47.93°) ✅
+- 對應 Al Vel（船帆座），RA=08h 31m，Dec=−47°39'，與 SIMBAD 一致
+- hint 更新：`ra_hint_h: 8.519801`，`dec_hint_deg: -47.666`
+- AlVel obs_session 已解除註解，debayer 完成（17/17）
+
+**AlVel 測光結果**
+- 全部 17 幀 airmass=4.4–5.1（仰角 11–13°）
+- 門檻 2.366（25°）全部被篩除，0/17 有效
+- **根本原因：AlVel Dec=−47.7°，從塔塔加（北緯 24°）觀測最高仰角僅 ~19°，幾何限制**
+- 這批資料不適合精密測光，建議視為練習資料
+
+**V1162Ori 狀態**
+- WCS 已用 hint 重新解算（187/187），CRVAL=(83.557°, −6.985°）
+- ASTAP GUI 盲解驗證：CRVAL=(83.784°, −7.482°)，offset=48'（正常）
+- photometry G2：比較星 40 顆，108/187 幀保留，週期 2.99h，FAP=7.35e-18
+
+**待辦**
+- AlVel 測光：若要強跑，需把 airmass 門檻暫時調到 5.5
+- V1162Ori 全通道測光（目前只有 G2）
+- sigma_clip 28 幀問題（比較星 40 顆可能不夠 ensemble 穩定）
+
+---
+
+### 2026-03-14 UTC+8
+
+**對話主題：測光驗證、選取圓修正、ASTAP 盲解校驗**
+
+**已實作**
+1. `_catalog_direct_phot`：在 pixel 座標計算後加入選取圓篩選（影像中心為圓心，短邊/2 為半徑），邊界排除從 55 → 6 筆
+2. 三組診斷 print 移除（pyc 快取問題，刪除後生效）
+3. airmass 門檻：dataclass 預設值從 1.994（30°）改為 2.366（25°），高氣團跳過從 51 → 34 幀
+4. 全幀 CSV：airmass 砍掉的幀現在也記錄進 CSV（`ok_flag=high_airmass`），CSV 從 136 → 187 rows
+5. Rejection timeline 圖：`output/rejection_timeline_*.png`，x=elapsed time，y=airmass，顏色=篩除原因
+6. zp_overview 散佈圖：加入回歸公式文字標注 + 目標星空心紅圈，已驗證成功（R²=0.974，slope=1.027）
+7. `ATime = Time` 頂層別名，修正 UnboundLocalError
+8. `FITSFixedWarning` 抑制：`warnings.filterwarnings("ignore", message=".*datfix.*")`
+
+**ASTAP 盲解校驗結果**
+- 用一張 V1162Ori 校正後 FITS（全幅 6264×4180）盲解
+- 結果：CRVAL=(83.784°, −7.482°)，Offset=48.0'，plate scale=1.485 arcsec/px ✅
+- 管線現有 WCS：CRVAL=(83.557°, −6.985°)，差約 0.5°
+- **結論：V1162Ori 的 WCS 需要重新 plate solve**（用正確 hint 重跑）
+
+**待辦（下次繼續）**
+- V1162Ori plate_solve 重跑（hint 已修正，需重跑 calibrated → plate_solve → debayer → photometry）
+- sigma_clip 從 7 → 28 的問題（比較星從 68 → 40，ensemble 可能不穩）
+- 多目標共用拆色檔架構（session-centric）
+- VSX 查詢整合
+
+---
+
+### 2026-03-13 晚 UTC+8（第二段）
+
+**對話主題：架構討論、Huber 回歸、診斷輸出改善**
+
+**已實作**
+1. `robust_zero_point`：`_fit` 改用 Huber 回歸（sklearn HuberRegressor，epsilon=1.35），失敗時退回 polyfit；舊版 OLS 保留為註解
+2. `zp_overview` 散佈圖：加入回歸公式文字標注（左上角紅字）＋目標星空心紅圈
+3. `ATime` UnboundLocalError 修正：頂層加 `ATime = Time` 別名，移除函式內重複 import
+4. FITSFixedWarning 海嘯：頂層加 `warnings.filterwarnings("ignore", message=".*datfix.*")`
+5. `datetime` 遮蔽修正（`import datetime as _dt_local`）已於第一段完成
+
+**架構討論結論（待實作）**
+- **Airmass 門檻**：改為 25°（airmass ≈ 2.37），原 30° 太嚴
+- **全幀記錄 CSV**：所有 187 幀都進 CSV，airmass 砍掉的填 `ok_flag=high_airmass`
+- **Rejection timeline 圖**：x=本地時間，每幀一點，顏色=篩除原因，存至 `output/`
+- **多目標共用拆色檔**：session-centric 架構，一份 split FITS 跑多顆目標（待設計）
+- **VSX 查詢整合**：用視野中心座標查 VSX，篩出 6–9 等、在長邊 1/2 半徑圓內的變星（待實作）
+- **解星校驗**：用 ASTAP 盲解校正後 FITS，確認 CRVAL 是否正確
+
+**術語確認**
+- 本管線做的是**校正測光（calibrated photometry）**，非差分測光
+- y 軸標籤已是 `Calibrated Magnitude (mag)`（前次已改）
+
+---
+
+### 2026-03-13 UTC+8
+
+**對話主題：V1162Ori 20251220 比較星選取失敗診斷 + WCS CRPIX/CD 修正**
+
+**診斷過程（只加 print，不改邏輯）**
+1. `_catalog_direct_phot` 加入三組診斷 print：
+   - mag 篩選範圍（mag_min/max）
+   - 星表 m_cat 分布（min/max/median/NaN 數）
+   - mag 範圍外跳過統計（NaN vs 真正超出範圍）
+2. 加入影像尺寸與 margin 診斷
+3. 加入邊界排除候選星的 pixel 座標診斷（前 20 筆）
+
+**診斷結果（V1162Ori R 通道）**
+- mag 篩選範圍：6.0 ～ 11.0
+- 星表 3932 筆：min=4.62、max=17.69、**median=15.04**（絕大多數太暗）
+- mag 範圍外跳過 3817 筆（NaN=268，超範圍=3549）
+- 剩餘 115 筆進入測光：邊界排除 113、飽和排除 2、通過 0
+
+**WCS 修正：`_fix_debayer_wcs()`**
+- 問題：plate_solve 對全幅 Bayer 影像解算，CRPIX 是全幅像素，拆色後影像為一半
+- 修正：新增 `_fix_debayer_wcs(wcs_obj)` helper（行 628 前），套用至三處 `WCS(hdr)` 呼叫（行 967、1928、2437）
+- 效果：x 從 7654 縮至 3826（正確縮 ½），通過從 0 → 2
+
+**根本原因（待處理）**
+- 邊界排除的 113 筆座標仍完全不合理（x≈3500–4000，y≈−11000）
+- 原因：**V1162Ori 所有 FITS 的 CRVAL=(83.56°, −6.98°)，這是 V1643Ori 的座標**
+- plate_solve 解星時 hint 帶錯，V1162Ori 的 WCS 全部指向 V1643Ori 天區
+- 星表查詢位置正確（ra=86°, dec=+12°），但影像 WCS 指向 19° 外
+- **待辦：V1162Ori 全部 FITS 需以正確 hint（ra=5.7374h, dec=+12.763°）重跑 plate_solve**
+
+---
+
+### 2026-03-12（v1.03）UTC+8
 
 **對話主題：輸出表格整理、格式問題修正**
 

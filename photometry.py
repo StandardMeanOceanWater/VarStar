@@ -30,6 +30,7 @@ import os
 import logging
 
 import warnings
+warnings.filterwarnings("ignore", message=".*datfix.*")
 
 # Windows cp950 終端機：強制 stdout/stderr 使用 UTF-8，防止 Unicode crash
 if hasattr(sys.stdout, "reconfigure"):
@@ -47,8 +48,9 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.stats import sigma_clipped_stats
 from astropy.time import Time
+ATime = Time   # 別名，供函式內部使用（避免 local import 遮蔽）
 import matplotlib.pyplot as plt
-from photutils.detection import DAOStarFinder
+from photutils.detection import DAOStarFinder, IRAFStarFinder
 
 # ── Module-level logger（__main__ 會加 handler；函數直接用此 logger）──────────
 _phot_logger = logging.getLogger("photometry")
@@ -127,7 +129,9 @@ class Cfg:
     # ── 比較星選取 ─────────────────────────────────────────────────────────────
     # 選取範圍：以目標星為圓心，影像短邊像素數一半為半徑
     selection_radius_mode: str = "half_short_side"
-    comp_mag_range: float = 4.0       # 目標星 ± comp_mag_range 等
+    comp_mag_range: float = 4.0        # deprecated：± 對稱範圍，優先用下方兩個
+    comp_mag_bright: float = 4.0      # 比目標星亮最多 N 等
+    comp_mag_faint: float = 2.0       # 比目標星暗最多 N 等
     comp_mag_min: float = 4.0         # 動態計算後填入
     comp_mag_max: float = 12.0        # 動態計算後填入
     comp_max: int = 15
@@ -188,7 +192,7 @@ class Cfg:
     # alt_min_deg=45° 對應 airmass ≈ 1.41（Young 1994）。
     # airmass=NaN（location 未設定）時不截斷。
     alt_min_deg: float = 30.0
-    alt_min_airmass: float = 1.994   # Young (1994) at alt=30°
+    alt_min_airmass: float = 2.366   # Young (1994) at alt=25°（原 1.994=30°）
 
     # ── 穩健回歸 ──────────────────────────────────────────────────────────────
     robust_regression_sigma: float = 3.0
@@ -204,7 +208,10 @@ class Cfg:
     # ── 幀品質篩選 ────────────────────────────────────────────────────────────
     sharpness_min: float = 0.3        # Sharpness index 下限（0.0 = 停用）
     zp_r2_min: float = 0.0            # ZP 回歸 R² 下限（0.0 = 停用）
-    peak_ratio_min: float = 0.0       # 峰值比 t_max_pix/t_flux_net 下限（0.0 = 停用）；次鏡起霧/甜甜圈偵測
+    peak_ratio_min: float = 0.0       # [deprecated] 峰值比固定下限（0.0=停用）；建議改用 peak_ratio_k
+    peak_ratio_k: float = 0.0         # 自適應門檻倍數（0.0=停用）；peak_ratio < median - k×MAD 時剔除
+    zp_intercept_sigma: float = 0.0   # ZP 截距突變閾值（倍 MAD，0.0 = 停用）；薄雲/透明度驟變偵測
+    sky_sigma: float = 0.0            # 背景突升閾值（倍 MAD，0.0 = 停用）；起霧/散射光偵測
 
     # ── 舊版相容（ASTAP 板塊解算，保留供 Cell 5 使用）────────────────────────
     fits_dir: Path = Path(".")
@@ -263,18 +270,28 @@ def cfg_from_yaml(
     vmag    = float(tgt.get("vmag_approx", 8.0))
     display = tgt.get("display_name", target)
 
-    # ── 比較星星等範圍（動態）──────────────────────────────────────────────────
-    comp_range = float(
-        yaml_dict.get("comparison_stars", {}).get("mag_range_delta", 4.0)
-    )
-    comp_mag_min = vmag - comp_range
-    comp_mag_max = vmag + comp_range
-    # yaml 可直接覆蓋 comp_mag_min / comp_mag_max
+    # ── 比較星星等範圍（動態，非對稱）────────────────────────────────────────
     _cmp = yaml_dict.get("comparison_stars", {})
+    if "comp_mag_bright" in _cmp or "comp_mag_faint" in _cmp:
+        # 新參數：非對稱範圍
+        _bright = float(_cmp.get("comp_mag_bright", 4.0))
+        _faint  = float(_cmp.get("comp_mag_faint",  2.0))
+        comp_mag_min = vmag - _bright
+        comp_mag_max = vmag + _faint
+    else:
+        # fallback：舊的對稱參數
+        print(
+            "[WARN] comparison_stars.comp_mag_bright / comp_mag_faint 未設定，"
+            "退回 mag_range_delta（deprecated）。請更新 yaml。"
+        )
+        _range = float(_cmp.get("mag_range_delta", 4.0))
+        comp_mag_min = vmag - _range
+        comp_mag_max = vmag + _range
+    # yaml 固定上下限作為夾鉗（不飽和保護 / 信噪比下限），取更嚴格的那側
     if "comp_mag_min" in _cmp:
-        comp_mag_min = float(_cmp["comp_mag_min"])
+        comp_mag_min = max(comp_mag_min, float(_cmp["comp_mag_min"]))
     if "comp_mag_max" in _cmp:
-        comp_mag_max = float(_cmp["comp_mag_max"])
+        comp_mag_max = min(comp_mag_max, float(_cmp["comp_mag_max"]))
 
     # ── 儀器參數 ───────────────────────────────────────────────────────────────
     # 找到此 target + date 對應的 session
@@ -351,7 +368,8 @@ def cfg_from_yaml(
         aavso_star_name=display,
 
         # 比較星
-        comp_mag_range=comp_range,
+        comp_mag_bright=float(_cmp.get("comp_mag_bright", 4.0)),
+        comp_mag_faint=float(_cmp.get("comp_mag_faint", 2.0)),
         comp_mag_min=comp_mag_min,
         comp_mag_max=comp_mag_max,
         comp_max=int(cmp_cfg.get("max_stars", 15)),
@@ -424,6 +442,9 @@ def cfg_from_yaml(
         sharpness_min=float(phot_cfg.get("sharpness_min", 0.3)),
         zp_r2_min=float(phot_cfg.get("zp_r2_min", 0.0)),
         peak_ratio_min=float(phot_cfg.get("peak_ratio_min", 0.0)),
+        peak_ratio_k=float(phot_cfg.get("peak_ratio_k", 0.0)),
+        zp_intercept_sigma=float(phot_cfg.get("zp_intercept_sigma", 0.0)),
+        sky_sigma=float(phot_cfg.get("sky_sigma", 0.0)),
 
         # 舊版相容
         fits_dir=wcs_dir,
@@ -1009,9 +1030,29 @@ def robust_zero_point(
         return None
 
     def _fit(msk):
-        if w is None:
-            return np.polyfit(m_cat[msk], m_inst[msk], 1)
-        return np.polyfit(m_cat[msk], m_inst[msk], 1, w=np.sqrt(w[msk]))
+        """Huber 強壯回歸（epsilon=1.35）；失敗時退回加權 OLS。"""
+        x_fit = m_cat[msk]
+        y_fit = m_inst[msk]
+        sample_w = np.sqrt(w[msk]) if w is not None else None
+        try:
+            from sklearn.linear_model import HuberRegressor
+            X = x_fit.reshape(-1, 1)
+            hr = HuberRegressor(epsilon=1.35, max_iter=200)
+            if sample_w is not None:
+                hr.fit(X, y_fit, sample_weight=sample_w)
+            else:
+                hr.fit(X, y_fit)
+            return float(hr.coef_[0]), float(hr.intercept_)
+        except Exception:
+            # sklearn 不可用時退回 polyfit（原始 OLS）
+            if sample_w is not None:
+                return np.polyfit(x_fit, y_fit, 1, w=sample_w)
+            return np.polyfit(x_fit, y_fit, 1)
+    # ── 原始 OLS（已改為 Huber，保留備查）────────────────────────────────────
+    # def _fit(msk):
+    #     if w is None:
+    #         return np.polyfit(m_cat[msk], m_inst[msk], 1)
+    #     return np.polyfit(m_cat[msk], m_inst[msk], 1, w=np.sqrt(w[msk]))
 
     a, b = _fit(mask)
     for _ in range(int(max_iter)):
@@ -1909,6 +1950,7 @@ def auto_select_comps(
         """
         rows = []
         n_bounds, n_sat, n_phot = 0, 0, 0
+        _diag_bounds_rows = []   # 收集邊界排除的候選星（診斷用）
         for _, row in cat_df.iterrows():
             try:
                 ra_c  = float(row[ra_col])
@@ -1921,8 +1963,14 @@ def auto_select_comps(
             if not (mag_min <= m_c <= mag_max):
                 continue
             xc, yc = radec_to_pixel(wcs_obj, ra_c, dec_c)
+            # 選取圓：影像中心為圓心，半徑 = 短邊 / 2
+            _cx, _cy = _w / 2.0, _h / 2.0
+            _sel_r   = float(min(_h, _w)) / 2.0
+            if np.hypot(xc - _cx, yc - _cy) > _sel_r:
+                continue
             if not in_bounds(img, xc, yc, margin=_margin):
                 n_bounds += 1
+                _diag_bounds_rows.append((ra_c, dec_c, m_c, xc, yc))
                 continue
             phot = aperture_photometry(img, xc, yc, _ap_r, _r_in, _r_out)
             if phot.get("ok") != 1 or not np.isfinite(phot.get("flux_net", np.nan)):
@@ -2400,16 +2448,19 @@ def run_photometry_on_wcs_dir(
         # airmass 已知（非 NaN）時才做截斷；location 未設定時不截斷（airmass=NaN）。
         if np.isfinite(airmass) and airmass > cfg.alt_min_airmass:
             n_skipped += 1
+            rec["ok_flag"] = "high_airmass"
+            rows.append(rec)
             continue
 
         # ── [1] 幀層級 FWHM 篩選 ─────────────────────────────────────────────
-        # 用 DAOStarFinder 估算全幀中位數 FWHM，剔除模糊/拖影幀。
+        # 用 IRAFStarFinder 估算全幀中位數 FWHM，剔除模糊/拖影幀。
+        # 注意：DAOStarFinder 不輸出 fwhm 欄，改用 IRAFStarFinder（有 fwhm 欄）。
         _frame_fwhm_median = np.nan
         try:
             _f_mean, _f_med, _f_std = sigma_clipped_stats(img, sigma=3.0, maxiters=3)
             if _f_std > 0:
-                _dao_fwhm = DAOStarFinder(fwhm=4.0, threshold=5.0 * _f_std)
-                _tbl_fwhm = _dao_fwhm(img - _f_med)
+                _iraf_fwhm = IRAFStarFinder(fwhm=4.0, threshold=5.0 * _f_std)
+                _tbl_fwhm = _iraf_fwhm(img - _f_med)
                 if _tbl_fwhm is not None and len(_tbl_fwhm) > 0:
                     _frame_fwhm_median = float(np.median(_tbl_fwhm["fwhm"]))
         except Exception:
@@ -2557,10 +2608,11 @@ def run_photometry_on_wcs_dir(
             weights=np.asarray(comp_weights, dtype=float),
         )
 
-        # 捕捉第一幀資料供診斷圖使用
+        # 捕捉第一幀資料供診斷圖使用（含目標星儀器星等）
         if _first_frame_diag_data is None and len(comp_m_cat) >= 2:
             _first_frame_diag_data = (
-                comp_m_cat.copy(), comp_m_inst.copy(), fit
+                comp_m_cat.copy(), comp_m_inst.copy(), fit,
+                float(getattr(cfg, "vmag_approx", np.nan)), float(m_inst_t),
             )
 
         if fit is None:
@@ -2707,7 +2759,72 @@ def run_photometry_on_wcs_dir(
                   f"(|m_var - median| > 3sigma = {3.0 * _robust_sigma:.4f})")
     _n_after_clip = int((df["ok"] == 1).sum())
 
+    # ── ZP 截距突變篩選 ────────────────────────────────────────────────────────
+    # 薄雲或透明度驟變時所有比較星同步變暗，零點截距 b 會系統性漂移。
+    # 滾動中位數（±5 幀）捕捉短時突變，偏離超過 zp_intercept_sigma × MAD 則剔除。
+    n_zp_jump = 0
+    _zp_intercept_sigma = float(getattr(cfg, "zp_intercept_sigma", 0.0))
+    if _zp_intercept_sigma > 0 and "zp_intercept" in df.columns:
+        _zp_col = df["zp_intercept"].copy()
+        _zp_roll_med = _zp_col.rolling(window=11, center=True, min_periods=3).median()
+        _zp_resid = (_zp_col - _zp_roll_med).abs()
+        _zp_mad = float(np.nanmedian(_zp_resid[df["ok"] == 1]))
+        _zp_thresh = _zp_intercept_sigma * 1.4826 * _zp_mad if _zp_mad > 0 else np.inf
+        _zp_jump_mask = (df["ok"] == 1) & (_zp_resid > _zp_thresh)
+        if _zp_jump_mask.any():
+            df.loc[_zp_jump_mask, "ok"] = 0
+            if "ok_flag" not in df.columns:
+                df["ok_flag"] = ""
+            df.loc[_zp_jump_mask, "ok_flag"] = "zp_jump"
+            n_zp_jump = int(_zp_jump_mask.sum())
+            print(f"[zp_jump] MAD={_zp_mad:.4f}  thresh={_zp_thresh:.4f}  "
+                  f"clipped {n_zp_jump} frames")
+
+    # ── 天空背景突升篩選 ──────────────────────────────────────────────────────
+    # 起霧或散射光使目標孔徑背景環中位數升高，t_b_sky 突升可做為霧的早期指標。
+    # 滾動中位數（±5 幀）捕捉短時突變，偏離超過 sky_sigma × MAD 則剔除。
+    n_high_sky = 0
+    _sky_sigma = float(getattr(cfg, "sky_sigma", 0.0))
+    if _sky_sigma > 0 and "t_b_sky" in df.columns:
+        _sky_col = df["t_b_sky"].copy()
+        _sky_roll_med = _sky_col.rolling(window=11, center=True, min_periods=3).median()
+        _sky_resid = _sky_col - _sky_roll_med  # 只看正向突升
+        _sky_mad = float(np.nanmedian(_sky_resid[df["ok"] == 1].abs()))
+        _sky_thresh = _sky_sigma * 1.4826 * _sky_mad if _sky_mad > 0 else np.inf
+        _sky_jump_mask = (df["ok"] == 1) & (_sky_resid > _sky_thresh)
+        if _sky_jump_mask.any():
+            df.loc[_sky_jump_mask, "ok"] = 0
+            if "ok_flag" not in df.columns:
+                df["ok_flag"] = ""
+            df.loc[_sky_jump_mask, "ok_flag"] = "high_sky"
+            n_high_sky = int(_sky_jump_mask.sum())
+            print(f"[high_sky] MAD={_sky_mad:.4f}  thresh={_sky_thresh:.4f}  "
+                  f"clipped {n_high_sky} frames")
+
+    # ── peak_ratio 自適應篩選 ─────────────────────────────────────────────────
+    # 自適應門檻，不依賴絕對值，可移植至不同望遠鏡/相機。
+    # peak_ratio 極低代表 PSF 中心被挖空（次鏡起霧甜甜圈）。
+    # 門檻 = median(peak_ratio) - peak_ratio_k × MAD，整夜所有幀一起算。
+    n_low_peak_ratio_adaptive = 0
+    _peak_ratio_k = float(getattr(cfg, "peak_ratio_k", 0.0))
+    if _peak_ratio_k > 0 and "peak_ratio" in df.columns:
+        _pr_vals = df.loc[df["ok"] == 1, "peak_ratio"].dropna()
+        if len(_pr_vals) >= 5:
+            _pr_med = float(np.median(_pr_vals))
+            _pr_mad = float(np.median(np.abs(_pr_vals - _pr_med)))
+            _pr_thresh = _pr_med - _peak_ratio_k * 1.4826 * _pr_mad
+            _pr_mask = (df["ok"] == 1) & (df["peak_ratio"].notna()) & (df["peak_ratio"] < _pr_thresh)
+            if _pr_mask.any():
+                df.loc[_pr_mask, "ok"] = 0
+                if "ok_flag" not in df.columns:
+                    df["ok_flag"] = ""
+                df.loc[_pr_mask, "ok_flag"] = "low_peak_ratio"
+                n_low_peak_ratio_adaptive = int(_pr_mask.sum())
+                print(f"[peak_ratio adaptive] median={_pr_med:.4f}  MAD={_pr_mad:.4f}  "
+                      f"thresh={_pr_thresh:.4f}  clipped {n_low_peak_ratio_adaptive} frames")
+
     # ── 剔除統計表 ────────────────────────────────────────────────────────────
+    # 統計結果同步存檔（帶時間戳，不覆蓋），供調整篩選閾值時對照各版本剔除效果
     _n_total_fits  = len(wcs_files_sorted)
     _n_in_df       = len(df)
     _n_ok_final    = int((df["ok"] == 1).sum())
@@ -2718,9 +2835,10 @@ def run_photometry_on_wcs_dir(
     _n_low_sharpness_val = n_low_sharpness
     _n_low_peak_ratio_val = n_low_peak_ratio
     _n_low_zp_r2_val     = n_low_zp_r2
-    # 重新計算 _n_phot_fail：排除四層篩選計數
+    # 重新計算 _n_phot_fail：排除所有已命名篩選計數
     _n_qual_filtered = (_n_high_fwhm_val + _n_low_sharpness_val
-                        + _n_low_peak_ratio_val + _n_low_zp_r2_val)
+                        + _n_low_peak_ratio_val + _n_low_zp_r2_val
+                        + n_zp_jump + n_high_sky + n_low_peak_ratio_adaptive)
     _n_phot_fail   = _n_in_df - _n_ok_final - _n_sigma_clip - _n_qual_filtered
 
     _sep = "-" * 68
@@ -2735,9 +2853,32 @@ def run_photometry_on_wcs_dir(
     print(f"  {'低 ZP R2 剔除':<24} {_n_low_zp_r2_val:>6}    zp_r2 < {float(getattr(cfg,'zp_r2_min',0.0)):.2f} (0=停用)")
     print(f"  {'孔徑/WCS/邊界失敗':<24} {_n_phot_fail:>6}    flux/位置無效")
     print(f"  {'sigma_clip':<24} {_n_sigma_clip:>6}    |m_var - median| > 3 * 1.4826 * MAD")
+    print(f"  {'ZP 截距突變':<24} {n_zp_jump:>6}    rolling median ± {float(getattr(cfg,'zp_intercept_sigma',0.0)):.1f} MAD (0=停用)")
+    print(f"  {'天空背景突升':<24} {n_high_sky:>6}    rolling median + {float(getattr(cfg,'sky_sigma',0.0)):.1f} MAD (0=停用)")
+    print(f"  {'Peak Ratio 自適應':<24} {n_low_peak_ratio_adaptive:>6}    median - {float(getattr(cfg,'peak_ratio_k',0.0)):.1f} MAD (0=停用)")
     print(_sep)
     print(f"  {'保留 (ok=1)':<24} {_n_ok_final:>6} / {_n_total_fits} 幀")
     print()
+
+    # 存檔：帶時間戳，不覆蓋
+    _rej_rows = [
+        {"reason": "高氣團跳過",       "count": _n_alt_skip,            "threshold": f"airmass > {cfg.alt_min_airmass:.2f}",                              "config_key": "max_airmass",         "config_value": cfg.alt_min_airmass},
+        {"reason": "高 FWHM 幀剔除",   "count": _n_high_fwhm_val,       "threshold": f"fwhm > {cfg.comp_fwhm_max:.1f} px",                                "config_key": "max_fwhm_px",         "config_value": cfg.comp_fwhm_max},
+        {"reason": "低 Sharpness 剔除", "count": _n_low_sharpness_val,   "threshold": f"S < {float(getattr(cfg,'sharpness_min',0.3)):.2f}",                 "config_key": "sharpness_min",       "config_value": float(getattr(cfg, "sharpness_min", 0.3))},
+        {"reason": "低 Peak Ratio 剔除","count": _n_low_peak_ratio_val,  "threshold": f"peak/flux < {float(getattr(cfg,'peak_ratio_min',0.0)):.3f}",        "config_key": "peak_ratio_min",      "config_value": float(getattr(cfg, "peak_ratio_min", 0.0))},
+        {"reason": "低 ZP R2 剔除",    "count": _n_low_zp_r2_val,       "threshold": f"zp_r2 < {float(getattr(cfg,'zp_r2_min',0.0)):.2f}",                 "config_key": "zp_r2_min",           "config_value": float(getattr(cfg, "zp_r2_min", 0.0))},
+        {"reason": "孔徑/WCS/邊界失敗", "count": _n_phot_fail,           "threshold": "flux/位置無效",                                                     "config_key": "—",                   "config_value": "—"},
+        {"reason": "sigma_clip",        "count": _n_sigma_clip,          "threshold": "|m_var - median| > 3 * 1.4826 * MAD",                               "config_key": "—",                   "config_value": "—"},
+        {"reason": "ZP 截距突變",       "count": n_zp_jump,              "threshold": f"rolling |zp_intercept - med| > {float(getattr(cfg,'zp_intercept_sigma',0.0)):.1f} MAD", "config_key": "zp_intercept_sigma", "config_value": float(getattr(cfg, "zp_intercept_sigma", 0.0))},
+        {"reason": "天空背景突升",       "count": n_high_sky,                    "threshold": f"rolling (t_b_sky - med) > {float(getattr(cfg,'sky_sigma',0.0)):.1f} MAD",                     "config_key": "sky_sigma",           "config_value": float(getattr(cfg, "sky_sigma", 0.0))},
+        {"reason": "Peak Ratio 自適應", "count": n_low_peak_ratio_adaptive,    "threshold": f"peak_ratio < median - {float(getattr(cfg,'peak_ratio_k',0.0)):.1f} * 1.4826 * MAD",           "config_key": "peak_ratio_k",        "config_value": float(getattr(cfg, "peak_ratio_k", 0.0))},
+        {"reason": "保留 (ok=1)",       "count": _n_ok_final,                   "threshold": f"/ {_n_total_fits} 幀",                                                                         "config_key": "—",                   "config_value": "—"},
+    ]
+    _rej_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _rej_stem = out_csv.stem  # e.g. photometry_G1_20251220
+    _rej_path = out_csv.parent / f"rejection_stats_{_rej_stem}_{_rej_ts}.csv"
+    pd.DataFrame(_rej_rows).to_csv(_rej_path, index=False, encoding="utf-8-sig")
+    print(f"[剔除統計] saved → {_rej_path}")
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
@@ -2745,7 +2886,7 @@ def run_photometry_on_wcs_dir(
     print(f"[CSV] saved → {out_csv}  "
           f"({n_written} rows written, {_n_after_clip} successful "
           f"[{_n_before_clip - _n_after_clip} sigma-clipped], "
-          f"{n_skipped} skipped [alt < {cfg.alt_min_deg:.0f}°])")
+          f"{n_skipped} skipped [airmass > {cfg.alt_min_airmass:.3f}])")
 
     # ── 零點診斷總覽圖：殘差時序 + 第一幀散佈圖 ─────────────────────────────
     if cfg.save_zeropoint_diagnostic:
@@ -2760,6 +2901,8 @@ def run_photometry_on_wcs_dir(
             )
 
             # 左：殘差時序圖
+            import datetime as _dt_zp
+            import matplotlib.ticker as _mticker_zp
             ax_ts = axes_diag[0]
             if "zp_residual_rms" in _df_ok.columns and np.isfinite(_df_ok["zp_residual_rms"]).any():
                 ax_ts.plot(
@@ -2775,6 +2918,69 @@ def run_photometry_on_wcs_dir(
                 ax_ts.set_title("Zero-point residual RMS vs. time")
                 ax_ts.legend(fontsize=8)
                 ax_ts.grid(True, alpha=0.3)
+
+                # ── x 軸：完整 BJD 數值，移除科學記號偏移 ────────────────
+                ax_ts.xaxis.set_major_formatter(
+                    _mticker_zp.FuncFormatter(lambda v, _: f"{v:.2f}")
+                )
+
+                # ── 上方 Local Time 刻度（UTC+8）────────────────────────
+                _tz_zp  = float(getattr(cfg, "tz_offset_hours", 8))
+                _ts_arr = _df_ok[time_key].dropna().values
+                if len(_ts_arr) > 0:
+                    _bjd_lo_zp = float(_ts_arr.min())
+                    _bjd_hi_zp = float(_ts_arr.max())
+                    _tmin_zp   = (ATime(_bjd_lo_zp, format="jd", scale="tdb")
+                                  .to_datetime()
+                                  + _dt_zp.timedelta(hours=_tz_zp))
+                    _tmax_zp   = (ATime(_bjd_hi_zp, format="jd", scale="tdb")
+                                  .to_datetime()
+                                  + _dt_zp.timedelta(hours=_tz_zp))
+                    _tks_30_zp, _tks_60_zp = [], []
+                    _cur_zp = _tmin_zp.replace(second=0, microsecond=0)
+                    _cur_zp = _cur_zp.replace(minute=(_cur_zp.minute // 30) * 30)
+                    while _cur_zp <= _tmax_zp + _dt_zp.timedelta(minutes=1):
+                        _utc_zp = _cur_zp - _dt_zp.timedelta(hours=_tz_zp)
+                        _bv_zp  = ATime(_utc_zp).jd
+                        _tks_30_zp.append(_bv_zp)
+                        if _cur_zp.minute == 0:
+                            _tks_60_zp.append(_bv_zp)
+                        _cur_zp += _dt_zp.timedelta(minutes=30)
+
+                    for _bv in _tks_30_zp:
+                        ax_ts.axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
+                    for _bv in _tks_60_zp:
+                        ax_ts.axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
+
+                    def _bjd_to_hhmm_zp(bjd_val, pos):
+                        try:
+                            _t = (ATime(bjd_val, format="jd", scale="tdb")
+                                  .to_datetime()
+                                  + _dt_zp.timedelta(hours=_tz_zp))
+                            return _t.strftime("%H:%M")
+                        except Exception:
+                            return ""
+
+                    _ax_top_zp = ax_ts.twiny()
+                    _ax_top_zp.set_xlim(ax_ts.get_xlim())
+                    _ax_top_zp.xaxis.set_major_locator(
+                        _mticker_zp.FixedLocator(_tks_30_zp)
+                    )
+                    _ax_top_zp.xaxis.set_major_formatter(
+                        _mticker_zp.FuncFormatter(_bjd_to_hhmm_zp)
+                    )
+                    _ax_top_zp.tick_params(
+                        axis="x", which="major",
+                        direction="out", length=4,
+                        colors="steelblue", labelsize=7, labelcolor="steelblue",
+                    )
+                    # "Local Time" 標籤：刻度列最左端
+                    _ax_top_zp.text(
+                        -0.002, 1.01, "Local Time",
+                        transform=_ax_top_zp.transAxes,
+                        ha="right", va="bottom",
+                        fontsize=7, color="steelblue", clip_on=False,
+                    )
             else:
                 ax_ts.text(0.5, 0.5, "No residual data", transform=ax_ts.transAxes,
                            ha="center", va="center")
@@ -2783,16 +2989,30 @@ def run_photometry_on_wcs_dir(
             ax_sc = axes_diag[1]
             _ffd = _first_frame_diag_data
             if _ffd is not None:
-                _mc, _mi, _fit = _ffd
+                _mc, _mi, _fit = _ffd[:3]
+                _tgt_mcat = _ffd[3] if len(_ffd) > 3 else np.nan
+                _tgt_minst = _ffd[4] if len(_ffd) > 4 else np.nan
                 _ok_pts = np.isfinite(_mc) & np.isfinite(_mi)
                 ax_sc.scatter(_mc[_ok_pts], _mi[_ok_pts], s=12, alpha=0.6,
-                              color="steelblue", label=f"n={_ok_pts.sum()}")
+                              color="steelblue", label=f"comp (n={_ok_pts.sum()})")
                 if _fit and np.isfinite(_fit.get("a", np.nan)):
+                    _a, _b, _r2 = _fit["a"], _fit["b"], _fit.get("r2", np.nan)
                     _xl = np.linspace(_mc[_ok_pts].min(), _mc[_ok_pts].max(), 100)
-                    ax_sc.plot(_xl, _fit["a"] * _xl + _fit["b"], "r-", lw=1.5,
-                               label=f"a={_fit['a']:.3f} b={_fit['b']:.3f} R2={_fit['r2']:.3f}")
+                    ax_sc.plot(_xl, _a * _xl + _b, "r-", lw=1.5,
+                               label=f"$m_{{inst}}={_a:.3f}\\,m_{{cat}}+({_b:.3f})$  $R^2={_r2:.3f}$")
+                    # 公式文字標注在圖內
+                    ax_sc.text(0.04, 0.95,
+                               f"$m_{{inst}} = {_a:.3f}\\,m_{{cat}} + ({_b:.3f})$\n$R^2 = {_r2:.3f}$",
+                               transform=ax_sc.transAxes, fontsize=7,
+                               va="top", color="red",
+                               bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+                # 目標星紅圈
+                if np.isfinite(_tgt_mcat) and np.isfinite(_tgt_minst):
+                    ax_sc.scatter([_tgt_mcat], [_tgt_minst], s=80, marker="o",
+                                  facecolors="none", edgecolors="red", linewidths=1.8,
+                                  zorder=5, label=f"target  $m_{{cat}}$={_tgt_mcat:.1f}")
                 _xr = np.array([_mc[_ok_pts].min(), _mc[_ok_pts].max()])
-                ax_sc.plot(_xr, _xr, "k--", lw=0.8, alpha=0.4)
+                ax_sc.plot(_xr, _xr, "k--", lw=0.8, alpha=0.4, label="ideal")
                 ax_sc.invert_yaxis()
                 ax_sc.set_xlabel(f"$m_{{cat}}$ ({cfg.phot_band})")
                 ax_sc.set_ylabel("$m_{inst}$")
@@ -2815,6 +3035,54 @@ def run_photometry_on_wcs_dir(
         except Exception as _e:
             print(f"[WARN] 零點診斷圖輸出失敗：{_e}")
 
+    # ── Rejection timeline 圖 ────────────────────────────────────────────────
+    try:
+        _rej_colors = {
+            "high_airmass":  "#aaaaaa",
+            "high_fwhm":     "#e67e22",
+            "low_sharpness": "#9b59b6",
+            "low_peak_ratio":"#1abc9c",
+            "low_zp_r2":     "#e74c3c",
+            "phot_fail":     "#c0392b",
+            "sigma_clip":    "#2980b9",
+            "zp_jump":       "#f39c12",
+            "high_sky":      "#16a085",
+            "ok":            "#cccccc",
+        }
+        _rej_fig, _rej_ax = plt.subplots(figsize=(12, 3))
+        _df_all = df.copy()
+        _df_all["_flag"] = _df_all["ok_flag"].fillna("ok").where(_df_all["ok"] == 0, "ok")
+        # 用 bjd_tdb 轉本地時間（UTC+8）
+        _tz_h = float(getattr(cfg, "tz_offset_hours", 8))
+        if time_key in _df_all.columns and _df_all[time_key].notna().any():
+            _t_local = (_df_all[time_key] - 2400000.5) * 86400  # MJD → 秒，只取相對值
+            _t0 = _t_local.min()
+            _t_rel = (_t_local - _t0) / 3600  # 相對小時
+        else:
+            _t_rel = pd.Series(range(len(_df_all)), dtype=float)
+        for _flag, _grp in _df_all.groupby("_flag"):
+            _col = _rej_colors.get(_flag, "#888888")
+            _size = 15 if _flag == "ok" else 40
+            _zord = 2 if _flag == "ok" else 3
+            _idx = _df_all.index[_df_all["_flag"] == _flag]
+            _rej_ax.scatter(_t_rel.iloc[_idx], _df_all.loc[_df_all["_flag"] == _flag, "airmass"],
+                            c=_col, s=_size, label=_flag, zorder=_zord, alpha=0.85)
+        _rej_ax.set_xlabel("Elapsed time (hours from first frame)")
+        _rej_ax.set_ylabel("Airmass")
+        _rej_ax.invert_yaxis()
+        _rej_ax.set_title(
+            f"Rejection timeline  |  {cfg.target_name}  ch={cfg.phot_band}  {out_csv.stem}",
+            fontsize=9)
+        _rej_ax.legend(fontsize=7, ncol=5, loc="upper right")
+        _rej_ax.grid(True, alpha=0.25)
+        _rej_fig.tight_layout()
+        _rej_path = out_csv.parent / f"rejection_timeline_{out_csv.stem}.png"
+        _rej_fig.savefig(_rej_path, dpi=150)
+        plt.close(_rej_fig)
+        print(f"[剔除時序圖] saved → {_rej_path}")
+    except Exception as _e:
+        print(f"[WARN] 剔除時序圖輸出失敗：{_e}")
+
     # ── Plot light curve ──────────────────────────────────────────────────────
     d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
     if len(d) == 0:
@@ -2824,7 +3092,7 @@ def run_photometry_on_wcs_dir(
         return df, {}
 
     import matplotlib.ticker as mticker
-    from astropy.time import Time as ATime
+    # ATime 已在行 2950 附近作為 local 變數使用，不在此重新 import（會遮蔽）
 
     # 從 csv 檔名取觀測日期
     _lc_obs_date = str(out_csv.stem).split("_")[-1]
@@ -2840,41 +3108,36 @@ def run_photometry_on_wcs_dir(
         """BJD → 本地時間 HH:MM（近似，UTC+8）"""
         try:
             t_utc = ATime(bjd_val, format="jd", scale="tdb").to_datetime()
-            import datetime
-            t_local = t_utc + datetime.timedelta(hours=_tz_offset_h)
+            import datetime as _dt_local
+            t_local = t_utc + _dt_local.timedelta(hours=_tz_offset_h)
             return t_local
         except Exception:
             return None
 
-    # 計算 Local Time 整點刻度位置（BJD）
+    # 計算 Local Time 刻度位置（BJD）
     _t_local_min = _bjd_to_local_hm(bjd_min)
     _t_local_max = _bjd_to_local_hm(bjd_max)
 
-    _major_bjd_ticks = []
-    _major_labels = []
-    _minor_bjd_ticks = []
+    _major_bjd_ticks = []   # 整點
+    _label30_bjd_ticks = []  # 整點 + 半點（有數字標示）
+    _label30_labels = []
+    _minor_bjd_ticks = []   # 每 10 分鐘
     if _t_local_min is not None and _t_local_max is not None:
-        import datetime
-        # 整點刻度
-        _cur = _t_local_min.replace(minute=0, second=0, microsecond=0)
-        if _cur < _t_local_min:
-            _cur += datetime.timedelta(hours=1)
-        while _cur <= _t_local_max + datetime.timedelta(minutes=1):
-            # 反算回 BJD
-            _utc = _cur - datetime.timedelta(hours=_tz_offset_h)
-            _bjd_tick = ATime(_utc).jd
-            _major_bjd_ticks.append(_bjd_tick)
-            _major_labels.append(_cur.strftime("%H:%M"))
-            _cur += datetime.timedelta(hours=1)
-        # 每 10 分鐘小刻度
+        import datetime as _dt_local
+        # 每 10 分鐘刻度，收集整點 / 半點 / 其他
         _cur = _t_local_min.replace(second=0, microsecond=0)
         _min_round = (_cur.minute // 10) * 10
         _cur = _cur.replace(minute=_min_round)
-        while _cur <= _t_local_max + datetime.timedelta(minutes=1):
-            _utc = _cur - datetime.timedelta(hours=_tz_offset_h)
+        while _cur <= _t_local_max + _dt_local.timedelta(minutes=1):
+            _utc = _cur - _dt_local.timedelta(hours=_tz_offset_h)
             _bjd_tick = ATime(_utc).jd
             _minor_bjd_ticks.append(_bjd_tick)
-            _cur += datetime.timedelta(minutes=10)
+            if _cur.minute == 0:
+                _major_bjd_ticks.append(_bjd_tick)
+            if _cur.minute in (0, 30):
+                _label30_bjd_ticks.append(_bjd_tick)
+                _label30_labels.append(_cur.strftime("%H:%M"))
+            _cur += _dt_local.timedelta(minutes=10)
 
     fig, ax = plt.subplots(figsize=(12, 4))
 
@@ -2887,46 +3150,65 @@ def run_photometry_on_wcs_dir(
     ax.invert_yaxis()
     ax.set_xlim(bjd_min - 0.002, bjd_max + 0.002)
 
-    # 主 x 軸（下方）：本地時間 HH:MM，黑色，刻度朝外（預設）
-    if _major_bjd_ticks:
-        ax.set_xticks(_major_bjd_ticks)
-        ax.set_xticklabels(_major_labels, color="black", fontsize=9)
+    # 主 x 軸（下方）：本地時間 HH:MM，每 30 分標數字，10 分 minor tick
     if _minor_bjd_ticks:
         ax.set_xticks(_minor_bjd_ticks, minor=True)
+    if _label30_bjd_ticks:
+        ax.set_xticks(_label30_bjd_ticks)
+        ax.set_xticklabels(_label30_labels, color="black", fontsize=9)
     ax.tick_params(axis="x", which="major", direction="out", colors="black", length=6)
     ax.tick_params(axis="x", which="minor", direction="out", colors="black", length=3)
 
-    # 副 x 軸（上方）：BJD，淺藍色，刻度朝內
-    ax2 = ax.twiny()
-    ax2.set_xlim(ax.get_xlim())
-    # 使用與主軸相同的整點刻度位置，但顯示 BJD 值
-    if _major_bjd_ticks:
-        ax2.set_xticks(_major_bjd_ticks)
-        _bjd_labels = [f"{v:.4f}" for v in _major_bjd_ticks]
-        ax2.set_xticklabels(_bjd_labels, color="lightblue", fontsize=7, rotation=30, ha="left")
-    ax2.tick_params(axis="x", which="major", direction="in",
-                    colors="lightblue", length=8)
+    # 內軸（圖框內下方）：BJD 數值用 ax.text 直接標在圖框底部，避免 secondary_xaxis 排版衝突
+    _xlim = ax.get_xlim()
+    _xspan = _xlim[1] - _xlim[0]
+    _inset_ticks = _label30_bjd_ticks if _label30_bjd_ticks else _major_bjd_ticks
+    for _i, _bjd_v in enumerate(_inset_ticks):
+        if _i == 0:
+            continue  # 跳過第一個，避免與左側 BJD 標題重疊
+        _x_frac = (_bjd_v - _xlim[0]) / _xspan
+        if 0.0 <= _x_frac <= 1.0:
+            ax.text(_x_frac, 0.01, f"{_bjd_v:.4f}",
+                    transform=ax.transAxes,
+                    ha="center", va="bottom",
+                    fontsize=7, color="#00BFFF", rotation=45,
+                    clip_on=True, zorder=5)
+    # "BJD" 標題：圖框內左下角
+    ax.text(0.0, 0.01, "BJD", transform=ax.transAxes,
+            ha="left", va="bottom", fontsize=9, color="#00BFFF", zorder=5)
 
-    # 軸標題：黃色，靠左
-    ax.set_xlabel("Local Time (HH:MM)", color="yellow", loc="left", fontsize=9)
-    ax2.set_xlabel("BJD", color="yellow", loc="left", fontsize=9)
+    # Local Time 軸標題：黑色，靠左
+    ax.set_xlabel("Local Time (HH:MM)", color="black", loc="left", fontsize=9, labelpad=2)
 
-    ax.set_ylabel("Differential magnitude (mag)")
+    ax.set_ylabel("Calibrated Magnitude (mag)")
 
-    # 標題：星名 通道 日期
-    _lc_tname = getattr(cfg, "target_name", "")
-    _lc_title = f"{_lc_tname}  [{channel}]  {_lc_obs_date}"
+    # 標題：display_name 優先，格式 "CC And Light Curve [B]"
+    _lc_tname = getattr(cfg, "display_name", None) or getattr(cfg, "target_name", "")
+    _lc_title = f"{_lc_tname} Light Curve [{channel}]"
     ax.set_title(_lc_title)
 
-    # 右上角：觀測站座標
+    # 圖例字體大小（與日期文字對齊）
+    _annot_fs = 16
+
+    # 左上角：日期（黑色），圖例緊接右邊
+    ax.text(0.01, 0.97, _lc_obs_date,
+            transform=ax.transAxes, ha="left", va="top",
+            fontsize=_annot_fs, color="black")
+    ax.legend(fontsize=_annot_fs, loc="upper left",
+              bbox_to_anchor=(0.01 + len(_lc_obs_date) * 0.013, 0.97),
+              bbox_transform=ax.transAxes,
+              frameon=False, borderaxespad=0)
+
+    # 右上角：觀測站座標（綠色）
     _lat = getattr(cfg, "obs_lat_deg", None)
     _lon = getattr(cfg, "obs_lon_deg", None)
     if _lat is not None and _lon is not None:
-        ax.text(0.99, 0.97, f"{_lat:.2f}  {_lon:.2f}",
+        _lat_str = f"{abs(_lat):.2f}°{'N' if _lat >= 0 else 'S'}"
+        _lon_str = f"{abs(_lon):.2f}°{'E' if _lon >= 0 else 'W'}"
+        ax.text(0.99, 0.97, f"{_lat_str} {_lon_str}",
                 transform=ax.transAxes, ha="right", va="top",
-                fontsize=7, color="gray")
+                fontsize=_annot_fs, color="green")
 
-    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -3257,12 +3539,23 @@ def run_fourier_fit(
     ax.invert_yaxis()
     ax.set_xlabel(f"Phase  (P = {period:.6f} d = {period * 24:.4f} h)",
                   loc="center")
-    ax.set_ylabel("Differential magnitude")
-    _ff_title = f"{target_name}  [{channel}]  {obs_date}" if target_name else "Phase-Folded Light Curve"
-    ax.set_title(_ff_title + "\nPhase-Folded Light Curve + Fourier Fit")
+    ax.set_ylabel("Calibrated magnitude")
+    _ff_title = (f"{target_name}  [{channel}]  {obs_date}"
+                 if target_name else "Phase-Folded Light Curve")
+    ax.set_title(_ff_title + "\nPhase-Folded Light Curve + Fourier Fit",
+                 fontsize=14, loc="left")
+    _sigma_med_ff = (float(np.nanmedian(err))
+                     if err is not None and len(err) > 0 else float("nan"))
+    ax.text(
+        1.0, 1.01,
+        f"Reliability: σ_med = {_sigma_med_ff:.4f} mag",
+        transform=ax.transAxes,
+        ha="right", va="bottom",
+        fontsize=14, color="saddlebrown",
+    )
     ax.legend(fontsize=9, loc="upper left")
     ax.grid(True, alpha=0.4)
-    # 右上角：觀測站座標
+    # 右上角：觀測站座標（保留原邏輯）
     if lat_deg is not None and lon_deg is not None:
         ax.text(0.99, 0.97, f"{lat_deg:.2f}  {lon_deg:.2f}",
                 transform=ax.transAxes, ha="right", va="top",
@@ -3566,23 +3859,149 @@ if __name__ == "__main__":
                     print(f"[G1/G2] 比值 CSV：{_ratio_csv}（{len(_mg)} 幀）")
                     # 繪圖：flux ratio + mag diff
                     _ratio_png = cfg_ch.out_dir / f"G1G2_ratio_{ACTIVE_DATE}.png"
-                    _fig_r, _ax_r = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+                    # sharex=False：兩軸各自設 formatter，避免互相覆蓋
+                    _fig_r, _ax_r = plt.subplots(
+                        2, 1, figsize=(12, 6), sharex=False,
+                        gridspec_kw={"hspace": 0.12},
+                    )
                     _med_ratio = float(np.nanmedian(_mg["flux_ratio_G1G2"]))
                     _med_mag   = float(np.nanmedian(_mg["mag_diff_G1G2"]))
+                    _rms_mag   = float(np.sqrt(np.nanmean(
+                        (_mg["mag_diff_G1G2"] - _med_mag) ** 2
+                    )))
+
+                    # ── 資料繪製 ────────────────────────────────────────────
+                    from matplotlib.transforms import blended_transform_factory
+                    import matplotlib.ticker as _mticker
+
+                    _bjd_arr_r = _mg["bjd_tdb"].values
+                    _bjd_lo    = float(_bjd_arr_r.min())
+                    _bjd_hi    = float(_bjd_arr_r.max())
+                    _xlim_r    = (_bjd_lo - 0.002, _bjd_hi + 0.002)
+                    for _a in _ax_r:
+                        _a.set_xlim(_xlim_r)
+
                     _ax_r[0].plot(_mg["bjd_tdb"], _mg["flux_ratio_G1G2"], "g.", ms=4)
-                    _ax_r[0].axhline(_med_ratio, color="k", ls="--", lw=0.8,
-                                     label=f"median={_med_ratio:.4f}")
+                    _ax_r[0].axhline(_med_ratio, color="k", ls="--", lw=0.8)
                     _ax_r[0].set_ylabel("G1 / G2 flux ratio")
-                    _ax_r[0].set_title(f"{ACTIVE_TARGET} {ACTIVE_DATE} — G1/G2 flux ratio")
-                    _ax_r[0].legend(fontsize=8)
+                    # median 標註：繪圖區左端，緊貼虛線上方
+                    _ax_r[0].text(
+                        0.0, _med_ratio,
+                        f"  median={_med_ratio:.4f}",
+                        transform=blended_transform_factory(
+                            _ax_r[0].transAxes, _ax_r[0].transData
+                        ),
+                        ha="left", va="bottom", fontsize=8,
+                    )
+
                     _ax_r[1].plot(_mg["bjd_tdb"], _mg["mag_diff_G1G2"], "g.", ms=4)
-                    _ax_r[1].axhline(_med_mag, color="k", ls="--", lw=0.8,
-                                     label=f"median={_med_mag:.4f} mag")
+                    _ax_r[1].axhline(_med_mag, color="k", ls="--", lw=0.8)
                     _ax_r[1].set_ylabel("G1 − G2 (mag)")
                     _ax_r[1].set_xlabel("BJD_TDB")
-                    _ax_r[1].legend(fontsize=8)
-                    plt.tight_layout()
-                    _fig_r.savefig(_ratio_png, dpi=150)
+                    # median 標註：繪圖區左端，緊貼虛線上方
+                    _ax_r[1].text(
+                        0.0, _med_mag,
+                        f"  median={_med_mag:.4f} mag",
+                        transform=blended_transform_factory(
+                            _ax_r[1].transAxes, _ax_r[1].transData
+                        ),
+                        ha="left", va="bottom", fontsize=8,
+                    )
+
+                    # ── 標題（fontsize=14）+ 棕色可信度文字 ─────────────────
+                    _ax_r[0].set_title(
+                        f"{ACTIVE_TARGET} {ACTIVE_DATE} — G1/G2 flux ratio",
+                        fontsize=14, loc="left",
+                    )
+                    _ax_r[0].text(
+                        1.0, 1.01,
+                        f"Reliability: G1-G2 RMS = {_rms_mag:.4f} mag",
+                        transform=_ax_r[0].transAxes,
+                        ha="right", va="bottom",
+                        fontsize=14, color="saddlebrown",
+                    )
+
+                    # ── 兩圖之間 Local Time 刻度軸 ───────────────────────────
+                    # 計算 HH:MM 刻度（UTC+8）
+                    import datetime as _dt
+                    _tz_r = float(getattr(cfg, "tz_offset_hours", 8))
+                    _tmin_r    = (ATime(_bjd_lo, format="jd", scale="tdb").to_datetime()
+                                  + _dt.timedelta(hours=_tz_r))
+                    _tmax_r    = (ATime(_bjd_hi, format="jd", scale="tdb").to_datetime()
+                                  + _dt.timedelta(hours=_tz_r))
+
+                    _ticks_30  = []   # 每 30 分（含整點）→ 淡藍線
+                    _ticks_60  = []   # 整點 → 稍深藍線
+                    _tick_labs = []   # HH:MM 標籤（整點 + 半點）
+                    _cur_r = _tmin_r.replace(second=0, microsecond=0)
+                    _cur_r = _cur_r.replace(minute=(_cur_r.minute // 30) * 30)
+                    while _cur_r <= _tmax_r + _dt.timedelta(minutes=1):
+                        _utc_r  = _cur_r - _dt.timedelta(hours=_tz_r)
+                        _bjd_r  = ATime(_utc_r).jd
+                        _ticks_30.append(_bjd_r)
+                        _tick_labs.append(_cur_r.strftime("%H:%M"))
+                        if _cur_r.minute == 0:
+                            _ticks_60.append(_bjd_r)
+                        _cur_r += _dt.timedelta(minutes=30)
+
+                    # 垂直線畫在兩個子圖上
+                    for _bv in _ticks_30:
+                        _ax_r[0].axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
+                        _ax_r[1].axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
+                    for _bv in _ticks_60:
+                        _ax_r[0].axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
+                        _ax_r[1].axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
+
+                    # _ax_r[0] 底部（兩圖中間）：HH:MM，FuncFormatter 各自獨立
+                    def _bjd_to_hhmm(bjd_val, pos):
+                        try:
+                            _t = (ATime(bjd_val, format="jd", scale="tdb")
+                                  .to_datetime()
+                                  + _dt.timedelta(hours=_tz_r))
+                            return _t.strftime("%H:%M")
+                        except Exception:
+                            return ""
+
+                    _ax_r[0].xaxis.set_major_locator(
+                        _mticker.FixedLocator(_ticks_30)
+                    )
+                    _ax_r[0].xaxis.set_major_formatter(
+                        _mticker.FuncFormatter(_bjd_to_hhmm)
+                    )
+                    _ax_r[0].tick_params(
+                        axis="x", which="major",
+                        bottom=True, labelbottom=True,
+                        top=False, labeltop=False,
+                        direction="in", length=5,
+                        colors="steelblue", labelsize=8,
+                        labelcolor="steelblue",
+                    )
+                    # "Local Time" 標籤：略偏出繪圖區左側，避免與第一個刻度重疊
+                    _ax_r[0].text(
+                        -0.002, -0.01, "Local Time",
+                        transform=_ax_r[0].transAxes,
+                        ha="right", va="top",
+                        fontsize=8, color="steelblue",
+                        clip_on=False,
+                    )
+
+                    # _ax_r[1] 頂部：刻度朝內；底部：完整 BJD 數值
+                    _ax_r[1].xaxis.set_major_locator(
+                        _mticker.FixedLocator(_ticks_30)
+                    )
+                    _ax_r[1].xaxis.set_major_formatter(
+                        _mticker.FuncFormatter(lambda v, _: f"{v:.2f}")
+                    )
+                    _ax_r[1].tick_params(
+                        axis="x", which="major",
+                        top=True, labeltop=False,
+                        bottom=True, labelbottom=True,
+                        direction="in", length=5,
+                        colors="steelblue", labelsize=8,
+                        labelcolor="black",
+                    )
+
+                    _fig_r.savefig(_ratio_png, dpi=150, bbox_inches="tight")
                     plt.close("all")
                     print(f"[G1/G2] 比值圖：{_ratio_png}")
                     # LS on G1/G2 ratio

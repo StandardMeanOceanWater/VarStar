@@ -1,6 +1,6 @@
 # ============================================================
 # 變星測光管線設定檔  Variable Star Pipeline Configuration
-# 版本：v1.02  |  日期：2026-03-12
+# 版本：v1.03  |  日期：2026-03-14
 # 修改這個檔案即可切換目標、路徑、儀器參數
 #
 # ⚠️ 修訂規則（防止修改互相覆蓋）：
@@ -60,29 +60,29 @@ cameras:
 # -----------------------------------------------------------------------------
 obs_sessions:
   - date: "20251122"
-    site: "Tataka (Shandonpu Parking)"     # 塔塔加上東埔停車場
+    site: "Tataka (Shandonpu Parking)"   # 塔塔加上東埔停車場
     telescope: "VixenR200SS"
     camera: "Canon6D2"
-    targets: ["AlVel", "CCAnd", "SXPhe"]
+    targets: ["AlVel"]
     calibration_date: "20251122"
-    dark_temp_c: 5.3    # 或 null
-    light_temp_c: 7  # 或 null
+    dark_temp_c: 5.3
+    light_temp_c: 7
     iso: 3200
-    obs_lat_deg: 24.076856               # Tataka Shandonpu Parking
+    obs_lat_deg: 24.076856
     obs_lon_deg: 121.171665
     obs_height_m: 2106
 
   - date: "20251220"
-    site: "Cingjing Observatory"         # 清境觀星園
+    site: "Tataka (Shandonpu Parking)"
     telescope: "VixenR200SS"
     camera: "Canon6D2"
-    targets: ["V1162Ori"]
+    targets: ["V1162Ori", "V1643Ori", "V1373Ori", "HHOri", "Gaia301"]
     calibration_date: "20251220"
     dark_temp_c: 3.7    # 或 null
     light_temp_c: 4     # 或 null
     iso: 3200
-    obs_lat_deg: 23.481197               # Cingjing Observatory
-    obs_lon_deg: 120.885415
+    obs_lat_deg: 23.48119126688765
+    obs_lon_deg: 120.8853953430719
     obs_height_m: 2610
 
 # -----------------------------------------------------------------------------
@@ -93,27 +93,62 @@ obs_sessions:
 # display_name: AAVSO 查詢用星名（需有空格）
 # vmag_approx : 目標星亮度，影響比較星篩選範圍
 # -----------------------------------------------------------------------------
-targets:
+targets:    # JIN親手核對，誰再動它誰死
   V1162Ori:
-    ra_hint_h: 5.533886      # V1162 Ori SIMBAD 05h32m01.9s (83.0083 deg)
-    dec_hint_deg: -7.256849  # V1162 Ori SIMBAD -7° 15' 24.7"
+    ra_hint_h: 5.53388611      # 83.00829 deg = 05 32 01.99
+    dec_hint_deg: -7.25689     # -07 15 24.8
     display_name: "V1162 Ori"
-    vmag_approx: 9.0
+    vmag_approx: 9.89          # V 9.85-10.3
+    period_d: 0.078684     #0.078684 d =113.305 min
+  V1643Ori:
+    ra_hint_h: 5.542900      #period_d: 83.144 deg = 05h 32m 34s（VSX 確認值，核對通過 2026-03-13）
+    dec_hint_deg: -7.211     # -07° 12' 40"
+    display_name: "V1643 Ori"
+    vmag_approx: 10.3         # V 10.26, 振幅 0.03mag, DSCT; AAVSO UID: 000-BFB-403
+    period_d: 0.07303         # 0.07303d = 105.16min
+
+  V1373Ori:
+    ra_hint_h: 5.484953
+    dec_hint_deg: -6.634861
+    display_name: "V1373 Ori"
+    vmag_approx: 8.72         # 8.68 - 8.76 V
+    period_d: 122.668
+
+  HHOri:
+    ra_hint_h: 5.503194
+    dec_hint_deg: -6.569222
+    display_name: "HH Ori"
+    vmag_approx: 12         # 11.0 - 13.4 p
+
+  Gaia301:
+    ra_hint_h: 5.564478
+    dec_hint_deg: -6.615639
+    display_name: "Gaia DR3 3016754040524540160"
+    vmag_approx: 9.50  #9.48 - 9.50 G
+
+
   AlVel:
-    ra_hint_h: 8.519801      # Al Vel SIMBAD 08h31m11.28s (127.797 deg)
-    dec_hint_deg: -47.665948  # -47° 39' 57.4"  (修正前錯填為 9.458297h / -44.682°)
+    ra_hint_h: 8.519801        # 127.797 deg = 08h 31m 11s（SIMBAD 確認，盲解驗證 2026-03-14）
+    dec_hint_deg: -47.666      # -47° 39' 57"（SIMBAD 確認）
     display_name: "Al Vel"
-    vmag_approx: 6.4          # GCVS: 極大 6.17, 極小 6.67 V；HADS 變星
-  CCAnd:
-    ra_hint_h: 0.730003      # V* CC And SIMBAD 00h43m48.01s (10.950052 deg)
-    dec_hint_deg: 42.282157  # +42° 16' 55.8"  (修正前錯填為 23.647767h / 38.584°)
-    display_name: "CC And"
-    vmag_approx: 10.8
-  SXPhe:
-    ra_hint_h: 23.775797
-    dec_hint_deg: -41.581667
-    display_name: "SX Phe"
-    vmag_approx: 7.1
+    vmag_approx: 6.4           # V 6.15–6.76；HADS 變星
+
+  # CCAnd:                      
+  #   ra_hint_h: 0.730003       # 00 43 48.01 +42 16 55.8
+  #   dec_hint_deg:42.282167
+  #   display_name: "CC And"
+  #   vmag_approx: 9.3          # V 9.19 - 9.46 V
+  # Gaia375
+  #   ra_hint_h: 0.784231      # 00 47 03.23 +41 57 53.4
+  #   dec_hint_deg:41.964833
+  #   display_name: "Gaia DR3 375316507435909888"
+  #   vmag_approx: 8.90         #8.90 - 8.93 G
+
+  # SXPhe:
+  #   ra_hint_h: 	23.775803     # 323 46 32.89 -41 34 54.8
+  #   dec_hint_deg: -41.581889    
+  #   display_name: "SX Phe"
+  #   vmag_approx: 7.1          # 6.76 - 7.53 V
 
 
 # -----------------------------------------------------------------------------
@@ -151,7 +186,17 @@ astrometry:
     timeout_sec: 300
 
 # -----------------------------------------------------------------------------
-# 8. Bayer 拆色 (DeBayer)
+# 8. VSX 自動查詢 (VSX Auto Query)
+# plate_solve 完成後自動查詢 AAVSO VSX，找出視場內變星候選
+# -----------------------------------------------------------------------------
+vsx:
+  auto_query: true              # false 可停用
+  search_radius_deg: 1.55       # Canon 6D2 + R200SS 對角半徑
+  auto_add_mag_max: 13.0        # 比這亮才自動加入 targets（太暗測光誤差大）
+  auto_add_types: []            # 空白=全部，或指定如 [DSCT, HADS, RR]
+
+# -----------------------------------------------------------------------------
+# 9. Bayer 拆色 (DeBayer)
 # -----------------------------------------------------------------------------
 debayer:
   channels_output: ["R", "G1", "B"]   # G2 只做驗證，不輸出獨立光變曲線
@@ -165,7 +210,9 @@ comparison_stars:
   min_stars: 3
   max_stars: 15
   min_separation_arcsec: 10.0
-  mag_range_delta: 5.0
+  mag_range_delta: 5.0      # deprecated：改用 comp_mag_bright / comp_mag_faint
+  comp_mag_bright: 4.0      # 比目標星亮最多 N 等（target_mag - comp_mag_bright）
+  comp_mag_faint:  2.0      # 比目標星暗最多 N 等（target_mag + comp_mag_faint）
   comp_mag_min: 6.0         # 固定下限（不飽和）
   comp_mag_max: 13.0        # 固定上限
   catalog_priority: ["AAVSO", "APASS", "Tycho2"]
@@ -197,7 +244,10 @@ photometry:
   # 幀品質篩選（三層）
   sharpness_min: 0.3    # S=flux(r=3px)/flux(r=8px) 下限；0.0=停用
   zp_r2_min: 0.0        # ZP 回歸 R2 下限；0.0=停用（保留 WARN 輸出）
-  peak_ratio_min: 0.0   # peak_ratio=t_max_pix/t_flux_net 下限；0.0=停用；次鏡起霧偵測用，V1162Ori 建議 0.090
+  peak_ratio_min: 0.0   # [deprecated] 固定絕對值門檻，建議改用 peak_ratio_k
+  peak_ratio_k: 3.0     # 自適應門檻倍數；peak_ratio < median - k×MAD 時剔除
+  zp_intercept_sigma: 3.0  # ZP 截距突變閾值（倍 MAD）；薄雲/透明度驟變偵測
+  sky_sigma: 3.0           # 背景突升閾值（倍 MAD）；起霧/散射光偵測
 
 
 # -----------------------------------------------------------------------------
@@ -226,6 +276,7 @@ extinction:
     B: 0.22
   airmass_method: "young1994"
   max_airmass: 2.5
+  alt_min_airmass: 2.366   # 仰角 25° = airmass 2.366（Young 1994），原預設 1.994（30°）
 
 # -----------------------------------------------------------------------------
 # 13. 週期分析 (Period Analysis)
@@ -240,6 +291,7 @@ period_analysis:
     normalization: "standard"       # "standard" | "model" | "log"
     period_min_hr: 0.5              # 搜尋週期下限（小時）
     period_max_hr: 24.0             # 搜尋週期上限（小時）
+    period_max_hours: 12.0          # 週期圖 x 軸顯示上限（小時），同步限制 LS 搜尋上限
     oversampling: 10                # 頻率格網 oversampling 因子
 
     # FAP 計算：bootstrap 迭代至收斂或上限，取先到者
