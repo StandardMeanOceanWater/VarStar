@@ -929,6 +929,7 @@ def plot_period_analysis(
     fig.suptitle(
         f"Period Analysis: {target_name} [{channel}]",
         fontsize=14, x=0.02, ha="left",
+        fontweight="bold", fontfamily="Arial", color="darkblue",
     )
     _sigma_med = float(np.nanmedian(err)) if len(err) > 0 else float("nan")
     fig.text(
@@ -999,8 +1000,8 @@ def plot_period_analysis(
 
     ax.errorbar(
         phase_ext, mag_ext, yerr=err_ext,
-        fmt="ko", ms=2, elinewidth=0.6, capsize=0, alpha=0.5,
-        zorder=1, label="Data",
+        fmt="ko", ms=2, elinewidth=0.6, capsize=2, alpha=0.5,
+        zorder=1, label="obs ±1σ",
     )
     ax.plot(
         phi_dense_ext, mag_dense_ext,
@@ -1015,9 +1016,19 @@ def plot_period_analysis(
         f"Amp = {fit_result['amplitude']:.3f} mag"
         f"  RMS = {fit_result['rms_residuals']:.3f} mag"
     )
-    ax.legend(fontsize=8)
+    # 圖例：放在 suptitle 下方，不在子圖內
+    _leg_handles, _leg_labels = ax.get_legend_handles_labels()
+    fig.legend(
+        _leg_handles, _leg_labels,
+        loc="upper left",
+        bbox_to_anchor=(0.01, 0.87),
+        fontsize=8,
+        frameon=True,
+        borderpad=0.5,
+        handlelength=2.0,
+    )
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.84])
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_png, bbox_inches="tight")
     plt.close()

@@ -60,6 +60,11 @@ import os
 import sys
 import time
 from datetime import datetime
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
 
 
@@ -472,11 +477,46 @@ def _run_period_analysis(config_path: Path) -> bool:
 
     print(f"  找到 {len(output_csvs)} 個測光 CSV，開始週期分析。")
 
-    # ── 呼叫模組 ─────────────────────────────────────────────────────────────
+    # ── 呼叫模組：逐 CSV 執行 run_period_analysis ────────────────────────────
     try:
+        import yaml as _yaml
+        import pandas as _pd
         from period_analysis import run_period_analysis
-        run_period_analysis(config_path)
-        return True
+
+        any_ok = False
+        for csv_path in sorted(output_csvs):
+            # 從路徑解析 target / channel
+            # 路徑格式：.../targets/{TARGET}/output/photometry_{CH}_{DATE}.csv
+            parts = csv_path.parts
+            try:
+                tgt_idx = parts.index("targets") + 1
+                target_name = parts[tgt_idx]
+            except (ValueError, IndexError):
+                target_name = csv_path.parent.parent.name
+            stem = csv_path.stem  # photometry_G1_20251220
+            channel = stem.split("_")[1] if "_" in stem else "G1"
+            out_dir = csv_path.parent
+
+            df = _pd.read_csv(csv_path)
+            # 欄位對映：photometry CSV → period_analysis 所需欄位名稱
+            # ok 欄已存在（1=通過，0=被篩除），直接使用；只需補 v_err
+            if "t_sigma_mag" in df.columns and "v_err" not in df.columns:
+                df = df.rename(columns={"t_sigma_mag": "v_err"})
+            print(f"  週期分析：{target_name} [{channel}]  ({len(df)} 幀)")
+            try:
+                run_period_analysis(
+                    df=df,
+                    target_name=target_name,
+                    channel=channel,
+                    out_dir=out_dir,
+                    config_path=config_path,
+                )
+                any_ok = True
+            except Exception as exc_inner:
+                print(f"  [WARN] {target_name}/{channel} 週期分析失敗：{exc_inner}")
+
+        return any_ok
+
     except ImportError as exc:
         print(
             f"[ERROR] 無法匯入 period_analysis.py：{exc}\n"

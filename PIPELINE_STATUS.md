@@ -158,14 +158,18 @@
 - [x] 觀測站實際座標已填入：Tataka Shandonpu Parking / Cingjing Observatory
 - [x] CCAnd yaml hint 座標修正：原值錯填 23.647767h/38.584°，正確為 0.730003h/42.282°（V* CC And, SIMBAD）
 - [x] AlVel yaml hint 座標修正：原值錯填 9.458297h/-44.682°，正確為 8.519801h/-47.666°（Al Vel, SIMBAD）；WCS 像素驗證確認解星正確
-- [ ] **V1162Ori plate_solve 重跑**：所有 FITS CRVAL 錯指 V1643Ori（83.56°, −6.98°），需用正確 hint（ra=5.7374h, dec=+12.763°）重新解算，再重跑拆色 → 測光
+- [x] **V1162Ori plate_solve + debayer + photometry + period_analysis 重跑**（完成，2026-03-14）：WCS hint ra=5.534h dec=−7.257°，187 WCS／187 split／R=130/G1=120/G2=121/B=128 有效幀；⚠️ m_var_norm 末段幀異常（frames 0142/0143 值 7.35 vs 正常 ~10），週期分析結果不可信，需先修 ensemble 正規化
 - [ ] 診斷 EXIF ISO 讀出為 0（FITS GAIN/RDNOISE 空白），在 photometry 前處理
 - [x] Gaia DR3 比較星介面（`fetch_gaia_dr3_cone`，G→V/Rc/B 三通道轉換，⚠️ 尚未實測）
-- [ ] APASS 本機星表（約 1.5 GB，離線環境備用，低優先）
+- [ ] APASS 本機快取：`download_apass_cache.py` 已實作（2026-03-14），各目標視野 CSV 存 `data/catalogs/apass/`；下載中
 - [ ] `quality_report.py` 實作（第二批 D 組）
-- [ ] SXPhe 4 幀全部失敗（1s 曝光，星點太少），評估是否補觀測
-- [ ] 起霧偵測完整方案：peak_ratio 已實作（門檻需逐 session 校定）；待辦：(a) 逐幀生長曲線孔徑（PSF 擴散時孔徑增大），(b) FWHM 估計器修復（DAOStarFinder 對拆色 FITS 全 NaN，需調整 threshold 或換 fit_2dgaussian），(c) 整合三指標為加權評分，避免單一指標誤殺
-- [ ] ZP R² 門檻評估：V1162Ori R 通道 median=0.83，31 幀落在 0.50–0.70；起霧後 median 降至 0.79，有訊號但重疊度高；建議先累積多目標資料再定門檻，目前維持停用
+- [ ] SXPhe 4 幀全部失敗（1s 曝光，星點太少）—— 不補觀測，標記為已知限制
+- [ ] 起霧偵測模組：`fog_detect.py` 已實作（2026-03-14）；門檻探索工具完成；待辦：(a) 逐幀生長曲線孔徑，(b) FWHM 估計器修復（DAOStarFinder NaN），(c) 三指標整合加權評分；實測方案：逐幀測試各判準 → 人眼核對表格 → 找最適門檻
+- [ ] ZP R² 門檻：由 V1162Ori 重跑結果與 AAVSO 週期比對後決定
+- [ ] 初始幀篩選自動化：`select_comp_stars` 若第一幀品質不佳，自動往後試 N 幀（FWHM＋比較星數雙重條件）
+- [ ] sigma_clip / ensemble 不穩診斷：frames 0142/0143 m_var_norm=7.35（正常~10），末段高氣團幀 ensemble 正規化崩潰；需分析原因並在 period_analysis 前加 sigma clip 保護
+- [ ] VSX 查詢整合：視野中心查 6–9 等變星，長邊 1/2 圓內（`vsx_query.py` 已有草稿）
+- [ ] 多目標共用拆色檔架構（session-centric）：一份 split FITS 跑多顆目標，避免重複拆色
 
 ---
 
@@ -242,10 +246,10 @@
 - **結論：V1162Ori 的 WCS 需要重新 plate solve**（用正確 hint 重跑）
 
 **待辦（下次繼續）**
-- V1162Ori plate_solve 重跑（hint 已修正，需重跑 calibrated → plate_solve → debayer → photometry）
+- ~~多目標共用拆色檔架構（session-centric）~~ → **進行中**（本次實作）
+- 初始幀篩選：`select_comp_stars` 若第一張幀品質不佳，自動往後找（前 N 張試驗，FWHM+比較星數雙重條件）
 - sigma_clip 從 7 → 28 的問題（比較星從 68 → 40，ensemble 可能不穩）
-- 多目標共用拆色檔架構（session-centric）
-- VSX 查詢整合
+- VSX 查詢整合（視野中心查 6–9 等變星，長邊 1/2 圓內）
 
 ---
 

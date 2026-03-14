@@ -1583,12 +1583,72 @@ def _stars_in_circle(
     return pd.DataFrame(rows)
 
 
+def _fetch_apass_from_cache(
+    ra_deg: float,
+    dec_deg: float,
+    radius_deg: float,
+    cache_dir: Path,
+) -> pd.DataFrame:
+    """從本機快取（download_apass_cache.py 產生的 CSV）做錐形查詢。"""
+    import re as _re
+    candidates = list(cache_dir.glob("*.csv"))
+    if not candidates:
+        return pd.DataFrame()
+    best = None
+    best_r = -1.0
+    for p in candidates:
+        try:
+            m = _re.search(r"_r([\d.]+)deg", p.stem)
+            r_cache = float(m.group(1)) if m else 99.0
+            if r_cache >= radius_deg and r_cache > best_r:
+                df_tmp = pd.read_csv(p, nrows=1000)
+                if "ra_deg" not in df_tmp.columns:
+                    continue
+                cache_ra  = float(df_tmp["ra_deg"].median())
+                cache_dec = float(df_tmp["dec_deg"].median())
+                sep = np.sqrt(
+                    ((ra_deg - cache_ra) * np.cos(np.radians(dec_deg))) ** 2
+                    + (dec_deg - cache_dec) ** 2
+                )
+                if sep <= r_cache:
+                    best = p
+                    best_r = r_cache
+        except Exception:
+            continue
+    if best is None:
+        return pd.DataFrame()
+    df_full = pd.read_csv(best)
+    if "ra_deg" not in df_full.columns:
+        return pd.DataFrame()
+    sep = np.sqrt(
+        ((df_full["ra_deg"] - ra_deg) * np.cos(np.radians(dec_deg))) ** 2
+        + (df_full["dec_deg"] - dec_deg) ** 2
+    )
+    df_cone = df_full[sep <= radius_deg].reset_index(drop=True)
+    print(f"  [APASS] 本機快取命中：{best.name}，{len(df_cone)} 筆")
+    return df_cone
+
+
 def fetch_apass_cone(
     ra_deg: float,
     dec_deg: float,
     radius_deg: float = 1.0,
     maxrec: int = 5000,
+    cache_dir: Path | None = None,
 ) -> pd.DataFrame:
+    """查詢 APASS DR9。優先使用本機快取，快取不存在時改用 VizieR。
+
+    結果欄位統一為 ra_deg, dec_deg, vmag, e_vmag, bmag, e_bmag, rmag, e_rmag。
+    """
+    # 1. 嘗試本機快取
+    if cache_dir is None:
+        cache_dir = Path(__file__).parent.parent / "data" / "catalogs" / "apass"
+    if cache_dir.exists():
+        df_cache = _fetch_apass_from_cache(ra_deg, dec_deg, radius_deg, cache_dir)
+        if not df_cache.empty and "vmag" in df_cache.columns:
+            return df_cache[np.isfinite(df_cache["vmag"])].reset_index(drop=True)
+
+    # 2. 回退到 VizieR 線上查詢
     """查詢 APASS DR9（astroquery.vizier），回傳視場內所有 APASS 星。
 
     改用 VizieR 因 dc.g-vo.org endpoint 已失效（404）。
@@ -2351,6 +2411,27 @@ def ensemble_normalize(
     return df_out, delta_series
 
 
+class _FrameCompCache:
+    """同視野多目標共用的比較星測光快取。
+    第一顆目標測完後存入，後續目標直接讀取，避免重複孔徑測光。
+    Key: (frame_stem, ra_rounded_5dp, dec_rounded_5dp)
+    """
+    def __init__(self):
+        self._data: dict = {}
+
+    def _key(self, frame_stem: str, ra: float, dec: float) -> tuple:
+        return (frame_stem, round(float(ra), 5), round(float(dec), 5))
+
+    def get(self, frame_stem: str, ra: float, dec: float):
+        return self._data.get(self._key(frame_stem, ra, dec))
+
+    def set(self, frame_stem: str, ra: float, dec: float, result: dict):
+        self._data[self._key(frame_stem, ra, dec)] = result
+
+    def __len__(self):
+        return len(self._data)
+
+
 def run_photometry_on_wcs_dir(
     wcs_dir: Path,
     out_csv: Path,
@@ -2359,6 +2440,7 @@ def run_photometry_on_wcs_dir(
     check_star=None,
     ap_radius: "float | None" = None,
     channel: str = "B",
+    shared_cache: "_FrameCompCache | None" = None,
 ) -> "tuple[pd.DataFrame, dict[str, pd.Series]]":
     """
     Per-frame aperture differential photometry.
@@ -2566,7 +2648,14 @@ def run_photometry_on_wcs_dir(
             xc, yc = radec_to_pixel(wcs_obj, ra_c, dec_c)
             if not in_bounds(img, xc, yc, margin=margin):
                 continue
-            phot_c = aperture_photometry(img, xc, yc, ap_radius, r_in, r_out)
+            # 同視野多目標共用快取：命中則跳過重測
+            _cached_phot = shared_cache.get(f.stem, ra_c, dec_c) if shared_cache else None
+            if _cached_phot is not None:
+                phot_c = _cached_phot
+            else:
+                phot_c = aperture_photometry(img, xc, yc, ap_radius, r_in, r_out)
+                if shared_cache is not None:
+                    shared_cache.set(f.stem, ra_c, dec_c, phot_c)
             if phot_c.get("ok") != 1 or not np.isfinite(phot_c.get("flux_net")):
                 continue
             if is_saturated(phot_c.get("max_pix", np.nan), cfg.saturation_threshold):
@@ -3660,6 +3749,35 @@ if __name__ == "__main__":
 
     print(f"[photometry] 待處理目標：{_targets_list}  通道：{CHANNELS}")
 
+    # ── 同視野偵測：以 split/{ch}/ 前三個 FITS 檔名為 field_key ────────────────
+    # 相同視野的目標（hardlink 或同一 session 同一視野）共用 _FrameCompCache，
+    # 避免重複做比較星孔徑測光。
+    def _get_field_key(tgt, dt):
+        try:
+            _cfg_tmp = cfg_from_yaml(_yaml, tgt, dt, channel=CHANNELS[0],
+                                     split_subdir=_args.split_subdir)
+            _ff = sorted(_cfg_tmp.wcs_dir.glob(f"*_{CHANNELS[0]}.fits"))
+            return tuple(f.name for f in _ff[:3]) if _ff else None
+        except Exception:
+            return None
+
+    from collections import defaultdict as _defaultdict
+    _field_groups: "dict[tuple, list]" = _defaultdict(list)
+    for _tgt, _dt in _targets_list:
+        _fk = _get_field_key(_tgt, _dt)
+        if _fk:
+            _field_groups[_fk].append((_tgt, _dt))
+
+    # 為多目標視野建立共用快取（單目標視野不需要）
+    _field_caches: "dict[tuple, _FrameCompCache]" = {
+        _fk: _FrameCompCache()
+        for _fk, _grp in _field_groups.items()
+        if len(_grp) > 1
+    }
+    _multi_fields = sum(1 for v in _field_groups.values() if len(v) > 1)
+    if _multi_fields:
+        print(f"[photometry] 偵測到 {_multi_fields} 個多目標視野，啟用共用比較星快取")
+
     # ── 各目標迴圈 ────────────────────────────────────────────────────────────
     for (ACTIVE_TARGET, ACTIVE_DATE) in _targets_list:
         print(f"\n{'#'*60}")
@@ -3757,6 +3875,9 @@ if __name__ == "__main__":
             print(f"  FITS 張數：{len(_fits_ch)}")
             print(f"  輸出 CSV ：{cfg_ch.phot_out_csv}")
 
+            # 同視野多目標：傳入共用比較星快取
+            _active_field_key = _get_field_key(ACTIVE_TARGET, ACTIVE_DATE)
+            _active_cache = _field_caches.get(_active_field_key) if _active_field_key else None
             df_ch, _comp_lc_ch = run_photometry_on_wcs_dir(
                 _split_dir,
                 cfg_ch.phot_out_csv,
@@ -3765,7 +3886,10 @@ if __name__ == "__main__":
                 check_star=check_star,
                 ap_radius=cfg_ch.aperture_radius,
                 channel=_ch,
+                shared_cache=_active_cache,
             )
+            if _active_cache:
+                print(f"  [快取] 比較星快取 {len(_active_cache)} 筆")
             channel_results[_ch] = df_ch
             _ok_cnt = int(df_ch['ok'].sum()) if 'ok' in df_ch.columns else 0
             print(f"  [完成] {_ch}：ok={_ok_cnt} / {len(df_ch)} 幀")

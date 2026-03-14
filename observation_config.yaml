@@ -63,7 +63,7 @@ obs_sessions:
     site: "Tataka (Shandonpu Parking)"   # 塔塔加上東埔停車場
     telescope: "VixenR200SS"
     camera: "Canon6D2"
-    targets: ["AlVel"]
+    targets: ["AlVel", "CCAnd"]
     calibration_date: "20251122"
     dark_temp_c: 5.3
     light_temp_c: 7
@@ -133,11 +133,11 @@ targets:    # JIN親手核對，誰再動它誰死
     display_name: "Al Vel"
     vmag_approx: 6.4           # V 6.15–6.76；HADS 變星
 
-  # CCAnd:                      
-  #   ra_hint_h: 0.730003       # 00 43 48.01 +42 16 55.8
-  #   dec_hint_deg:42.282167
-  #   display_name: "CC And"
-  #   vmag_approx: 9.3          # V 9.19 - 9.46 V
+  CCAnd:
+    ra_hint_h: 0.730003        # 00 43 48.01 +42 16 55.8
+    dec_hint_deg: 42.282167
+    display_name: "CC And"
+    vmag_approx: 9.3           # V 9.19 - 9.46 V
   # Gaia375
   #   ra_hint_h: 0.784231      # 00 47 03.23 +41 57 53.4
   #   dec_hint_deg:41.964833
@@ -275,8 +275,8 @@ extinction:
     G: 0.13
     B: 0.22
   airmass_method: "young1994"
-  max_airmass: 2.5
-  alt_min_airmass: 2.366   # 仰角 25° = airmass 2.366（Young 1994），原預設 1.994（30°）
+  max_airmass: 99
+  alt_min_airmass: 99   # 暫時關閉 airmass 門檻
 
 # -----------------------------------------------------------------------------
 # 13. 週期分析 (Period Analysis)
