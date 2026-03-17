@@ -220,49 +220,69 @@ def _compute_bic(
     return bic
 
 
-def _select_harmonics_bic(
+def _select_harmonics_breger(
     phase: np.ndarray,
     mag: np.ndarray,
     err: np.ndarray,
     max_harmonics: int,
+    sn_threshold: float = 4.0,
 ) -> Tuple[int, np.ndarray, np.ndarray]:
     """
-    以 BIC 最小化自動選取最佳傅立葉諧波數。
+    以 Breger et al. (1993) S/N 準則選取傅立葉諧波數。
 
-    搜尋範圍：N = 1 … max_harmonics。
-    對每個 N 嘗試擬合，收集 BIC；選取 BIC 最小的 N。
-    若所有 N 均擬合失敗，raise RuntimeError。
+    逐階遞增：若第 N 諧波振幅的 S/N >= sn_threshold 則接受，否則停止。
+    S/N = A_N / (σ_res × sqrt(2/n))
+        A_N      = sqrt(a_N² + b_N²)，第 N 諧波振幅
+        σ_res    = 加入第 N 諧波後的殘差 RMS
+        sqrt(2/n) = DFT 振幅雜訊等級的近似（n = 資料點數）
+
+    BIC 在 σ 很小（高精度測光）時無法正確剔刀（penalty << chi²），
+    故改用此天文學標準準則。max_harmonics 仍作為硬上限。
 
     Returns
     -------
     (best_n, best_popt, best_pcov)
     """
-    bic_values: List[float] = []
-    results: List[Tuple[np.ndarray, np.ndarray]] = []
+    n_data = len(mag)
+    best_n = 1
+    best_popt: np.ndarray = np.array([])
+    best_pcov: np.ndarray = np.array([])
 
     for n in range(1, max_harmonics + 1):
         try:
             popt, pcov = _fit_fourier(phase, mag, err, n)
-            mag_pred = _fourier_series(phase, *popt)
-            n_params = 2 * n + 1
-            bic = _compute_bic(mag, mag_pred, n_params, err)
-            bic_values.append(bic)
-            results.append((popt, pcov))
-            logger.debug("  N=%d  BIC=%.2f", n, bic)
         except (RuntimeError, ValueError) as exc:
             logger.debug("  N=%d 擬合失敗：%s", n, exc)
-            bic_values.append(np.inf)
-            results.append((np.array([]), np.array([])))
+            break
 
-    if all(np.isinf(b) for b in bic_values):
+        mag_pred = _fourier_series(phase, *popt)
+        residuals = mag - mag_pred
+        sigma_res = float(np.std(residuals))
+
+        # 第 N 諧波振幅
+        a_n = popt[1 + 2 * (n - 1)]
+        b_n = popt[2 + 2 * (n - 1)]
+        amp_n = float(np.sqrt(a_n ** 2 + b_n ** 2))
+
+        noise_level = sigma_res * np.sqrt(2.0 / n_data) if n_data > 0 else np.inf
+        sn = amp_n / noise_level if noise_level > 0 else 0.0
+
+        logger.debug("  N=%d  A=%.4f  σ_res=%.4f  S/N=%.2f", n, amp_n, sigma_res, sn)
+
+        if sn >= sn_threshold or n == 1:   # N=1 永遠接受，不能有 0 諧波
+            best_n = n
+            best_popt = popt
+            best_pcov = pcov
+        else:
+            logger.info("Breger 準則停止：N=%d S/N=%.2f < %.1f，採用 N=%d", n, sn, sn_threshold, best_n)
+            break
+    else:
+        logger.info("Breger 準則：已達上限 N=%d，採用 N=%d", max_harmonics, best_n)
+
+    if best_popt.size == 0:
         raise RuntimeError("所有諧波數均擬合失敗，無法選取最佳階數。")
 
-    best_n = int(np.argmin(bic_values)) + 1
-    best_popt, best_pcov = results[best_n - 1]
-    logger.info(
-        "BIC 選階完成：最佳 N=%d，BIC=%.2f（搜尋範圍 N=1–%d）",
-        best_n, bic_values[best_n - 1], max_harmonics,
-    )
+    logger.info("Breger 選階完成：N=%d（上限 %d，S/N 閾值 %.1f）", best_n, max_harmonics, sn_threshold)
     return best_n, best_popt, best_pcov
 
 
@@ -419,6 +439,13 @@ def run_ls_and_dft(
     min_freq = 1.0 / period_max_days
     max_freq = 1.0 / period_min_days
 
+    # ── 趨勢扣除（線性 detrend，去除大氣漂移） ────────────────────────────
+    detrend_order = int(_get(cfg, "period_analysis", "lomb_scargle", "detrend_order", default=0))
+    if detrend_order > 0:
+        _t_c = t - np.mean(t)
+        _poly = np.polyfit(_t_c, mag, detrend_order)
+        mag = mag - np.polyval(_poly, _t_c)
+
     ls = LombScargle(t, mag, dy=err)
     freqs, ls_power = ls.autopower(
         minimum_frequency=min_freq,
@@ -545,6 +572,7 @@ def fit_phase_folded_model(
     """
     fit_cfg = _get(cfg, "period_analysis", "fourier_fit", default={})
     max_harmonics = _get(fit_cfg, "max_harmonics", default=8)
+    sn_threshold = float(_get(fit_cfg, "breger_sn_threshold", default=4.0))
 
     freq = 1.0 / period
     phi_dense = np.linspace(0.0, 1.0, 10_000)
@@ -553,13 +581,13 @@ def fit_phase_folded_model(
     t0_temp = float(t[0])
     phase_temp = ((t - t0_temp) / period) % 1.0
 
-    logger.info("[Step 1] BIC 選階（最大諧波數 N=%d）…", max_harmonics)
+    logger.info("[Step 1] Breger S/N 選階（上限 N=%d，閾值 %.1f）…", max_harmonics, sn_threshold)
     try:
-        best_n, popt_temp, _ = _select_harmonics_bic(
-            phase_temp, mag, err, max_harmonics
+        best_n, popt_temp, _ = _select_harmonics_breger(
+            phase_temp, mag, err, max_harmonics, sn_threshold
         )
     except RuntimeError as exc:
-        logger.error("[Step 1] BIC 選階失敗：%s", exc)
+        logger.error("[Step 1] Breger 選階失敗：%s", exc)
         return {}
 
     # 在稠密格網找極大亮度相位（mag 最小值）
@@ -701,7 +729,11 @@ def run_pre_whitening(
 
     ls_cfg = _get(cfg, "period_analysis", "lomb_scargle", default={})
     period_min_days = _get(ls_cfg, "period_min_hr", default=0.5) / 24.0
-    period_max_days = _get(ls_cfg, "period_max_hr", default=24.0) / 24.0
+    _pmh_pw = _get(ls_cfg, "period_max_hours", default=None)
+    if _pmh_pw is not None:
+        period_max_days = float(_pmh_pw) / 24.0
+    else:
+        period_max_days = _get(ls_cfg, "period_max_hr", default=24.0) / 24.0
     oversampling = _get(ls_cfg, "oversampling", default=10)
 
     plot_cfg = _get(cfg, "output", "plots", default={})
@@ -897,6 +929,7 @@ def plot_period_analysis(
     err: np.ndarray,
     out_png: Path,
     cfg: Dict,
+    obs_date: str = "",
 ) -> None:
     """
     輸出 1×3 組合診斷圖：LS 週期圖、DFT 振幅譜、相位折疊圖（含誤差棒）。
@@ -925,37 +958,71 @@ def plot_period_analysis(
     fap_n_iter = ls_result["fap_n_iter"]
     fap_status = ls_result["fap_status"]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4), dpi=dpi)
-    fig.suptitle(
-        f"Period Analysis: {target_name} [{channel}]",
-        fontsize=14, x=0.02, ha="left",
-        fontweight="bold", fontfamily="Arial", color="darkblue",
-    )
-    _sigma_med = float(np.nanmedian(err)) if len(err) > 0 else float("nan")
-    fig.text(
-        0.98, 0.98,
-        f"Reliability: σ_med = {_sigma_med:.4f} mag",
-        ha="right", va="top",
-        fontsize=14, color="saddlebrown",
+    # ── 色彩定義（深→淺：標題 > 主線 > 外框 > 座標軸） ──────────────────────
+    # LS 綠色系
+    _LS_TITLE = "#081c15"
+    _LS_LINE  = "#1b4332"
+    _LS_SPINE = "#52b788"
+    _LS_TICK  = "#95d5b2"
+    # DFT 紫色系
+    _DFT_TITLE = "#240046"
+    _DFT_LINE  = "#5a0080"
+    _DFT_SPINE = "#9d4edd"
+    _DFT_TICK  = "#c77dff"
+
+    # ── 標題組裝：display_name + 日期 + 座標（多色） ────────────────────────
+    _display_name = _get(cfg, "targets", target_name, "display_name", default=target_name)
+    _lat, _lon = None, None
+    for _sess in _get(cfg, "obs_sessions", default=[]):
+        _sess_targets = _get(_sess, "targets", default=[])
+        if isinstance(_sess_targets, list) and target_name in _sess_targets:
+            _lat = _get(_sess, "obs_lat_deg", default=None)
+            _lon = _get(_sess, "obs_lon_deg", default=None)
+            break
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=(22, 5), dpi=dpi,
+        gridspec_kw={"width_ratios": [2.5, 1.5, 3]},
     )
 
-    # 子圖 1：LS 週期圖
+    # 標題：照 photometry.py 做法，單行 + 座標右上角
+    _date_str = f"  {obs_date}" if obs_date else ""
+    fig.text(
+        0.02, 0.95,
+        f"{_display_name}  [{channel}]{_date_str}",
+        fontsize=32, fontweight="bold", ha="left",
+    )
+    if _lat is not None and _lon is not None:
+        _coord_disp = (
+            f"{abs(_lat):.2f}°{'N' if _lat >= 0 else 'S'}"
+            f" {abs(_lon):.2f}°{'E' if _lon >= 0 else 'W'}"
+        )
+        fig.text(0.98, 0.97, _coord_disp, fontsize=14, color="#2d6a4f", ha="right", va="top")
+    _sigma_med = float(np.nanmedian(err)) if len(err) > 0 else float("nan")
+    fig.text(
+        0.98, 0.92,
+        f"Reliability: σ_med = {_sigma_med:.4f} mag",
+        ha="right", va="top", fontsize=14, color="saddlebrown",
+    )
+
+    # ── 子圖 1：LS 週期圖 ─────────────────────────────────────────────────────
     ax = axes[0]
     periods_days = 1.0 / freqs
     periods_hr = periods_days * 24.0
     best_p_hr = best_p * 24.0
     _best_h = int(best_p_hr)
     _best_m = int((best_p_hr - _best_h) * 60)
-    ax.plot(periods_hr, ls_result["ls_power"], "k-", lw=0.5)
+
+    ax.plot(periods_hr, ls_result["ls_power"], color=_LS_LINE, lw=1.0)
     ax.axvline(best_p_hr, color="r", ls="--", lw=1, alpha=0.8,
                label=f"P = {_best_h}:{_best_m:02d}")
 
-    # x 軸顯示上限（period_max_days，來自 period_max_hours）
+    # x 軸顯示上限
     _plot_xmax_days = ls_result.get("period_max_days", periods_days.max())
     _plot_xmax_hr = _plot_xmax_days * 24.0
     ax.set_xlim(0.0, _plot_xmax_hr)
 
-    # 第二高峰：與最高峰距離 >= 20% * best_p，在顯示範圍內
+    # P2：與最高峰距離 >= 20% * best_p，在顯示範圍內
     _min_sep_hr = 0.20 * best_p_hr
     _mask_p2 = (
         (np.abs(periods_hr - best_p_hr) >= _min_sep_hr)
@@ -969,23 +1036,68 @@ def plot_period_analysis(
         ax.axvline(_p2_hr, color="orange", ls="--", lw=1, alpha=0.8,
                    label=f"P2 = {_p2_h}:{_p2_m:02d}")
 
-    ax.set_xlabel("Period (hours)")
-    ax.set_ylabel("LS Power")
+    # P3：短週期峰（< 4h），抓最高峰，排除已標記的 P1/P2 附近
+    _short_limit_hr = min(4.0, _plot_xmax_hr * 0.4)
+    _mask_short = (periods_hr > 0.3) & (periods_hr <= _short_limit_hr)
+    if _mask_short.any():
+        _p3_idx_local = int(np.argmax(ls_result["ls_power"][_mask_short]))
+        _p3_hr = float(periods_hr[_mask_short][_p3_idx_local])
+        _p3_power = float(ls_result["ls_power"][_mask_short][_p3_idx_local])
+        # 僅在與 P1/P2 距離夠遠時標記
+        _p3_far = abs(_p3_hr - best_p_hr) > 0.20 * best_p_hr
+        if _mask_p2.any():
+            _p3_far = _p3_far and abs(_p3_hr - _p2_hr) > 0.5
+        if _p3_far:
+            _p3_h = int(_p3_hr)
+            _p3_m = int((_p3_hr - _p3_h) * 60)
+            ax.axvline(_p3_hr, color="#2196f3", ls=":", lw=1.2, alpha=0.9,
+                       label=f"P3 = {_p3_h}:{_p3_m:02d}")
+            ax.annotate(
+                f"{_p3_power:.2f}",
+                xy=(_p3_hr, _p3_power),
+                xytext=(4, 4), textcoords="offset points",
+                fontsize=7, color="#2196f3",
+            )
+
+    ax.set_xlabel("Period (hours)", color=_LS_TICK)
+    ax.set_ylabel("LS Power", color=_LS_TICK)
     ax.set_title(
-        f"Lomb-Scargle\nFAP={fap:.2e}  ({fap_n_iter} iter, {fap_status})"
+        f"Lomb-Scargle\nFAP={fap:.2e}  ({fap_n_iter} iter, {fap_status})",
+        color=_LS_TITLE,
     )
+    for spine in ax.spines.values():
+        spine.set_edgecolor(_LS_SPINE)
+    ax.tick_params(colors=_LS_TICK)
     ax.legend(fontsize=8)
 
-    # 子圖 2：DFT 振幅譜
+    # ── 子圖 2：DFT 振幅譜 ───────────────────────────────────────────────────
     ax = axes[1]
-    ax.plot(periods_hr, ls_result["dft_amp"], "b-", lw=0.5)
+    ax.plot(periods_hr, ls_result["dft_amp"], color=_DFT_LINE, lw=1.0)
     ax.axvline(best_p_hr, color="r", ls="--", lw=1, alpha=0.8)
     ax.set_xlim(0.0, _plot_xmax_hr)
-    ax.set_xlabel("Period (hours)")
-    ax.set_ylabel("Amplitude (mag)")
-    ax.set_title("DFT Amplitude (cross-check)")
 
-    # 子圖 3：相位折疊圖（展開 2 個週期）
+    # DFT 峰值標注
+    _dft_peak_idx = int(np.argmax(ls_result["dft_amp"]))
+    _dft_peak_p_hr = float(periods_hr[_dft_peak_idx])
+    _dft_peak_amp = float(ls_result["dft_amp"][_dft_peak_idx])
+    _dft_ph = int(_dft_peak_p_hr)
+    _dft_pm = int((_dft_peak_p_hr - _dft_ph) * 60)
+    ax.annotate(
+        f"P={_dft_ph}:{_dft_pm:02d}\nA={_dft_peak_amp:.3f}",
+        xy=(_dft_peak_p_hr, _dft_peak_amp),
+        xytext=(6, -14), textcoords="offset points",
+        fontsize=8, color=_DFT_TITLE,
+        arrowprops=dict(arrowstyle="->", color=_DFT_SPINE, lw=0.8),
+    )
+
+    ax.set_xlabel("Period (hours)", color=_DFT_TICK)
+    ax.set_ylabel("Amplitude (mag)", color=_DFT_TICK)
+    ax.set_title("DFT Amplitude (cross-check)", color=_DFT_TITLE)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(_DFT_SPINE)
+    ax.tick_params(colors=_DFT_TICK)
+
+    # ── 子圖 3：相位折疊圖（展開 2 個週期） ──────────────────────────────────
     ax = axes[2]
     phase = fit_result["phase"]
     phase_ext = np.concatenate([phase, phase + 1.0])
@@ -1016,19 +1128,11 @@ def plot_period_analysis(
         f"Amp = {fit_result['amplitude']:.3f} mag"
         f"  RMS = {fit_result['rms_residuals']:.3f} mag"
     )
-    # 圖例：放在 suptitle 下方，不在子圖內
-    _leg_handles, _leg_labels = ax.get_legend_handles_labels()
-    fig.legend(
-        _leg_handles, _leg_labels,
-        loc="upper left",
-        bbox_to_anchor=(0.01, 0.87),
-        fontsize=8,
-        frameon=True,
-        borderpad=0.5,
-        handlelength=2.0,
-    )
 
-    plt.tight_layout(rect=[0, 0, 1, 0.84])
+    # 圖例：相位折疊圖右下角
+    ax.legend(loc="lower right", fontsize=8, frameon=True, borderpad=0.5, handlelength=2.0)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.90])
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_png, bbox_inches="tight")
     plt.close()
@@ -1046,6 +1150,7 @@ def run_period_analysis(
     out_dir: Path,
     config_path: Optional[Path] = None,
     run_prewhitening: bool = True,
+    obs_date: str = "",
 ) -> Dict:
     """
     從測光 CSV DataFrame 執行完整進階週期分析。
@@ -1128,7 +1233,8 @@ def run_period_analysis(
         f"period_analysis_{target_name.replace(' ', '')}_{channel}.png"
     )
     plot_period_analysis(
-        target_name, channel, ls_result, fit_result, t, mag, err, out_png, cfg
+        target_name, channel, ls_result, fit_result, t, mag, err, out_png, cfg,
+        obs_date=obs_date,
     )
 
     results: Dict = {"ls_result": ls_result, "fit_result": fit_result}

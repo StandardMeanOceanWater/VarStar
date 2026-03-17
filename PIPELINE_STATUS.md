@@ -1,5 +1,5 @@
 # 變星測光管線 — 狀態快照
-**最後更新：2026-03-14 UTC+8 | 版號 v1.1 | 本檔永遠只有一份，直接覆蓋更新**
+**最後更新：2026-03-16 UTC+8 | 版號 v1.35 | 本檔永遠只有一份，直接覆蓋更新**
 
 ---
 
@@ -65,7 +65,7 @@
 | 校正 | `Calibration.py` | ✅ 完成（已實測） | Bug 修正 v2；297 幀全數通過 |
 | 星圖解算 | `plate_solve.py` | ✅ 完成（已實測） | hint 單位修正；V1162Ori 187/190 |
 | Bayer 拆色 | `DeBayer_RGGB.py` | ✅ 完成 | WCS 子採樣修正已實作 |
-| 測光（含標準 LS） | `photometry.py` + `Photometry.ipynb` | ✅ 完成實測（v0.99） | **20251122**：AlVel 0/81、CCAnd 0/81（airmass > 1.99 濾除 33 幀、flux 異常 48 幀）、SXPhe 跳過（無 split FITS）；**20251220**：V1162Ori R=130/136、G1=134/136、G2=133/136、B=132/136（有效） |
+| 測光（含標準 LS） | `photometry.py` + `Photometry.ipynb` | ✅ 完成實測（v1.35） | **20251122**：AlVel 0/81、CCAnd 0/81；**20251220**：Orion 多目標批次進行中。V1162Ori 已產出整合式 3 欄分析圖。 |
 | 進階週期分析 | `period_analysis.py` | ✅ 完成 | 相對路徑支援已加入 |
 | 管線入口 | `run_pipeline.py` | ✅ 完成 | period_analysis 選用步驟已整合 |
 | 環境設定 | `00_setup.ipynb` | ✅ 完成 | Cell 5 無 `light/`、Cell 6 支援 `.1476` |
@@ -169,7 +169,10 @@
 - [ ] 初始幀篩選自動化：`select_comp_stars` 若第一幀品質不佳，自動往後試 N 幀（FWHM＋比較星數雙重條件）
 - [ ] sigma_clip / ensemble 不穩診斷：frames 0142/0143 m_var_norm=7.35（正常~10），末段高氣團幀 ensemble 正規化崩潰；需分析原因並在 period_analysis 前加 sigma clip 保護
 - [ ] VSX 查詢整合：視野中心查 6–9 等變星，長邊 1/2 圓內（`vsx_query.py` 已有草稿）
-- [ ] 多目標共用拆色檔架構（session-centric）：一份 split FITS 跑多顆目標，避免重複拆色
+- [x] 多目標共用拆色檔架軌（session-centric）：已實作，一份 split FITS 跑多顆目標。
+- [x] 整合式 3 欄式分析圖 (v1.35)：含 LS/DFT/Phase Fold，支援報告級字體與配色。
+- [x] G1/G2 比值週期分析自動化：修正變數定義 Bug，整合入主流程。
+- [/] 獵戶座 5 星批次執行：V1162Ori 完成，V1643Ori 進行中。
 
 ---
 
@@ -193,6 +196,32 @@
 ---
 
 ## 5. 修訂歷程
+
+---
+
+### 2026-03-16 UTC+8 (v1.35)
+
+**對話主題：3 欄式圖表整合、Orion 多目標批次處理、視覺細節微調**
+
+**實作項目**
+1. `photometry.py` 升級至 v1.35：
+   - 整合 `save_3panel_period_plot`：單張圖包含 LS Power, DFT Amplitude, Phase Fold。
+   - 視覺最佳化：標題 20pt、軸標 14pt、擬合線加粗 (LW=2.5)、±1σ 誤差棒標註。
+   - 格式化：LS 週期標籤改為 HH:MM 格式。
+2. 批次處理邏輯：
+   - 支援 `--date YYYYMMDD` 自動處理 yaml 中該場次所有目標。
+   - 失敗容錯：演算失敗（如 WCS）記錄日誌並跳過，不中斷批次執行。
+3. 視覺微調 (User Feedback)：
+   - 經緯度座標移至右上角，改為 `darkgreen` 墨綠色。
+   - G1/G2 比值圖 BJD 軸標題與刻度統一為 `steelblue`。
+4. Bug 修正：
+   - 修正 G1/G2 比值計算中 `c` vs `_c` 的 NameError。
+   - 修正 `run_fourier_fit` 中 `sort_idx` 未定義導致的 NameError。
+
+**執行進度**
+- 20251220 場次處理中。
+- V1162Ori：已完成，產出 v1.35 規格圖表。
+- V1643Ori / V1373Ori / HHOri / Gaia301：佇列執行中。
 
 ---
 

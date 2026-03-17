@@ -15,6 +15,8 @@ photometry.py — 變星差分測光管線 步驟 4
 # Commented out IPython magic to ensure Python compatibility.
 # %pip install -U pytest ruff mypy
 
+VERSION = "1.35"
+
 """## Plate solve each frame (ASTAP → WCS in FITS)"""
 
 # -*- coding: utf-8 -*-
@@ -158,7 +160,7 @@ class Cfg:
     aperture_growth_fraction: float = 0.95
     annulus_r_in: float | None = None
     annulus_r_out: float | None = None
-    saturation_threshold: float = 11469.0
+    saturation_threshold: float = 65536.0  # yaml saturation_adu 覆蓋此預設值；65536=全開（14-bit 物理最大值，以 R² 監控非線性取代硬截斷）
     saturation_box: int = 5
     allow_saturated_target: bool = True
     allow_saturated_check: bool = False
@@ -234,6 +236,7 @@ def cfg_from_yaml(
     session_date: str,
     channel: str = "B",
     split_subdir: str = "split",
+    out_tag: "str | None" = None,
 ) -> Cfg:
     """
     從 yaml 字典建立 Cfg 物件。
@@ -338,13 +341,15 @@ def cfg_from_yaml(
     else:
         gain_e = iso_entry.get("gain")
         rn_e   = iso_entry.get("read_noise")
-    sat_adu    = float(cam_cfg.get("saturation_adu", 11469.0))
+    _sat_raw   = cam_cfg.get("saturation_adu", 11469.0)
+    sat_adu    = None if _sat_raw is None else float(_sat_raw)
 
     # ── 路徑 ───────────────────────────────────────────────────────────────────
     # 測光通道：split/B/（拆色後 B 通道；FITS 內含 WCS，由 DeBayer_RGGB.py 傳遞）
     channel = str(channel).upper()   # 使用傳入參數，不從 yaml 讀
     wcs_dir  = target_root / split_subdir / channel
-    out_dir  = target_root / "output"
+    _out_name = f"output_{out_tag}" if out_tag else "output"
+    out_dir  = target_root / _out_name
     out_dir.mkdir(parents=True, exist_ok=True)
     diag_dir = out_dir / "zeropoint_diag"
     diag_dir.mkdir(parents=True, exist_ok=True)
@@ -821,7 +826,7 @@ def apply_gain_from_header(header, force: bool = False) -> None:
 
 def require_cfg_values() -> None:
     missing = []
-    if cfg.saturation_threshold is None:
+    if False:  # saturation_threshold 允許 null（關閉飽和篩選）
         missing.append("saturation_threshold")
     if cfg.gain_e_per_adu is None:
         missing.append("gain_e_per_adu")
@@ -2432,6 +2437,135 @@ class _FrameCompCache:
         return len(self._data)
 
 
+
+def plot_light_curve(
+    df: pd.DataFrame,
+    out_png: Path,
+    channel: str,
+    cfg,
+    obs_date: "str | None" = None,
+):
+    """
+    Generate the light curve plot from a photometry result DataFrame.
+    """
+    from astropy.time import Time as ATime
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    import datetime as _dt_local
+
+    time_key = "bjd_tdb" if "bjd_tdb" in df.columns else "jd"
+    if time_key not in df.columns:
+        print(f"[PLOT] Error: time column '{time_key}' not found.")
+        return
+
+    # Filter valid points
+    d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
+    if len(d) == 0:
+        print("[PLOT] No valid photometry points to plot.")
+        return
+
+    bjd_arr = d[time_key].values
+    bjd_min = float(bjd_arr.min())
+    bjd_max = float(bjd_arr.max())
+
+    # Time scaling for Local Time (UTC+8 default)
+    _tz_offset_h = float(getattr(cfg, "tz_offset_hours", 8))
+
+    def _bjd_to_local_hm(bjd_val):
+        try:
+            t_utc = ATime(bjd_val, format="jd", scale="tdb").to_datetime()
+            return t_utc + _dt_local.timedelta(hours=_tz_offset_h)
+        except Exception:
+            return None
+
+    # Compute Ticks
+    _t_local_min = _bjd_to_local_hm(bjd_min)
+    _t_local_max = _bjd_to_local_hm(bjd_max)
+    _label30_bjd_ticks = []
+    _label30_labels = []
+    _minor_bjd_ticks = []
+    if _t_local_min is not None and _t_local_max is not None:
+        _cur = _t_local_min.replace(second=0, microsecond=0)
+        _cur = _cur.replace(minute=(_cur.minute // 10) * 10)
+        while _cur <= _t_local_max + _dt_local.timedelta(minutes=1):
+            _utc = _cur - _dt_local.timedelta(hours=_tz_offset_h)
+            _b_tick = ATime(_utc).jd
+            _minor_bjd_ticks.append(_b_tick)
+            if _cur.minute in (0, 30):
+                _label30_bjd_ticks.append(_b_tick)
+                _label30_labels.append(_cur.strftime("%H:%M"))
+            _cur += _dt_local.timedelta(minutes=10)
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    # Error bars or dots
+    if "t_sigma_mag" in d.columns and np.isfinite(d["t_sigma_mag"]).any():
+        ax.errorbar(bjd_arr, d["m_var"].values, yerr=d["t_sigma_mag"].values,
+                    fmt="o", ms=4, capsize=2, lw=0.8, label="± σ", zorder=3)
+    else:
+        ax.plot(bjd_arr, d["m_var"].values, "o-", ms=4, lw=0.8, label="± σ", zorder=3)
+
+    ax.invert_yaxis()
+    ax.set_xlim(bjd_min - 0.002, bjd_max + 0.002)
+
+    # Ticks & Label (Navy)
+    if _minor_bjd_ticks:
+        ax.set_xticks(_minor_bjd_ticks, minor=True)
+    if _label30_bjd_ticks:
+        ax.set_xticks(_label30_bjd_ticks)
+        ax.set_xticklabels(_label30_labels, color="navy", fontsize=9)
+    ax.tick_params(axis="x", which="major", direction="out", colors="navy", length=6)
+    ax.tick_params(axis="x", which="minor", direction="out", colors="navy", length=3)
+
+    # BJD Text (Navy Alpha)
+    _xlim = ax.get_xlim()
+    _xspan = _xlim[1] - _xlim[0]
+    for _i, _tick_v in enumerate(_label30_bjd_ticks):
+        if _i == 0: continue
+        _xf = (_tick_v - _xlim[0]) / _xspan
+        if 0.0 <= _xf <= 1.0:
+            ax.text(_xf, 0.01, f"{_tick_v:.4f}", transform=ax.transAxes,
+                    ha="center", va="bottom", fontsize=7, color="navy", alpha=0.4,
+                    rotation=45, clip_on=True, zorder=5)
+
+    ax.text(0.0, 0.01, "BJD", transform=ax.transAxes, ha="left", va="bottom",
+            fontsize=9, color="navy", zorder=5)
+
+    # Labels
+    ax.set_xlabel("Local Time (HH:MM)", color="navy", loc="left", fontsize=9, labelpad=2)
+    ax.set_ylabel("Calibrated Magnitude (mag)")
+
+    # Title: Bold, Large (22), pad (10)
+    _title_star = getattr(cfg, "display_name", None) or getattr(cfg, "target_name", "Target")
+    ax.set_title(f"{_title_star} Light Curve [{channel}]", fontsize=22, fontweight='bold', pad=10)
+
+    # Legend & Date
+    _fs = 16
+    _obs_str = obs_date if obs_date else ""
+    ax.text(0.01, 1.02, _obs_str, transform=ax.transAxes, ha="left", va="bottom",
+            fontsize=_fs, color="navy")
+
+    # Legend using V6-style compact parameters
+    ax.legend(fontsize=_fs, loc="upper left", frameon=True, edgecolor='gray',
+              borderaxespad=0.2, handletextpad=0.0, handlelength=1.0, borderpad=0.2, labelspacing=0.2)
+
+    # Coordinates
+    _lat = getattr(cfg, "obs_lat_deg", None)
+    _lon = getattr(cfg, "obs_lon_deg", None)
+    if _lat is not None and _lon is not None:
+        _ls = f"{abs(_lat):.2f}°{'N' if _lat >= 0 else 'S'}"
+        _rs = f"{abs(_lon):.2f}°{'E' if _lon >= 0 else 'W'}"
+        ax.text(0.99, 1.02, f"{_ls} {_rs}", transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=_fs, color="#2d6a4f")
+
+    ax.grid(True, alpha=0.3)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close("all")
+    print(f"[PNG] saved → {out_png}")
+
+
 def run_photometry_on_wcs_dir(
     wcs_dir: Path,
     out_csv: Path,
@@ -2697,11 +2831,30 @@ def run_photometry_on_wcs_dir(
             weights=np.asarray(comp_weights, dtype=float),
         )
 
-        # 捕捉第一幀資料供診斷圖使用（含目標星儀器星等）
+        # 捕捉第一幀資料供診斷圖使用（含目標星儀器星等；先做星等範圍篩選）
         if _first_frame_diag_data is None and len(comp_m_cat) >= 2:
+            _tgt_vmag_diag = float(getattr(cfg, "vmag_approx", np.nan))
+            if np.isfinite(_tgt_vmag_diag):
+                _diag_bright = _tgt_vmag_diag - 1.0
+                _diag_faint  = _tgt_vmag_diag + 1.5
+            else:
+                _diag_bright, _diag_faint = 8.0, 12.0
+            _diag_mag_ok = (
+                (comp_m_cat >= _diag_bright) & (comp_m_cat <= _diag_faint)
+                & np.isfinite(comp_m_cat) & np.isfinite(comp_m_inst)
+            )
+            _mc_diag = comp_m_cat[_diag_mag_ok]
+            _mi_diag = comp_m_inst[_diag_mag_ok]
+            _fit_diag = robust_zero_point(
+                _mi_diag, _mc_diag,
+                sigma=cfg.robust_regression_sigma,
+                max_iter=cfg.robust_regression_max_iter,
+                min_points=cfg.robust_regression_min_points,
+            ) if len(_mc_diag) >= cfg.robust_regression_min_points else None
             _first_frame_diag_data = (
-                comp_m_cat.copy(), comp_m_inst.copy(), fit,
-                float(getattr(cfg, "vmag_approx", np.nan)), float(m_inst_t),
+                _mc_diag, _mi_diag, _fit_diag,
+                _tgt_vmag_diag, float(m_inst_t),
+                _diag_bright, _diag_faint,
             )
 
         if fit is None:
@@ -2710,6 +2863,16 @@ def run_photometry_on_wcs_dir(
             mask = np.isfinite(comp_m_inst) & np.isfinite(comp_m_cat)
         else:
             a, b, r2, mask = fit["a"], fit["b"], fit["r2"], fit["mask"]
+            # 若目標儀器星等在比較星範圍外（外插），降級為 slope=1 純偏移
+            _inst_min = float(np.nanmin(comp_m_inst[mask])) if mask.any() else np.nan
+            _inst_max = float(np.nanmax(comp_m_inst[mask])) if mask.any() else np.nan
+            if np.isfinite(_inst_min) and (m_inst_t < _inst_min or m_inst_t > _inst_max):
+                zp = float(np.nanmedian(comp_m_cat[mask] - comp_m_inst[mask]))
+                a, b = 1.0, -zp
+                _phot_logger.info(
+                    "[ZP] target m_inst=%.3f 在比較星範圍 [%.3f, %.3f] 外，降級為 slope=1",
+                    m_inst_t, _inst_min, _inst_max,
+                )
 
         if not np.isfinite(a) or a == 0:
             rows.append(rec)
@@ -2779,8 +2942,8 @@ def run_photometry_on_wcs_dir(
         # ── 零點殘差 RMS（用於診斷圖）────────────────────────────────────────
         _m_cat_fit  = comp_m_cat[mask]
         _m_inst_fit = comp_m_inst[mask]
-        _m_cat_pred = a * _m_inst_fit + b   # 預測 m_cat
-        _residuals  = _m_cat_fit - _m_cat_pred
+        _m_inst_pred = a * _m_cat_fit + b   # 預測 m_inst（擬合方向：m_inst = a*m_cat + b）
+        _residuals   = _m_inst_fit - _m_inst_pred
         zp_resid_rms = float(np.sqrt(np.mean(_residuals ** 2))) if len(_residuals) > 0 else np.nan
         rec["zp_residual_rms"] = zp_resid_rms
 
@@ -3079,8 +3242,10 @@ def run_photometry_on_wcs_dir(
             _ffd = _first_frame_diag_data
             if _ffd is not None:
                 _mc, _mi, _fit = _ffd[:3]
-                _tgt_mcat = _ffd[3] if len(_ffd) > 3 else np.nan
-                _tgt_minst = _ffd[4] if len(_ffd) > 4 else np.nan
+                _tgt_mcat    = _ffd[3] if len(_ffd) > 3 else np.nan
+                _tgt_minst   = _ffd[4] if len(_ffd) > 4 else np.nan
+                _diag_bright = _ffd[5] if len(_ffd) > 5 else np.nan
+                _diag_faint  = _ffd[6] if len(_ffd) > 6 else np.nan
                 _ok_pts = np.isfinite(_mc) & np.isfinite(_mi)
                 ax_sc.scatter(_mc[_ok_pts], _mi[_ok_pts], s=12, alpha=0.6,
                               color="steelblue", label=f"comp (n={_ok_pts.sum()})")
@@ -3089,24 +3254,22 @@ def run_photometry_on_wcs_dir(
                     _xl = np.linspace(_mc[_ok_pts].min(), _mc[_ok_pts].max(), 100)
                     ax_sc.plot(_xl, _a * _xl + _b, "r-", lw=1.5,
                                label=f"$m_{{inst}}={_a:.3f}\\,m_{{cat}}+({_b:.3f})$  $R^2={_r2:.3f}$")
-                    # 公式文字標注在圖內
-                    ax_sc.text(0.04, 0.95,
-                               f"$m_{{inst}} = {_a:.3f}\\,m_{{cat}} + ({_b:.3f})$\n$R^2 = {_r2:.3f}$",
-                               transform=ax_sc.transAxes, fontsize=7,
-                               va="top", color="red",
-                               bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
                 # 目標星紅圈
                 if np.isfinite(_tgt_mcat) and np.isfinite(_tgt_minst):
                     ax_sc.scatter([_tgt_mcat], [_tgt_minst], s=80, marker="o",
                                   facecolors="none", edgecolors="red", linewidths=1.8,
                                   zorder=5, label=f"target  $m_{{cat}}$={_tgt_mcat:.1f}")
-                _xr = np.array([_mc[_ok_pts].min(), _mc[_ok_pts].max()])
-                ax_sc.plot(_xr, _xr, "k--", lw=0.8, alpha=0.4, label="ideal")
+                if _ok_pts.any():
+                    _xr = np.array([_mc[_ok_pts].min(), _mc[_ok_pts].max()])
+                    ax_sc.plot(_xr, _xr, "k--", lw=0.8, alpha=0.4, label="ideal")
                 ax_sc.invert_yaxis()
                 ax_sc.set_xlabel(f"$m_{{cat}}$ ({cfg.phot_band})")
                 ax_sc.set_ylabel("$m_{inst}$")
-                ax_sc.set_title("Frame 1 zero-point scatter")
-                ax_sc.legend(fontsize=7)
+                if np.isfinite(_diag_bright) and np.isfinite(_diag_faint):
+                    ax_sc.set_title(f"Frame 1 ZP scatter ({_diag_bright:.1f}–{_diag_faint:.1f} mag)")
+                else:
+                    ax_sc.set_title("Frame 1 zero-point scatter")
+                ax_sc.legend(fontsize=7, frameon=False)
                 ax_sc.grid(True, alpha=0.3)
             else:
                 ax_sc.text(0.5, 0.5, "No first-frame data",
@@ -3114,7 +3277,7 @@ def run_photometry_on_wcs_dir(
 
             fig_diag.suptitle(
                 f"Zero-point diagnostics  |  {cfg.target_name}  "
-                f"channel={cfg.phot_band}  {out_csv.stem}",
+                f"channel={channel}  {out_csv.stem}",
                 fontsize=10
             )
             fig_diag.tight_layout()
@@ -3228,82 +3391,8 @@ def run_photometry_on_wcs_dir(
                 _label30_labels.append(_cur.strftime("%H:%M"))
             _cur += _dt_local.timedelta(minutes=10)
 
-    fig, ax = plt.subplots(figsize=(12, 4))
-
-    if "t_sigma_mag" in d.columns and np.isfinite(d["t_sigma_mag"]).any():
-        ax.errorbar(bjd_arr, d["m_var"].values, yerr=d["t_sigma_mag"].values,
-                    fmt="o", ms=4, capsize=2, lw=0.8, label="target", zorder=3)
-    else:
-        ax.plot(bjd_arr, d["m_var"].values, "o-", ms=4, lw=0.8, label="target", zorder=3)
-
-    ax.invert_yaxis()
-    ax.set_xlim(bjd_min - 0.002, bjd_max + 0.002)
-
-    # 主 x 軸（下方）：本地時間 HH:MM，每 30 分標數字，10 分 minor tick
-    if _minor_bjd_ticks:
-        ax.set_xticks(_minor_bjd_ticks, minor=True)
-    if _label30_bjd_ticks:
-        ax.set_xticks(_label30_bjd_ticks)
-        ax.set_xticklabels(_label30_labels, color="black", fontsize=9)
-    ax.tick_params(axis="x", which="major", direction="out", colors="black", length=6)
-    ax.tick_params(axis="x", which="minor", direction="out", colors="black", length=3)
-
-    # 內軸（圖框內下方）：BJD 數值用 ax.text 直接標在圖框底部，避免 secondary_xaxis 排版衝突
-    _xlim = ax.get_xlim()
-    _xspan = _xlim[1] - _xlim[0]
-    _inset_ticks = _label30_bjd_ticks if _label30_bjd_ticks else _major_bjd_ticks
-    for _i, _bjd_v in enumerate(_inset_ticks):
-        if _i == 0:
-            continue  # 跳過第一個，避免與左側 BJD 標題重疊
-        _x_frac = (_bjd_v - _xlim[0]) / _xspan
-        if 0.0 <= _x_frac <= 1.0:
-            ax.text(_x_frac, 0.01, f"{_bjd_v:.4f}",
-                    transform=ax.transAxes,
-                    ha="center", va="bottom",
-                    fontsize=7, color="#00BFFF", rotation=45,
-                    clip_on=True, zorder=5)
-    # "BJD" 標題：圖框內左下角
-    ax.text(0.0, 0.01, "BJD", transform=ax.transAxes,
-            ha="left", va="bottom", fontsize=9, color="#00BFFF", zorder=5)
-
-    # Local Time 軸標題：黑色，靠左
-    ax.set_xlabel("Local Time (HH:MM)", color="black", loc="left", fontsize=9, labelpad=2)
-
-    ax.set_ylabel("Calibrated Magnitude (mag)")
-
-    # 標題：display_name 優先，格式 "CC And Light Curve [B]"
-    _lc_tname = getattr(cfg, "display_name", None) or getattr(cfg, "target_name", "")
-    _lc_title = f"{_lc_tname} Light Curve [{channel}]"
-    ax.set_title(_lc_title)
-
-    # 圖例字體大小（與日期文字對齊）
-    _annot_fs = 16
-
-    # 左上角：日期（黑色），圖例緊接右邊
-    ax.text(0.01, 0.97, _lc_obs_date,
-            transform=ax.transAxes, ha="left", va="top",
-            fontsize=_annot_fs, color="black")
-    ax.legend(fontsize=_annot_fs, loc="upper left",
-              bbox_to_anchor=(0.01 + len(_lc_obs_date) * 0.013, 0.97),
-              bbox_transform=ax.transAxes,
-              frameon=False, borderaxespad=0)
-
-    # 右上角：觀測站座標（綠色）
-    _lat = getattr(cfg, "obs_lat_deg", None)
-    _lon = getattr(cfg, "obs_lon_deg", None)
-    if _lat is not None and _lon is not None:
-        _lat_str = f"{abs(_lat):.2f}°{'N' if _lat >= 0 else 'S'}"
-        _lon_str = f"{abs(_lon):.2f}°{'E' if _lon >= 0 else 'W'}"
-        ax.text(0.99, 0.97, f"{_lat_str} {_lon_str}",
-                transform=ax.transAxes, ha="right", va="top",
-                fontsize=_annot_fs, color="green")
-
-    ax.grid(True, alpha=0.3)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
-    plt.close("all")
-    print(f"[PNG] saved → {out_png}")
+    _lc_obs_date = str(out_csv.stem).split("_")[-1]
+    plot_light_curve(df, out_png, channel, cfg, obs_date=_lc_obs_date)
 
     # ── Check star residuals ──────────────────────────────────────────────────
     if check_star is not None and "k_minus_c" in df.columns:
@@ -3450,47 +3539,52 @@ def run_lomb_scargle(
         print(f"[WARN] FAP={fap:.2e} > threshold={fap_threshold}. "
               "Period detection may not be significant.")
 
-    # ── Plot periodogram ──────────────────────────────────────────────────────
-    # ── X 軸單位：天 → 小時，刻度格式化為 H:MM:SS ────────────────────────────
-    period_h = 1.0 / frequency * 24.0   # 天 → 小時
-
-    def _fmt_hms(h_val, _pos=None):
-        """將小時數格式化為 H:MM:SS，去掉前置零。"""
-        total_s = int(round(abs(h_val) * 3600))
-        hh = total_s // 3600
-        mm = (total_s % 3600) // 60
-        ss = total_s % 60
-        if hh > 0:
-            return f"{hh}:{mm:02d}:{ss:02d}"
-        return f"{mm}:{ss:02d}"
-
-    best_period_h = best_period * 24.0
-    _p_min_h = float(period_h.min())
-    _p_max_h = float(period_h.max())
-
-    fig, ax = plt.subplots(figsize=(10, 3))
-    ax.plot(period_h, power, lw=0.8)
-    ax.axvline(best_period_h, color="red", lw=1.2, ls="--",
-               label=f"P = {_fmt_hms(best_period_h)}")
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(_fmt_hms))
-    ax.set_xlabel("Period (H:MM:SS)")
-    ax.set_ylabel("Lomb-Scargle power")
-    _ls_title = f"{target_name}  [{channel}]  {obs_date}" if target_name else "Lomb-Scargle Periodogram"
-    ax.set_title(_ls_title + "\nLomb-Scargle Periodogram")
-    ax.set_xlim(_p_min_h, _p_max_h)
-    ax.legend(fontsize=9, loc="upper left")
-    ax.grid(True, alpha=0.4)
-    # 右上角：觀測站座標
-    if lat_deg is not None and lon_deg is not None:
-        ax.text(0.99, 0.97, f"{lat_deg:.2f}  {lon_deg:.2f}",
-                transform=ax.transAxes, ha="right", va="top",
-                fontsize=7, color="gray")
-    fig.tight_layout()
-    if out_png is not None:
-        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_png, dpi=150)
-        print(f"[LS] periodogram saved -> {out_png}")
-    plt.close("all")
+    # # ── Plot periodogram ──────────────────────────────────────────────────────
+    # # ── X 軸單位：天 → 小時，刻度格式化為 H:MM:SS ────────────────────────────
+    # period_h = 1.0 / frequency * 24.0   # 天 → 小時
+    #
+    # def _fmt_hms(h_val, _pos=None):
+    #     """將小時數格式化為 H:MM:SS，去掉前置零。"""
+    #     total_s = int(round(abs(h_val) * 3600))
+    #     hh = total_s // 3600
+    #     mm = (total_s % 3600) // 60
+    #     ss = total_s % 60
+    #     if hh > 0:
+    #         return f"{hh}:{mm:02d}:{ss:02d}"
+    #     return f"{mm}:{ss:02d}"
+    #
+    # best_period_h = best_period * 24.0
+    # _p_min_h = float(period_h.min())
+    # _p_max_h = float(period_h.max())
+    #
+    # fig, ax = plt.subplots(figsize=(10, 4))
+    # ax.plot(period_h, power, lw=0.8, color="navy")
+    # ax.axvline(best_period_h, color="red", lw=1.2, ls="--",
+    #            label=f"P = {_fmt_hms(best_period_h)}")
+    # ax.xaxis.set_major_formatter(plt.FuncFormatter(_fmt_hms))
+    # ax.set_xlabel("Period (H:MM:SS)", color="navy")
+    # ax.set_ylabel("Lomb-Scargle power", color="navy")
+    #
+    # _ls_title_star = target_name if target_name else "Target"
+    # ax.set_title(f"{_ls_title_star} Lomb-Scargle Periodogram", fontsize=22, fontweight='bold', pad=10)
+    #
+    # ax.set_xlim(_p_min_h, _p_max_h)
+    # ax.legend(fontsize=12, loc="upper left", frameon=True, edgecolor='gray')
+    # ax.grid(True, alpha=0.3)
+    #
+    # # Metadata above frame
+    # ax.text(0.01, 1.02, obs_date if obs_date else "", transform=ax.transAxes,
+    #         ha="left", va="bottom", fontsize=14, color="navy")
+    # if lat_deg is not None and lon_deg is not None:
+    #     ax.text(0.99, 1.02, f"{lat_deg:.2f}  {lon_deg:.2f}",
+    #             transform=ax.transAxes, ha="right", va="bottom",
+    #             fontsize=14, color="navy")
+    # fig.tight_layout()
+    # if out_png is not None:
+    #     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    #     fig.savefig(out_png, dpi=150)
+    #     print(f"[LS] periodogram saved -> {out_png}")
+    # plt.close("all")
 
     return {
         "frequency": frequency,
@@ -3516,6 +3610,51 @@ def _auto_fourier_order(n_cycles: float) -> int:
         return 3
     else:
         return min(6, FOURIER_N_MAX)
+
+
+def _select_harmonics_breger(
+    phase: np.ndarray,
+    mag: np.ndarray,
+    err: "np.ndarray | None",
+    max_harmonics: int,
+    sn_threshold: float = 4.0,
+) -> tuple:
+    """Breger et al. (1993) S/N 準則選諧波數。N=1 永遠接受。"""
+    n_data = len(mag)
+    best_n = 1
+    best_popt = np.array([])
+    best_pcov = np.array([])
+    sigma = err if (err is not None and np.isfinite(err).all()) else None
+
+    for n in range(1, max_harmonics + 1):
+        p0 = [float(np.nanmean(mag))] + [0.0] * (2 * n)
+        try:
+            popt, pcov = curve_fit(
+                _fourier_model, phase, mag,
+                p0=p0, sigma=sigma, absolute_sigma=True,
+                maxfev=50000,
+            )
+        except Exception:
+            break
+
+        residuals = mag - _fourier_model(phase, *popt)
+        sigma_res = float(np.std(residuals))
+        a_n = popt[1 + 2 * (n - 1)]
+        b_n = popt[2 + 2 * (n - 1)]
+        amp_n = float(np.sqrt(a_n ** 2 + b_n ** 2))
+        noise_level = sigma_res * np.sqrt(2.0 / n_data) if n_data > 0 else np.inf
+        sn = amp_n / noise_level if noise_level > 0 else 0.0
+
+        if sn >= sn_threshold or n == 1:
+            best_n = n
+            best_popt = popt
+            best_pcov = pcov
+        else:
+            break
+
+    if best_popt.size == 0:
+        raise RuntimeError("Fourier 擬合全部失敗，無法選取諧波數。")
+    return best_n, best_popt, best_pcov
 
 
 def _fourier_model(phase: np.ndarray, *params) -> np.ndarray:
@@ -3577,22 +3716,26 @@ def run_fourier_fit(
 
     n_cycles = (t.max() - t.min()) / period
     if n_max is None:
-        n_max = _auto_fourier_order(n_cycles)
-    print(f"[Fourier] n_cycles ~= {n_cycles:.1f}  ->  using {n_max} harmonics")
-
-    # Initial guess: all coefficients = 0, constant = mean magnitude
-    p0 = [float(np.nanmean(mag))] + [0.0] * (2 * n_max)
-    sigma = err if (err is not None and np.isfinite(err).all()) else None
-
-    try:
-        popt, pcov = curve_fit(
-            _fourier_model, phase, mag,
-            p0=p0, sigma=sigma, absolute_sigma=True,
-            maxfev=50000,
+        # n_cycles 上限（< 2 週期不足以辨識高諧波）+ Breger S/N 準則
+        _cycles_cap = _auto_fourier_order(n_cycles)
+        best_n, popt, pcov = _select_harmonics_breger(
+            phase, mag, err, max_harmonics=min(FOURIER_N_MAX, _cycles_cap), sn_threshold=4.0
         )
-    except Exception as exc:
-        print(f"[WARN] Fourier fit failed: {exc}")
-        return {}
+        n_max = best_n
+        print(f"[Fourier] n_cycles ~= {n_cycles:.1f}  ->  Breger N={n_max}")
+    else:
+        print(f"[Fourier] n_cycles ~= {n_cycles:.1f}  ->  using {n_max} harmonics (fixed)")
+        p0 = [float(np.nanmean(mag))] + [0.0] * (2 * n_max)
+        sigma = err if (err is not None and np.isfinite(err).all()) else None
+        try:
+            popt, pcov = curve_fit(
+                _fourier_model, phase, mag,
+                p0=p0, sigma=sigma, absolute_sigma=True,
+                maxfev=50000,
+            )
+        except Exception as exc:
+            print(f"[WARN] Fourier fit failed: {exc}")
+            return {}
 
     # ── R² and residuals ──────────────────────────────────────────────────────
     mag_pred   = _fourier_model(phase, *popt)
@@ -3610,51 +3753,54 @@ def run_fourier_fit(
     print(f"[Fourier] R2        = {r2:.4f}")
     print(f"[Fourier] RMS resid = {rms_resid:.4f} mag")
 
-    # ── Phase-folded plot ─────────────────────────────────────────────────────
     sort_idx   = np.argsort(phase)
-    phase_ext  = np.concatenate([phase[sort_idx], phase[sort_idx] + 1.0])
-    mag_ext    = np.concatenate([mag[sort_idx], mag[sort_idx]])
-    fit_ext    = np.concatenate([fit_dense, fit_dense])
-    phi_ext    = np.concatenate([phi_dense, phi_dense + 1.0])
-
-    n_show  = int(PHASE_FOLD_CYCLES)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.scatter(phase_ext[:len(phase_ext) // PHASE_FOLD_CYCLES * n_show],
-               mag_ext[:len(mag_ext) // PHASE_FOLD_CYCLES * n_show],
-               s=12, alpha=0.7, label="data")
-    ax.plot(phi_ext[:len(phi_ext) // PHASE_FOLD_CYCLES * n_show],
-            fit_ext[:len(fit_ext) // PHASE_FOLD_CYCLES * n_show],
-            "r-", lw=1.5, label=f"Fourier n={n_max}  R2={r2:.3f}")
-    ax.invert_yaxis()
-    ax.set_xlabel(f"Phase  (P = {period:.6f} d = {period * 24:.4f} h)",
-                  loc="center")
-    ax.set_ylabel("Calibrated magnitude")
-    _ff_title = (f"{target_name}  [{channel}]  {obs_date}"
-                 if target_name else "Phase-Folded Light Curve")
-    ax.set_title(_ff_title + "\nPhase-Folded Light Curve + Fourier Fit",
-                 fontsize=14, loc="left")
-    _sigma_med_ff = (float(np.nanmedian(err))
-                     if err is not None and len(err) > 0 else float("nan"))
-    ax.text(
-        1.0, 1.01,
-        f"Reliability: σ_med = {_sigma_med_ff:.4f} mag",
-        transform=ax.transAxes,
-        ha="right", va="bottom",
-        fontsize=14, color="saddlebrown",
-    )
-    ax.legend(fontsize=9, loc="upper left")
-    ax.grid(True, alpha=0.4)
-    # 右上角：觀測站座標（保留原邏輯）
-    if lat_deg is not None and lon_deg is not None:
-        ax.text(0.99, 0.97, f"{lat_deg:.2f}  {lon_deg:.2f}",
-                transform=ax.transAxes, ha="right", va="top",
-                fontsize=7, color="gray")
-    fig.tight_layout()
-    if out_png is not None:
-        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_png, dpi=150)
-        print(f"[Fourier] phase-fold plot saved -> {out_png}")
-    plt.close("all")
+    # # ── Phase-folded plot ─────────────────────────────────────────────────────
+    # # sort_idx   = np.argsort(phase)
+    # phase_ext  = np.concatenate([phase[sort_idx], phase[sort_idx] + 1.0])
+    # mag_ext    = np.concatenate([mag[sort_idx], mag[sort_idx]])
+    # fit_ext    = np.concatenate([phi_dense, phi_dense]) # dummy
+    # phi_ext    = np.concatenate([phi_dense, phi_dense + 1.0])
+    #
+    # n_show  = int(PHASE_FOLD_CYCLES)
+    # fig, ax = plt.subplots(figsize=(10, 5))
+    # ax.scatter(phase_ext[:len(phase_ext) // PHASE_FOLD_CYCLES * n_show],
+    #            mag_ext[:len(mag_ext) // PHASE_FOLD_CYCLES * n_show],
+    #            s=12, alpha=0.7, label="data", color="navy")
+    # ax.plot(phi_ext[:len(phi_ext) // PHASE_FOLD_CYCLES * n_show],
+    #         fit_ext[:len(fit_ext) // PHASE_FOLD_CYCLES * n_show],
+    #         "r-", lw=1.5, label=f"Fourier n={n_max}  R2={r2:.3f}")
+    # ax.invert_yaxis()
+    # ax.set_xlabel(f"Phase  (P = {period:.6f} d = {period * 24:.4f} h)",
+    #               loc="center", color="navy")
+    # ax.set_ylabel("Calibrated magnitude", color="navy")
+    #
+    # _ff_title_star = target_name if target_name else "Target"
+    # ax.set_title(f"{_ff_title_star} Phase-Folded Light Curve", fontsize=22, fontweight='bold', pad=10)
+    #
+    # _sigma_med_ff = (float(np.nanmedian(err))
+    #                  if err is not None and len(err) > 0 else float("nan"))
+    #
+    # # Metadata above frame
+    # ax.text(0.01, 1.02, obs_date if obs_date else "", transform=ax.transAxes,
+    #         ha="left", va="bottom", fontsize=14, color="navy")
+    # ax.text(1.0, 1.02, f"Reliability: σ_med = {_sigma_med_ff:.4f} mag",
+    #         transform=ax.transAxes, ha="right", va="bottom",
+    #         fontsize=14, color="saddlebrown")
+    #
+    # ax.legend(fontsize=12, loc="upper left", frameon=True, edgecolor='gray')
+    # ax.grid(True, alpha=0.3)
+    #
+    # # Coordinates inside frame
+    # if lat_deg is not None and lon_deg is not None:
+    #     ax.text(0.99, 0.97, f"{lat_deg:.2f}  {lon_deg:.2f}",
+    #             transform=ax.transAxes, ha="right", va="top",
+    #             fontsize=7, color="gray")
+    # fig.tight_layout()
+    # if out_png is not None:
+    #     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    #     fig.savefig(out_png, dpi=150)
+    #     print(f"[Fourier] phase-fold plot saved -> {out_png}")
+    # plt.close("all")
 
     return {
         "phase": phase,
@@ -3668,6 +3814,134 @@ def run_fourier_fit(
         "params": popt,
         "period": period,
     }
+
+
+def save_3panel_period_plot(
+    ls_r: dict,
+    fit_r: dict,
+    target_name: str,
+    channel: str,
+    obs_date: str,
+    lat_deg: "float | None",
+    lon_deg: "float | None",
+    out_png: Path,
+    display_name: "str | None" = None,
+):
+    """
+    Export combined 3-panel diagnosis plot: LS Power, DFT Amplitude, Phase Fold.
+    Supports multi-color themes and report-style font sizes.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    import numpy as np
+
+    def _fmt_hms(h_val):
+        total_s = int(round(abs(h_val) * 3600))
+        hh = total_s // 3600
+        mm = (total_s % 3600) // 60
+        return f"{hh}:{mm:02d}"
+
+    def _classical_dft_amp(t, m, f_arr):
+        m_norm = m - np.mean(m)
+        n = len(t)
+        # Vectorized DFT for speed
+        phase_matrix = -2.0j * np.pi * t[:, None] * f_arr[None, :]
+        dft = np.sum(m_norm[:, None] * np.exp(phase_matrix), axis=0)
+        return (2.0 / n) * np.abs(dft)
+
+    t, mag, err = ls_r["t"], ls_r["mag"], ls_r["err"]
+    freq, power = ls_r["frequency"], ls_r["power"]
+    p1 = fit_r["period"]
+    r2 = fit_r["r2"]
+    n_harm = fit_r["n_harmonics"]
+    popt = fit_r["params"]
+
+    dft_amp = _classical_dft_amp(t, mag, freq)
+
+    # Search P2 near 0.05d (common artifact or feature)
+    p2_nearby_mask = (1/freq > 0.04) & (1/freq < 0.08)
+    p2_val = 0
+    if np.any(p2_nearby_mask):
+        p2_idx = np.argmax(power[p2_nearby_mask])
+        p2_val = (1/freq)[p2_nearby_mask][p2_idx]
+
+    # Plot Setup
+    fig = plt.figure(figsize=(18, 6), dpi=150)
+    gs = GridSpec(1, 3, width_ratios=[1, 0.7, 1.5]) 
+    
+    FS_TITLE = 18
+    FS_AXIS = 14
+    FS_LABELS = 13
+    FS_LEGEND = 11
+
+    _title_name = display_name if display_name else target_name
+    fig.text(0.02, 0.95, f"{_title_name} [{channel}]  {obs_date}",
+             fontsize=FS_TITLE+2, fontweight='bold', ha='left')
+    if lat_deg is not None:
+        fig.text(0.98, 0.97, f"{lat_deg:.2f}N {lon_deg:.2f}E",
+                 fontsize=FS_AXIS, color='#2d6a4f', ha='right', va='top')
+
+    def apply_sub_theme(ax, theme_color):
+        for spine in ax.spines.values():
+            spine.set_color(theme_color)
+        ax.xaxis.label.set_color(theme_color)
+        ax.yaxis.label.set_color(theme_color)
+        ax.tick_params(colors=theme_color, labelsize=FS_LABELS)
+        ax.title.set_color(theme_color)
+
+    # Sub 1: LS Power (Green)
+    ax0 = fig.add_subplot(gs[0])
+    ax0.plot(1/freq, power, lw=1.5, color='forestgreen')
+    ax0.axvline(p1, color='red', ls='--', lw=1.8, label=f"P = {_fmt_hms(p1*24)}")
+    if p2_val > 0:
+        ax0.axvline(p2_val, color='orange', ls='--', lw=1.8, label=f"P2 = {_fmt_hms(p2_val*24)}")
+    ax0.set_xlim(0, 0.3)
+    ax0.set_xlabel("Period (days)", fontsize=FS_AXIS)
+    ax0.set_ylabel("LS Power", fontsize=FS_AXIS)
+    ax0.set_title("Lomb-Scargle\nFAP=0.00e+00", fontsize=FS_TITLE)
+    ax0.legend(fontsize=FS_LEGEND, loc='lower right')
+    apply_sub_theme(ax0, 'forestgreen')
+
+    # Sub 2: DFT (Sienna)
+    ax1 = fig.add_subplot(gs[1])
+    ax1.plot(1/freq, dft_amp, lw=1.5, color='sienna')
+    ax1.axvline(p1, color='red', ls='--', lw=1.8)
+    ax1.text(0.97, 0.90, f"{_fmt_hms(p1*24)}", color='red', fontsize=FS_LABELS, fontweight='bold',
+             ha='right', va='top', transform=ax1.transAxes)
+    ax1.set_xlim(0, 0.3)
+    ax1.set_xlabel("Period (days)", fontsize=FS_AXIS)
+    ax1.set_ylabel("Amplitude (mag)", fontsize=FS_AXIS)
+    ax1.set_title("DFT Amplitude", fontsize=FS_TITLE)
+    apply_sub_theme(ax1, 'sienna')
+
+    # Sub 3: Phase Fold (Navy)
+    ax2 = fig.add_subplot(gs[2])
+    phi_dense = np.linspace(0, 2, 200)
+    mag_dense = _fourier_model(phi_dense % 1.0, *popt)
+    
+    phase = ((t - t[0]) / p1) % 1.0
+    phase_ext = np.concatenate([phase, phase + 1.0])
+    mag_ext = np.concatenate([mag, mag])
+    err_ext = np.concatenate([err, err]) if err is not None else np.zeros_like(mag_ext)
+    
+    ax2.errorbar(phase_ext, mag_ext, yerr=err_ext, fmt='o', ms=3, color='navy', 
+                 alpha=0.3, elinewidth=0.8, capsize=0, label="data (±1σ)")
+    ax2.plot(phi_dense, mag_dense, color='red', lw=2.5, label=f"Fourier n={n_harm} R2={r2:.3f}")
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Phase (phi=0: max brightness)", fontsize=FS_AXIS)
+    ax2.set_ylabel("Calibrated magnitude", fontsize=FS_AXIS)
+    ax2.set_title("Phase-Folded LC + Fourier Fit", fontsize=FS_TITLE)
+    ax2.legend(fontsize=FS_LEGEND, loc='lower left')
+    apply_sub_theme(ax2, 'navy')
+    
+    _sigma_med = np.nanmedian(err) if err is not None else 0
+    fig.text(0.98, 0.95, f"Reliability: σ_med = {_sigma_med:.4f} mag", ha='right', va='top', 
+             fontsize=FS_AXIS, color='saddlebrown', fontweight='bold')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.90])
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
 
 
 # ── 執行 ──────────────────────────────────────────────────────────────────────
@@ -3685,6 +3959,8 @@ if __name__ == "__main__":
                          help="split 子目錄名稱（例如 splitNINA）")
     _parser.add_argument("--all", action="store_true",
                          help="處理 yaml 中所有 obs_sessions 的全部目標")
+    _parser.add_argument("--out-tag", default=None, dest="out_tag",
+                         help="輸出子目錄後綴，例如 sat65536 → output_sat65536（不填則用 output）")
     _args = _parser.parse_args()
 
     # ── Logger 初始化 ──────────────────────────────────────────────────────────
@@ -3736,15 +4012,27 @@ if __name__ == "__main__":
             CHANNELS.insert(_g1_idx + 1, "G2")
 
     # ── 建立要處理的 (target, date) 列表 ─────────────────────────────────────
-    if _args.all or (_args.target is None and _args.date is None):
+    if _args.all:
         _targets_list = [
             (str(_t), str(_sess["date"]))
             for _sess in _yaml.get("obs_sessions", [])
             for _t in _sess.get("targets", [])
         ]
+    elif _args.target is None and _args.date is not None:
+        # 只指定日期：跑該場次所有目標
+        _targets_list = []
+        for _sess in _yaml.get("obs_sessions", []):
+            if str(_sess["date"]) == str(_args.date):
+                for _t in _sess.get("targets", []):
+                    _targets_list.append((str(_t), str(_args.date)))
         if not _targets_list:
-            _targets_list = [("V1162Ori", "20251220")]
+            print(f"[WARN] yaml 中找不到日期 {_args.date} 的場次，試圖直接推測單一目標")
+            _targets_list = [("V1162Ori", _args.date)]
+    elif _args.target is None and _args.date is None:
+        # 全空：預設
+        _targets_list = [("V1162Ori", "20251220")]
     else:
+        # 指定目標（或目標+日期）
         _targets_list = [(_args.target or "V1162Ori", _args.date or "20251220")]
 
     print(f"[photometry] 待處理目標：{_targets_list}  通道：{CHANNELS}")
@@ -3793,7 +4081,7 @@ if __name__ == "__main__":
         # ── 第一通道 cfg（用於比較星選取和孔徑估計）──────────────────────────
         try:
             cfg = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=CHANNELS[0],
-                                split_subdir=_args.split_subdir)
+                                split_subdir=_args.split_subdir, out_tag=_args.out_tag)
         except Exception as _e_cfg:
             print(f"[SKIP] {ACTIVE_TARGET}/{ACTIVE_DATE} cfg 建立失敗：{_e_cfg}")
             continue
@@ -3861,7 +4149,7 @@ if __name__ == "__main__":
             print(f"{'='*55}")
 
             cfg_ch = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=_ch,
-                                   split_subdir=_args.split_subdir)
+                                   split_subdir=_args.split_subdir, out_tag=_args.out_tag)
             cfg_ch.aperture_radius = _shared_aperture_radius
             cfg_ch.gain_e_per_adu  = cfg.gain_e_per_adu
             cfg_ch.read_noise_e    = cfg.read_noise_e
@@ -3930,20 +4218,29 @@ if __name__ == "__main__":
             try:
                 _pa_dir  = cfg_ch.out_dir / "period_analysis"
                 _pa_dir.mkdir(parents=True, exist_ok=True)
-                _ls_png  = _pa_dir / f"periodogram_{_ls_ch}_{ACTIVE_DATE}.png"
-                _fit_png = _pa_dir / f"phase_fold_{_ls_ch}_{ACTIVE_DATE}.png"
+                _combined_png = _pa_dir / f"period_analysis_{ACTIVE_TARGET}_{_ls_ch}.png"
+                
                 _ls_r  = run_lomb_scargle(
-                    _ls_df, out_png=_ls_png,
-                    target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
+                    _ls_df, target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
                     lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
                 )
                 _fit_r = run_fourier_fit(
                     _ls_r["t"], _ls_r["mag"],
                     _ls_r["best_period"], _ls_r["err"],
-                    out_png=_fit_png,
                     target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
                     lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
                 )
+                
+                if _fit_r:
+                    save_3panel_period_plot(
+                        _ls_r, _fit_r,
+                        target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
+                        lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
+                        out_png=_combined_png,
+                        display_name=getattr(cfg, "display_name", None),
+                    )
+                    print(f"[PA] Combined plot saved -> {_combined_png}")
+                
                 _ls_results_all[_ls_ch] = {"ls": _ls_r, "fit": _fit_r}
             except Exception as _e_ls:
                 print(f"[LS] {_ls_ch} 失敗：{_e_ls}")
@@ -3956,8 +4253,8 @@ if __name__ == "__main__":
         _dg2 = channel_results.get("G2")
         if _dg1 is not None and _dg2 is not None:
             _need_cols = ["bjd_tdb", "t_flux_net", "m_var", "ok"]
-            _g1_ok = all(c in _dg1.columns for c in _need_cols)
-            _g2_ok = all(c in _dg2.columns for c in _need_cols)
+            _g1_ok = all(_c in _dg1.columns for _c in _need_cols)
+            _g2_ok = all(_c in _dg2.columns for _c in _need_cols)
             if _g1_ok and _g2_ok:
                 _mg = pd.merge(
                     _dg1[_need_cols].rename(columns={
@@ -4021,7 +4318,13 @@ if __name__ == "__main__":
                     _ax_r[1].plot(_mg["bjd_tdb"], _mg["mag_diff_G1G2"], "g.", ms=4)
                     _ax_r[1].axhline(_med_mag, color="k", ls="--", lw=0.8)
                     _ax_r[1].set_ylabel("G1 − G2 (mag)")
-                    _ax_r[1].set_xlabel("BJD_TDB")
+                    _ax_r[1].set_xlabel("BJD_TDB", color="steelblue", fontsize=12)
+                    _ax_r[1].tick_params(axis='x', colors='steelblue')
+                    
+                    if cfg.obs_lat_deg is not None:
+                        _ax_r[0].text(1.0, 1.12, f"{cfg.obs_lat_deg:.2f}N {cfg.obs_lon_deg:.2f}E", 
+                                      transform=_ax_r[0].transAxes, ha='right', va='bottom', 
+                                      fontsize=12, color='#2d6a4f')
                     # median 標註：繪圖區左端，緊貼虛線上方
                     _ax_r[1].text(
                         0.0, _med_mag,

@@ -45,7 +45,7 @@ cameras:
     bayer_pattern: "RGGB"
     camera_model: "Canon_6D2"
     ir_cut_modified: true         # 已改機移除 IR cut filter
-    saturation_adu: 11469         # 14-bit 滿井的 70%（線性響應安全上限）
+    saturation_adu: 65536         # 全開（Gaia301/V1373Ori 用）；R²監控非線性
     sensor_db:
    # 來源：photonstophotos.net ISO 100 實測值線性推算
    # gain = 7.428 / 32；read_noise = σ_READ(ISO100, DN) × gain
@@ -63,7 +63,7 @@ obs_sessions:
     site: "Tataka (Shandonpu Parking)"   # 塔塔加上東埔停車場
     telescope: "VixenR200SS"
     camera: "Canon6D2"
-    targets: ["AlVel", "CCAnd"]
+    targets: ["AlVel", "CCAnd", "Gaia375"]
     calibration_date: "20251122"
     dark_temp_c: 5.3
     light_temp_c: 7
@@ -138,11 +138,12 @@ targets:    # JIN親手核對，誰再動它誰死
     dec_hint_deg: 42.282167
     display_name: "CC And"
     vmag_approx: 9.3           # V 9.19 - 9.46 V
-  # Gaia375
-  #   ra_hint_h: 0.784231      # 00 47 03.23 +41 57 53.4
-  #   dec_hint_deg:41.964833
-  #   display_name: "Gaia DR3 375316507435909888"
-  #   vmag_approx: 8.90         #8.90 - 8.93 G
+  
+  Gaia375:
+    ra_hint_h: 0.784231      # 00 47 03.23 +41 57 53.4
+    dec_hint_deg: 41.964833
+    display_name: "Gaia DR3 375316507435909888"
+    vmag_approx: 8.90         #8.90 - 8.93 G
 
   # SXPhe:
   #   ra_hint_h: 	23.775803     # 323 46 32.89 -41 34 54.8
@@ -211,8 +212,8 @@ comparison_stars:
   max_stars: 15
   min_separation_arcsec: 10.0
   mag_range_delta: 5.0      # deprecated：改用 comp_mag_bright / comp_mag_faint
-  comp_mag_bright: 4.0      # 比目標星亮最多 N 等（target_mag - comp_mag_bright）
-  comp_mag_faint:  2.0      # 比目標星暗最多 N 等（target_mag + comp_mag_faint）
+  comp_mag_bright: 1.5      # 比目標星亮最多 N 等
+  comp_mag_faint:  1.5      # 比目標星暗最多 N 等
   comp_mag_min: 6.0         # 固定下限（不飽和）
   comp_mag_max: 13.0        # 固定上限
   catalog_priority: ["AAVSO", "APASS", "Tycho2"]
@@ -291,7 +292,8 @@ period_analysis:
     normalization: "standard"       # "standard" | "model" | "log"
     period_min_hr: 0.5              # 搜尋週期下限（小時）
     period_max_hr: 24.0             # 搜尋週期上限（小時）
-    period_max_hours: 12.0          # 週期圖 x 軸顯示上限（小時），同步限制 LS 搜尋上限
+    period_max_hours: 8.0           # 週期圖 x 軸顯示上限（小時），同步限制 LS 搜尋上限
+    detrend_order: 1                # LS 前線性趨勢扣除（0=關，1=線性，2=二次）
     oversampling: 10                # 頻率格網 oversampling 因子
 
     # FAP 計算：bootstrap 迭代至收斂或上限，取先到者
