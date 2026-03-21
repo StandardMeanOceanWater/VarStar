@@ -58,8 +58,8 @@ _DEFAULT_CONFIG: Dict = {
         "lomb_scargle": {
             "normalization": "standard",
             "period_min_hr": 0.5,
-            "period_max_hr": 24.0,
-            "period_max_hours": 12.0,
+            "period_max_hours": 8.0,
+            "detrend_order": 1,
             "oversampling": 10,
             "fap_method": "bootstrap",
             "fap_bootstrap_max_iter": 1000,
@@ -71,12 +71,13 @@ _DEFAULT_CONFIG: Dict = {
             "max_harmonics": 8,
             "model_selection": "BIC",
             "min_data_points": 50,
+            "sn_threshold": 4.0,
         },
         "pre_whitening": {
             "enabled": True,
             "sn_threshold": 4.0,
             "max_frequencies": 10,
-            "save_csv": False,
+            "save_csv": True,
         },
     },
     "output": {
@@ -92,37 +93,14 @@ _DEFAULT_CONFIG: Dict = {
 
 def _load_config(config_path: Optional[Path]) -> Dict:
     """
-    讀取 observation_config.yaml。
+    讀取 observation_config.yaml（統一使用 pipeline_config.py）。
     若路徑不存在或解析失敗，回退至預設值並記錄警告。
     """
-    if config_path is None or not config_path.exists():
-        logger.warning(
-            "找不到 observation_config.yaml，使用預設參數。"
-            "（路徑：%s）", config_path
-        )
-        return _DEFAULT_CONFIG
-
     try:
-        with open(config_path, "r", encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh)
-        if not cfg:
-            return _DEFAULT_CONFIG
-
-        # ── 推算 project_root（支援相對路徑）────────────────────────────────
-        try:
-            import google.colab  # noqa: F401
-            root = cfg["paths"]["colab"]["project_root"]
-        except (ImportError, KeyError):
-            root = cfg["paths"]["local"]["project_root"]
-        p = Path(root)
-        if not p.is_absolute():
-            p = (Path(config_path).parent / p).resolve()
-        cfg["_project_root"] = p
-        cfg["_data_root"] = p / "data"
-
-        return cfg
-    except yaml.YAMLError as exc:
-        logger.warning("observation_config.yaml 解析失敗：%s，使用預設參數。", exc)
+        from pipeline_config import load_pipeline_config
+        return load_pipeline_config(config_path)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning("設定載入失敗：%s，使用預設參數。", exc)
         return _DEFAULT_CONFIG
 
 
@@ -424,12 +402,7 @@ def run_ls_and_dft(
     """
     ls_cfg = _get(cfg, "period_analysis", "lomb_scargle", default={})
     period_min_days = _get(ls_cfg, "period_min_hr", default=0.5) / 24.0
-    # period_max_hours 優先覆蓋 period_max_hr（同步限制搜尋上限與圖形顯示上限）
-    _pmh = _get(ls_cfg, "period_max_hours", default=None)
-    if _pmh is not None:
-        period_max_days = float(_pmh) / 24.0
-    else:
-        period_max_days = _get(ls_cfg, "period_max_hr", default=24.0) / 24.0
+    period_max_days = float(_get(ls_cfg, "period_max_hours", default=8.0)) / 24.0
     oversampling = _get(ls_cfg, "oversampling", default=10)
     max_iter = _get(ls_cfg, "fap_bootstrap_max_iter", default=1000)
     converge_window = _get(ls_cfg, "fap_bootstrap_converge_window", default=100)
@@ -572,7 +545,7 @@ def fit_phase_folded_model(
     """
     fit_cfg = _get(cfg, "period_analysis", "fourier_fit", default={})
     max_harmonics = _get(fit_cfg, "max_harmonics", default=8)
-    sn_threshold = float(_get(fit_cfg, "breger_sn_threshold", default=4.0))
+    sn_threshold = float(_get(fit_cfg, "sn_threshold", default=4.0))
 
     freq = 1.0 / period
     phi_dense = np.linspace(0.0, 1.0, 10_000)
@@ -729,11 +702,7 @@ def run_pre_whitening(
 
     ls_cfg = _get(cfg, "period_analysis", "lomb_scargle", default={})
     period_min_days = _get(ls_cfg, "period_min_hr", default=0.5) / 24.0
-    _pmh_pw = _get(ls_cfg, "period_max_hours", default=None)
-    if _pmh_pw is not None:
-        period_max_days = float(_pmh_pw) / 24.0
-    else:
-        period_max_days = _get(ls_cfg, "period_max_hr", default=24.0) / 24.0
+    period_max_days = float(_get(ls_cfg, "period_max_hours", default=8.0)) / 24.0
     oversampling = _get(ls_cfg, "oversampling", default=10)
 
     plot_cfg = _get(cfg, "output", "plots", default={})

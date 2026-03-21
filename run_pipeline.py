@@ -212,10 +212,10 @@ def _run_vsx_query(config_path: Path, auto_yes: bool = False) -> None:
         targets = session.get("targets", [])
 
         for target in targets:
-            wcs_dir = (
-                project_root / "data" / "targets" / target
-                / "calibrated" / "wcs"
-            )
+            _tgt_cfg = cfg.get("targets", {}).get(target, {})
+            _group = _tgt_cfg.get("group", target)
+            _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+            wcs_dir = project_root / "data" / _date_fmt / _group / "wcs"
             wcs_files = sorted(wcs_dir.glob("*_wcs.fits")) if wcs_dir.exists() else []
             if not wcs_files:
                 print(f"[WARN] VSX [{target}]：找不到 WCS 檔案，跳過。")
@@ -247,7 +247,7 @@ def _run_vsx_query(config_path: Path, auto_yes: bool = False) -> None:
                 print(f"[WARN] VSX：無法匯入 vsx_query.py：{exc}")
                 return
 
-            out_dir = project_root / "data" / "targets" / target / "output"
+            out_dir = project_root / "output" / _date_fmt / _group / target
             df = query_vsx(center_ra, center_dec, radius)
             if df is None or df.empty:
                 print(f"[VSX] {target}：查詢結果為空。")

@@ -129,8 +129,7 @@ def resolve_session_paths(
     根據 obs_session 設定解析所有輸入輸出路徑。
 
     搜尋 calibration 幀的邏輯：
-        先找 targets/{target}/raw/{date}/{type}/
-        找不到再找 shared_calibration/{date}/{type}/
+        calibration 幀統一存放在 data/share/calibration/{date}_{telescope}_{camera}/{type}/
 
     Dark 子目錄選取（_find_dark_dir）：
         1. dark/ 根層直接有影像 → 直接使用（向下相容）
@@ -169,18 +168,19 @@ def resolve_session_paths(
             else str(raw_targets)
         )
 
-    target_root = data_root / "targets" / target
-    shared_cal = data_root / "shared_calibration" / date
+    _tgt_cfg = cfg.get("targets", {}).get(target, {})
+    _group = _tgt_cfg.get("group", target)
+    _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+    field_root = data_root / _date_fmt / _group
+    _cal_label = f"{date}_{session.get('telescope', '')}_{session.get('camera', '')}"
+    shared_cal = data_root / "share" / "calibration" / _cal_label
 
     light_temp_c: Optional[float] = session.get("light_temp_c")
     if light_temp_c is not None:
         light_temp_c = float(light_temp_c)
 
     def _find_cal_dir(frame_type: str) -> Optional[Path]:
-        """非 dark 的通用搜尋：target-local 優先，次選 shared。"""
-        local = target_root / "raw" / date / frame_type
-        if local.exists() and any(local.iterdir()):
-            return local
+        """搜尋 shared calibration 目錄。"""
         shared = shared_cal / frame_type
         if shared.exists() and any(shared.iterdir()):
             return shared
@@ -206,9 +206,8 @@ def resolve_session_paths(
         resolved_dark_temp_c 優先取 session['dark_temp_c']；
         若未填，則從子目錄名稱解析。
         """
-        # 候選位置（target-local 優先）
+        # 候選位置
         candidates = [
-            target_root / "raw" / date / "dark",
             shared_cal / "dark",
         ]
         explicit_temp: Optional[float] = session.get("dark_temp_c")
@@ -278,11 +277,11 @@ def resolve_session_paths(
     dark_dir, resolved_dark_temp = _find_dark_dir()
 
     return {
-        "light_dir": target_root / "raw" / date,
+        "light_dir": field_root / "raw",
         "dark_dir": dark_dir,
         "flat_dir": _find_cal_dir("flat"),
         "bias_dir": _find_cal_dir("bias"),
-        "calibrated_dir": target_root / "calibrated",
+        "calibrated_dir": field_root / "wcs",
         "masters_dir": shared_cal / "masters",
         "dark_temp_c": resolved_dark_temp,
         "light_temp_c": light_temp_c,

@@ -274,9 +274,11 @@ def run_debayer(config_path: "str | Path") -> None:
             target_cfg = cfg.get("targets", {}).get(target, {})
             object_name = target_cfg.get("display_name", target)
 
-            target_root = data_root / "targets" / target
-            wcs_dir = target_root / "calibrated" / "wcs"
-            split_base = target_root / "split"
+            _group = target_cfg.get("group", target)
+            _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+            field_root = data_root / _date_fmt / _group
+            wcs_dir = field_root / "wcs"
+            split_base = field_root / "splits"
 
             wcs_files = sorted(wcs_dir.glob("*_wcs.fits"))
             if not wcs_files:

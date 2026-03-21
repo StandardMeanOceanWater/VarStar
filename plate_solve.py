@@ -516,8 +516,12 @@ def run_plate_solve(config_path: str | Path) -> None:
         data_root = cfg["_data_root"]
 
         for target in target_list:
-            cal_dir = data_root / "targets" / target / "calibrated"
-            wcs_dir = cal_dir / "wcs"
+            _tgt_cfg = cfg.get("targets", {}).get(target, {})
+            _group = _tgt_cfg.get("group", target)
+            _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+            field_root = data_root / _date_fmt / _group
+            cal_dir = field_root / "wcs"
+            wcs_dir = cal_dir  # WCS output to same directory
             wcs_dir.mkdir(parents=True, exist_ok=True)
 
             fits_files = sorted(

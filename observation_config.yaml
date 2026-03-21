@@ -95,12 +95,14 @@ obs_sessions:
 # -----------------------------------------------------------------------------
 targets:    # JIN親手核對，誰再動它誰死
   V1162Ori:
+    group: "Ori"
     ra_hint_h: 5.53388611      # 83.00829 deg = 05 32 01.99
     dec_hint_deg: -7.25689     # -07 15 24.8
     display_name: "V1162 Ori"
     vmag_approx: 9.89          # V 9.85-10.3
     period_d: 0.078684     #0.078684 d =113.305 min
   V1643Ori:
+    group: "Ori"
     ra_hint_h: 5.542900      #period_d: 83.144 deg = 05h 32m 34s（VSX 確認值，核對通過 2026-03-13）
     dec_hint_deg: -7.211     # -07° 12' 40"
     display_name: "V1643 Ori"
@@ -108,6 +110,7 @@ targets:    # JIN親手核對，誰再動它誰死
     period_d: 0.07303         # 0.07303d = 105.16min
 
   V1373Ori:
+    group: "Ori"
     ra_hint_h: 5.484953
     dec_hint_deg: -6.634861
     display_name: "V1373 Ori"
@@ -115,12 +118,14 @@ targets:    # JIN親手核對，誰再動它誰死
     period_d: 122.668
 
   HHOri:
+    group: "Ori"
     ra_hint_h: 5.503194
     dec_hint_deg: -6.569222
     display_name: "HH Ori"
     vmag_approx: 12         # 11.0 - 13.4 p
 
   Gaia301:
+    group: "Ori"
     ra_hint_h: 5.564478
     dec_hint_deg: -6.615639
     display_name: "Gaia DR3 3016754040524540160"
@@ -128,26 +133,30 @@ targets:    # JIN親手核對，誰再動它誰死
 
 
   AlVel:
+    group: "Vel"
     ra_hint_h: 8.519801        # 127.797 deg = 08h 31m 11s（SIMBAD 確認，盲解驗證 2026-03-14）
     dec_hint_deg: -47.666      # -47° 39' 57"（SIMBAD 確認）
     display_name: "Al Vel"
     vmag_approx: 6.4           # V 6.15–6.76；HADS 變星
 
   CCAnd:
+    group: "And"
     ra_hint_h: 0.730003        # 00 43 48.01 +42 16 55.8
     dec_hint_deg: 42.282167
     display_name: "CC And"
     vmag_approx: 9.3           # V 9.19 - 9.46 V
   
   Gaia375:
+    group: "And"
     ra_hint_h: 0.784231      # 00 47 03.23 +41 57 53.4
     dec_hint_deg: 41.964833
     display_name: "Gaia DR3 375316507435909888"
     vmag_approx: 8.90         #8.90 - 8.93 G
 
   # SXPhe:
+  #   group: "Phe"
   #   ra_hint_h: 	23.775803     # 323 46 32.89 -41 34 54.8
-  #   dec_hint_deg: -41.581889    
+  #   dec_hint_deg: -41.581889
   #   display_name: "SX Phe"
   #   vmag_approx: 7.1          # 6.76 - 7.53 V
 
@@ -158,10 +167,6 @@ targets:    # JIN親手核對，誰再動它誰死
 calibration:
   tz_offset_hours: 8              # 台灣 UTC+8，用於 EXIF 時間轉換
   chunk_size: 10                  # Remedian 每批幀數（RAM 控制）
-  bad_pixel_threshold: 0.3        # Flat 歸一化後低於此值視為壞像素
-  sigma_clip_sigma: 3.0
-  sigma_clip_iters: 5
-  save_masters: true
 
 # -----------------------------------------------------------------------------
 # 7. 星圖解算 (Astrometry)
@@ -211,7 +216,6 @@ comparison_stars:
   min_stars: 3
   max_stars: 15
   min_separation_arcsec: 10.0
-  mag_range_delta: 5.0      # deprecated：改用 comp_mag_bright / comp_mag_faint
   comp_mag_bright: 1.5      # 比目標星亮最多 N 等
   comp_mag_faint:  1.5      # 比目標星暗最多 N 等
   comp_mag_min: 6.0         # 固定下限（不飽和）
@@ -223,6 +227,8 @@ comparison_stars:
   apass_radius_deg: 1.0
   apass_match_arcsec: 2.0
   check_star_max_sigma: 0.02
+  comp_fwhm_min: 2.0
+  comp_fwhm_max: 8.0
   save_zeropoint_diagnostic: true
 
 # -----------------------------------------------------------------------------
@@ -249,6 +255,7 @@ photometry:
   peak_ratio_k: 3.0     # 自適應門檻倍數；peak_ratio < median - k×MAD 時剔除
   zp_intercept_sigma: 3.0  # ZP 截距突變閾值（倍 MAD）；薄雲/透明度驟變偵測
   sky_sigma: 3.0           # 背景突升閾值（倍 MAD）；起霧/散射光偵測
+  aperture_growth_fraction: 0.95
 
 
 # -----------------------------------------------------------------------------
@@ -281,8 +288,7 @@ extinction:
 
 # -----------------------------------------------------------------------------
 # 13. 週期分析 (Period Analysis)
-# 本區段控制 period_analysis.py（使用者選用進階模組）
-# photometry.py 內建的 LS 區段為管線標準輸出，不受此區段控制
+# 本區段控制 period_analysis.py 的週期分析參數
 # -----------------------------------------------------------------------------
 period_analysis:
 
@@ -291,8 +297,7 @@ period_analysis:
     method: "astropy"               # astropy.timeseries.LombScargle
     normalization: "standard"       # "standard" | "model" | "log"
     period_min_hr: 0.5              # 搜尋週期下限（小時）
-    period_max_hr: 24.0             # 搜尋週期上限（小時）
-    period_max_hours: 8.0           # 週期圖 x 軸顯示上限（小時），同步限制 LS 搜尋上限
+    period_max_hours: 8.0           # LS 搜尋週期上限（小時）
     detrend_order: 1                # LS 前線性趨勢扣除（0=關，1=線性，2=二次）
     oversampling: 10                # 頻率格網 oversampling 因子
 
@@ -308,6 +313,7 @@ period_analysis:
     max_harmonics: 8                # 諧波數上限（Delta Scuti 建議 4–8）
     model_selection: "BIC"          # BIC 最小化自動選階數
     min_data_points: 50             # 低於此點數不進行擬合
+    sn_threshold: 4.0               # Breger S/N 門檻（諧波選取）
 
   # 預白化 (Pre-whitening)
   pre_whitening:
@@ -321,27 +327,6 @@ period_analysis:
 # 13. 輸出設定 (Output)
 # -----------------------------------------------------------------------------
 output:
-  photometry_csv_columns:
-    - "BJD_TDB"
-    - "mag"
-    - "mag_err"
-    - "flux"
-    - "flux_err"
-    - "zero_point"
-    - "zp_err"
-    - "airmass"
-    - "fwhm_px"
-    - "sky_bg"
-    - "flag"
-
-  quality_flags:
-    ok: 0
-    saturated: 1
-    near_edge: 2
-    high_airmass: 4
-    poor_wcs: 8
-    few_comp_stars: 16
-
   plots:
     dpi: 150
     format: "png"
@@ -349,19 +334,6 @@ output:
     figsize_periodogram: [10, 4]
     figsize_phase_folded: [8, 5]
     figsize_prewhitening: [15, 4]   # 預白化診斷圖（每次迭代 1 列）
-
-  report:
-    format: "md"
-    include_sections:
-      - "instrument_summary"
-      - "observation_log"
-      - "comparison_stars_table"
-      - "zero_point_diagnostics"
-      - "light_curve"
-      - "periodogram"
-      - "phase_folded_curve"
-      - "fourier_parameters"
-      - "prewhitening_summary"      # 新增：預白化結果摘要
 
 # -----------------------------------------------------------------------------
 # 14. 管線行為 (Pipeline Behavior)
@@ -373,3 +345,24 @@ pipeline:
   parallel: false
   n_workers: 1
   keep_intermediates: true
+
+# =============================================================================
+# 以下為暫時停用或尚未實作的參數，保留供日後啟用
+# =============================================================================
+# calibration:
+#   bad_pixel_threshold: 0.3        # Flat 歸一化後低於此值視為壞像素
+#   sigma_clip_sigma: 3.0
+#   sigma_clip_iters: 5
+#   save_masters: true
+#
+# comparison_stars:
+#   mag_range_delta: 5.0            # deprecated：改用 comp_mag_bright / comp_mag_faint
+#
+# output:
+#   photometry_csv_columns: [BJD_TDB, mag, mag_err, flux, flux_err, zero_point, zp_err, airmass, fwhm_px, sky_bg, flag]
+#   quality_flags: {ok: 0, saturated: 1, near_edge: 2, high_airmass: 4, poor_wcs: 8, few_comp_stars: 16}
+#   report:
+#     format: "md"
+#     include_sections: [instrument_summary, observation_log, comparison_stars_table,
+#       zero_point_diagnostics, light_curve, periodogram, phase_folded_curve,
+#       fourier_parameters, prewhitening_summary]

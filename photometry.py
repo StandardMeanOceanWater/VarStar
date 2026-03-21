@@ -15,7 +15,7 @@ photometry.py — 變星差分測光管線 步驟 4
 # Commented out IPython magic to ensure Python compatibility.
 # %pip install -U pytest ruff mypy
 
-VERSION = "1.35"
+VERSION = "1.6"
 
 """## Plate solve each frame (ASTAP → WCS in FITS)"""
 
@@ -57,61 +57,8 @@ from photutils.detection import DAOStarFinder, IRAFStarFinder
 # ── Module-level logger（__main__ 會加 handler；函數直接用此 logger）──────────
 _phot_logger = logging.getLogger("photometry")
 
-# ── 自動偵測環境，找到 observation_config.yaml ────────────────────────────────
-def _find_config() -> Path:
-    """
-    搜尋順序：
-    1. 環境變數 VARSTAR_CONFIG
-    2. 目前工作目錄
-    3. 本 notebook 所在目錄的上層（pipeline/ 的上層 = project_root）
-    4. Colab 的 Drive 預設路徑
-    """
-    env = os.environ.get("VARSTAR_CONFIG")
-    if env:
-        return Path(env)
-
-    candidates = [
-        Path.cwd() / "observation_config.yaml",
-        Path(__file__).parent.parent / "observation_config.yaml"
-        if "__file__" in dir() else Path("/nonexistent"),
-        Path("/content/drive/Shareddrives/VarStar/pipeline/observation_config.yaml"),
-        Path("D:/VarStar/pipeline/observation_config.yaml"),
-    ]
-    for p in candidates:
-        try:
-            if p.exists():
-                return p
-        except Exception:
-            continue
-
-    raise FileNotFoundError(
-        "找不到 observation_config.yaml。\n"
-        "請設定環境變數 VARSTAR_CONFIG 或把 yaml 放在工作目錄下。\n"
-        "例如：os.environ['VARSTAR_CONFIG'] = 'D:/VarStar/pipeline/observation_config.yaml'"
-    )
-
-
-def _detect_project_root(cfg_dict: dict, config_path: Path) -> Path:
-    try:
-        import google.colab  # noqa: F401
-        root = cfg_dict["paths"]["colab"]["project_root"]
-    except (ImportError, KeyError):
-        root = cfg_dict["paths"]["local"]["project_root"]
-    p = Path(root)
-    if not p.is_absolute():
-        p = (config_path.parent / p).resolve()
-    return p
-
-
-def load_pipeline_config(config_path: Path | None = None) -> dict:
-    if config_path is None:
-        config_path = _find_config()
-    with config_path.open("r", encoding="utf-8") as fh:
-        cfg_dict = yaml.safe_load(fh)
-    cfg_dict["_project_root"] = _detect_project_root(cfg_dict, config_path)
-    cfg_dict["_data_root"] = cfg_dict["_project_root"] / "data"
-    cfg_dict["_config_path"] = config_path
-    return cfg_dict
+# ── 共用設定讀取（統一由 pipeline_config.py 提供）─────────────────────────────
+from pipeline_config import load_pipeline_config  # noqa: E402
 
 
 @dataclass
@@ -122,6 +69,7 @@ class Cfg:
     phot_out_csv: Path = Path("photometry.csv")
     phot_out_png: Path = Path("light_curve.png")
     zeropoint_diag_dir: Path = Path("zeropoint_diag")
+    run_root: Path = Path(".")     # output/{date}/{group}/{target}/{timestamp}/
 
     # ── 目標 ──────────────────────────────────────────────────────────────────
     target_name: str = ""
@@ -196,6 +144,14 @@ class Cfg:
     alt_min_deg: float = 30.0
     alt_min_airmass: float = 2.366   # Young (1994) at alt=25°（原 1.994=30°）
 
+    # ── 大氣消光改正（optional）────────────────────────────────────────────────
+    # 差分測光假設目標與比較星消光相同；長基線 (>2 hr) 或大氣團差 (ΔX>0.5) 時
+    # 可啟用一階消光改正：m_corrected = m_var - extinction_k * (X_frame - X_ref)
+    # extinction_k 為濾鏡相關消光係數 (mag/airmass)，典型值 V~0.15, R~0.10, B~0.25
+    # X_ref 為參考氣團 (觀測中最小氣團)
+    # 設 0.0 = 停用（預設）
+    extinction_k: float = 0.0
+
     # ── 穩健回歸 ──────────────────────────────────────────────────────────────
     robust_regression_sigma: float = 3.0
     robust_regression_max_iter: int = 5
@@ -230,6 +186,16 @@ class Cfg:
     stars_csv: Path = Path("stars.csv")
 
 
+def _resolve_extinction_k(yaml_dict: dict, channel: str, phot_cfg: dict) -> float:
+    """從 extinction.coefficients 取 per-channel 值，fallback 到 photometry.extinction_k。"""
+    ext_coeffs = yaml_dict.get("extinction", {}).get("coefficients", {})
+    # channel 映射：G1/G2 → G
+    ch_key = channel[0] if channel in ("G1", "G2") else channel
+    if ch_key in ext_coeffs:
+        return float(ext_coeffs[ch_key])
+    return float(phot_cfg.get("extinction_k", 0.0))
+
+
 def cfg_from_yaml(
     yaml_dict: dict,
     target: str,
@@ -237,6 +203,7 @@ def cfg_from_yaml(
     channel: str = "B",
     split_subdir: str = "split",
     out_tag: "str | None" = None,
+    run_ts: "str | None" = None,
 ) -> Cfg:
     """
     從 yaml 字典建立 Cfg 物件。
@@ -248,10 +215,15 @@ def cfg_from_yaml(
     session_date : 觀測日期字串，例如 "20241220"。
     """
     data_root = yaml_dict["_data_root"]
-    target_root = data_root / "targets" / target
+    project_root = yaml_dict["_project_root"]
 
     # ── 取得目標設定 ───────────────────────────────────────────────────────────
     tgt = yaml_dict.get("targets", {}).get(target, {})
+
+    # ── 照片組 (group) ─────────────────────────────────────────────────────
+    group = tgt.get("group", target)
+    _date_fmt = f"{session_date[:4]}-{session_date[4:6]}-{session_date[6:8]}"
+    field_root = data_root / _date_fmt / group
 
     # ra_deg 優先；fallback 到 ra_hint_h（小時角 × 15 轉為度）
     if "ra_deg" in tgt:
@@ -259,8 +231,10 @@ def cfg_from_yaml(
     elif "ra_hint_h" in tgt:
         ra_deg = float(tgt["ra_hint_h"]) * 15.0
     else:
-        ra_deg = 0.0
-        print(f"[WARN] {target}：yaml 缺少 ra_deg / ra_hint_h，座標設為 0.0")
+        raise ValueError(
+            f"{target}：yaml targets 缺少 ra_deg 或 ra_hint_h，無法繼續。"
+            f"  請在 observation_config.yaml 的 targets.{target} 補上座標。"
+        )
 
     # dec_deg 優先；fallback 到 dec_hint_deg
     if "dec_deg" in tgt:
@@ -268,7 +242,9 @@ def cfg_from_yaml(
     elif "dec_hint_deg" in tgt:
         dec_deg = float(tgt["dec_hint_deg"])
     else:
-        dec_deg = 0.0
+        raise ValueError(
+            f"{target}：yaml targets 缺少 dec_deg 或 dec_hint_deg，無法繼續。"
+        )
         print(f"[WARN] {target}：yaml 缺少 dec_deg / dec_hint_deg，座標設為 0.0")
     vmag    = float(tgt.get("vmag_approx", 8.0))
     display = tgt.get("display_name", target)
@@ -347,12 +323,18 @@ def cfg_from_yaml(
     # ── 路徑 ───────────────────────────────────────────────────────────────────
     # 測光通道：split/B/（拆色後 B 通道；FITS 內含 WCS，由 DeBayer_RGGB.py 傳遞）
     channel = str(channel).upper()   # 使用傳入參數，不從 yaml 讀
-    wcs_dir  = target_root / split_subdir / channel
-    _out_name = f"output_{out_tag}" if out_tag else "output"
-    out_dir  = target_root / _out_name
+    wcs_dir  = field_root / "splits" / channel
+    # ── 輸出目錄（時間戳制，每次執行獨立）─────────────────────────────────
+    _run_ts = run_ts or datetime.now().strftime("%Y%m%d_%H%M")
+    run_root = project_root / "output" / _date_fmt / group / target / _run_ts
+    out_dir  = run_root / "1_photometry"
     out_dir.mkdir(parents=True, exist_ok=True)
-    diag_dir = out_dir / "zeropoint_diag"
+    diag_dir = run_root / "2_zeropoint_diag"
     diag_dir.mkdir(parents=True, exist_ok=True)
+    lc_dir   = run_root / "3_light_curve"
+    lc_dir.mkdir(parents=True, exist_ok=True)
+    pa_dir   = run_root / "4_period_analysis"
+    pa_dir.mkdir(parents=True, exist_ok=True)
 
     # 通道對應 APASS 波段
     _band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
@@ -360,10 +342,11 @@ def cfg_from_yaml(
 
     return Cfg(
         # 路徑
+        run_root=run_root,
         wcs_dir=wcs_dir,
         out_dir=out_dir,
         phot_out_csv=out_dir / f"photometry_{channel}_{session_date}.csv",
-        phot_out_png=out_dir / f"light_curve_{channel}_{session_date}.png",
+        phot_out_png=lc_dir / f"light_curve_{channel}_{session_date}.png",
         zeropoint_diag_dir=diag_dir,
 
         # 目標
@@ -450,6 +433,7 @@ def cfg_from_yaml(
         peak_ratio_k=float(phot_cfg.get("peak_ratio_k", 0.0)),
         zp_intercept_sigma=float(phot_cfg.get("zp_intercept_sigma", 0.0)),
         sky_sigma=float(phot_cfg.get("sky_sigma", 0.0)),
+        extinction_k=_resolve_extinction_k(yaml_dict, channel, phot_cfg),
 
         # 舊版相容
         fits_dir=wcs_dir,
@@ -2230,7 +2214,7 @@ def auto_select_comps(
 
     # ── 儲存各星表 CSV ────────────────────────────────────────────────────────
     if hasattr(cfg, "out_dir") and cfg.out_dir is not None:
-        _cat_dir = Path(cfg.out_dir) / "catalogs"
+        _cat_dir = cfg.run_root / "1_photometry" / "catalogs"
         _cat_dir.mkdir(parents=True, exist_ok=True)
         for _raw_df in _catalog_raws:
             if len(_raw_df) == 0:
@@ -3011,6 +2995,22 @@ def run_photometry_on_wcs_dir(
                   f"(|m_var - median| > 3sigma = {3.0 * _robust_sigma:.4f})")
     _n_after_clip = int((df["ok"] == 1).sum())
 
+    # ── 大氣消光一階改正（optional）──────────────────────────────────────────
+    # m_var_ext = m_var - k × (X_frame - X_ref)
+    # k = extinction_k (mag/airmass)，X_ref = 觀測中最小氣團
+    # 差分測光中目標與比較星消光大致抵消，但長基線或大氣團差時殘差累積。
+    _ext_k = float(getattr(cfg, "extinction_k", 0.0))
+    if _ext_k > 0 and "airmass" in df.columns:
+        _ok_am = (df["ok"] == 1) & np.isfinite(df["airmass"]) & np.isfinite(df["m_var"])
+        if _ok_am.sum() >= 3:
+            _X_ref = float(df.loc[_ok_am, "airmass"].min())
+            _delta_ext = _ext_k * (df["airmass"] - _X_ref)
+            df["m_var_raw"] = df["m_var"].copy()
+            df.loc[_ok_am, "m_var"] = df.loc[_ok_am, "m_var"] - _delta_ext[_ok_am]
+            _med_corr = float(_delta_ext[_ok_am].median())
+            print(f"[extinction] k={_ext_k:.3f} mag/airmass  X_ref={_X_ref:.3f}  "
+                  f"median correction={_med_corr:.4f} mag  ({_ok_am.sum()} frames)")
+
     # ── ZP 截距突變篩選 ────────────────────────────────────────────────────────
     # 薄雲或透明度驟變時所有比較星同步變暗，零點截距 b 會系統性漂移。
     # 滾動中位數（±5 幀）捕捉短時突變，偏離超過 zp_intercept_sigma × MAD 則剔除。
@@ -3455,494 +3455,88 @@ def run_photometry_on_wcs_dir(
         df["m_var_norm"] = df["m_var"]
         df["delta_ensemble"] = np.nan
 
+    # ── 單通道摘要報告 ──────────────────────────────────────────────────────────
+    try:
+        _ok_df = df[df["ok"] == 1]
+        _n_ok = len(_ok_df)
+        _n_total = len(df)
+        _summary_lines = [
+            f"=== VarStar Photometry Summary ===",
+            f"Target    : {cfg.target_name}",
+            f"Channel   : {channel}",
+            f"Date      : {out_csv.stem.split('_')[-1]}",
+            f"Frames    : {_n_ok}/{_n_total} ok  "
+            f"({n_skipped} airmass-cut, "
+            f"{_n_before_clip - _n_after_clip} sigma-clipped)",
+            f"Aperture  : {ap_radius:.1f} px  "
+            f"(annulus {r_in:.1f}–{r_out:.1f})",
+        ]
+        if _n_ok > 0:
+            _mvar = _ok_df["m_var_norm"] if "m_var_norm" in _ok_df.columns else _ok_df["m_var"]
+            _mvar_ok = _mvar[np.isfinite(_mvar)]
+            if len(_mvar_ok) > 0:
+                _summary_lines.append(
+                    f"Mag range : {_mvar_ok.min():.3f} – {_mvar_ok.max():.3f}  "
+                    f"(median {_mvar_ok.median():.3f}, std {_mvar_ok.std():.4f})"
+                )
+            if "zp_r2" in _ok_df.columns:
+                _r2_ok = _ok_df["zp_r2"][np.isfinite(_ok_df["zp_r2"])]
+                if len(_r2_ok) > 0:
+                    _summary_lines.append(
+                        f"ZP R²     : median {_r2_ok.median():.4f}  "
+                        f"min {_r2_ok.min():.4f}  max {_r2_ok.max():.4f}"
+                    )
+            if "airmass" in _ok_df.columns:
+                _am_ok = _ok_df["airmass"][np.isfinite(_ok_df["airmass"])]
+                if len(_am_ok) > 0:
+                    _summary_lines.append(
+                        f"Airmass   : {_am_ok.min():.3f} – {_am_ok.max():.3f}"
+                    )
+            if "t_snr" in _ok_df.columns:
+                _snr_ok = _ok_df["t_snr"][np.isfinite(_ok_df["t_snr"])]
+                if len(_snr_ok) > 0:
+                    _summary_lines.append(
+                        f"SNR       : median {_snr_ok.median():.1f}  "
+                        f"min {_snr_ok.min():.1f}"
+                    )
+            if "comp_used" in _ok_df.columns:
+                _comp_ok = _ok_df["comp_used"][np.isfinite(_ok_df["comp_used"])]
+                if len(_comp_ok) > 0:
+                    _summary_lines.append(
+                        f"Comp stars: median {_comp_ok.median():.0f}  "
+                        f"min {_comp_ok.min():.0f}"
+                    )
+            if _ext_k > 0:
+                _summary_lines.append(
+                    f"Extinction: k={_ext_k:.3f} mag/airmass applied"
+                )
+            _baseline_hr = 0.0
+            if time_key in _ok_df.columns:
+                _t_ok = _ok_df[time_key][np.isfinite(_ok_df[time_key])]
+                if len(_t_ok) > 1:
+                    _baseline_hr = (_t_ok.max() - _t_ok.min()) * 24
+                    _summary_lines.append(
+                        f"Baseline  : {_baseline_hr:.2f} hr"
+                    )
+        _summary_lines.append(f"Output    : {out_csv}")
+        _summary_lines.append("")
+
+        _summary_text = "\n".join(_summary_lines)
+        _summary_path = out_csv.parent / f"summary_{out_csv.stem}.txt"
+        _summary_path.write_text(_summary_text, encoding="utf-8")
+        print(f"[摘要] saved → {_summary_path}")
+        for _sl in _summary_lines:
+            if _sl:
+                print(f"  {_sl}")
+    except Exception as _e_summary:
+        print(f"[WARN] 摘要報告輸出失敗：{_e_summary}")
+
     return df, comp_lightcurves
 
 
-"""## Lomb-Scargle Period Analysis + Fourier Fit"""
-
-# ── Lomb-Scargle period analysis + Fourier fit ───────────────────────────────
-# References:
-#   Lomb (1976) Ap&SS 39, 447
-#   Scargle (1982) ApJ 263, 835
-#   VanderPlas (2018) ApJS 236, 16
-#   Press & Rybicki (1989) ApJ 338, 277  (fast implementation)
-
-from astropy.timeseries import LombScargle
-from scipy.optimize import curve_fit
-from scipy.stats import pearsonr
-
-
-# ── Config (edit here or in observation_config.yaml) ─────────────────────────
-LS_MIN_PERIOD_DAYS  = 0.05     # shortest period to search (days)
-LS_MAX_PERIOD_DAYS  = 2.0      # longest  period to search (days)
-LS_SAMPLES_PER_PEAK = 10       # frequency grid oversampling
-FAP_THRESHOLD       = 0.001    # false-alarm probability threshold
-FOURIER_N_MAX       = 6        # maximum Fourier harmonics (auto-selected below)
-PHASE_FOLD_CYCLES   = 2        # how many phase cycles to show in the fold plot
-
-
-def run_lomb_scargle(
-    df: pd.DataFrame,
-    time_col: str = "bjd_tdb",
-    mag_col: str = "m_var",
-    err_col: str = "t_sigma_mag",
-    min_period: float = LS_MIN_PERIOD_DAYS,
-    max_period: float = LS_MAX_PERIOD_DAYS,
-    samples_per_peak: int = LS_SAMPLES_PER_PEAK,
-    fap_threshold: float = FAP_THRESHOLD,
-    out_png: "Path | None" = None,
-    target_name: str = "",
-    channel: str = "",
-    obs_date: str = "",
-    lat_deg: "float | None" = None,
-    lon_deg: "float | None" = None,
-) -> dict:
-    """
-    Run a Lomb-Scargle periodogram on the light-curve DataFrame.
-
-    Returns a dict with:
-        frequency   : np.ndarray  (1/day)
-        power       : np.ndarray
-        best_period : float  (days)
-        best_freq   : float  (1/day)
-        fap         : float  false-alarm probability at best peak
-        ls          : LombScargle object (for further queries)
-        t, mag, err : cleaned arrays used in the fit
-    """
-    d = df[(df["ok"] == 1) & np.isfinite(df[time_col]) & np.isfinite(df[mag_col])].copy()
-    if len(d) < 10:
-        raise ValueError(f"Only {len(d)} valid points -- need >= 10 for period search.")
-
-    t   = d[time_col].values
-    mag = d[mag_col].values
-    err = d[err_col].values if (err_col in d.columns and np.isfinite(d[err_col]).any()) else None
-
-    ls = LombScargle(t, mag, dy=err)
-
-    frequency, power = ls.autopower(
-        minimum_frequency=1.0 / max_period,
-        maximum_frequency=1.0 / min_period,
-        samples_per_peak=samples_per_peak,
-    )
-
-    best_idx    = int(np.argmax(power))
-    best_freq   = float(frequency[best_idx])
-    best_period = 1.0 / best_freq
-    fap         = float(ls.false_alarm_probability(power[best_freq == frequency].max()
-                                                   if power[best_freq == frequency].size
-                                                   else power[best_idx]))
-
-    print(f"[LS] Best period = {best_period:.6f} d  ({best_period * 24:.4f} h)")
-    print(f"[LS] Best freq   = {best_freq:.6f} d^-1")
-    print(f"[LS] FAP         = {fap:.2e}")
-    if fap > fap_threshold:
-        print(f"[WARN] FAP={fap:.2e} > threshold={fap_threshold}. "
-              "Period detection may not be significant.")
-
-    # # ── Plot periodogram ──────────────────────────────────────────────────────
-    # # ── X 軸單位：天 → 小時，刻度格式化為 H:MM:SS ────────────────────────────
-    # period_h = 1.0 / frequency * 24.0   # 天 → 小時
-    #
-    # def _fmt_hms(h_val, _pos=None):
-    #     """將小時數格式化為 H:MM:SS，去掉前置零。"""
-    #     total_s = int(round(abs(h_val) * 3600))
-    #     hh = total_s // 3600
-    #     mm = (total_s % 3600) // 60
-    #     ss = total_s % 60
-    #     if hh > 0:
-    #         return f"{hh}:{mm:02d}:{ss:02d}"
-    #     return f"{mm}:{ss:02d}"
-    #
-    # best_period_h = best_period * 24.0
-    # _p_min_h = float(period_h.min())
-    # _p_max_h = float(period_h.max())
-    #
-    # fig, ax = plt.subplots(figsize=(10, 4))
-    # ax.plot(period_h, power, lw=0.8, color="navy")
-    # ax.axvline(best_period_h, color="red", lw=1.2, ls="--",
-    #            label=f"P = {_fmt_hms(best_period_h)}")
-    # ax.xaxis.set_major_formatter(plt.FuncFormatter(_fmt_hms))
-    # ax.set_xlabel("Period (H:MM:SS)", color="navy")
-    # ax.set_ylabel("Lomb-Scargle power", color="navy")
-    #
-    # _ls_title_star = target_name if target_name else "Target"
-    # ax.set_title(f"{_ls_title_star} Lomb-Scargle Periodogram", fontsize=22, fontweight='bold', pad=10)
-    #
-    # ax.set_xlim(_p_min_h, _p_max_h)
-    # ax.legend(fontsize=12, loc="upper left", frameon=True, edgecolor='gray')
-    # ax.grid(True, alpha=0.3)
-    #
-    # # Metadata above frame
-    # ax.text(0.01, 1.02, obs_date if obs_date else "", transform=ax.transAxes,
-    #         ha="left", va="bottom", fontsize=14, color="navy")
-    # if lat_deg is not None and lon_deg is not None:
-    #     ax.text(0.99, 1.02, f"{lat_deg:.2f}  {lon_deg:.2f}",
-    #             transform=ax.transAxes, ha="right", va="bottom",
-    #             fontsize=14, color="navy")
-    # fig.tight_layout()
-    # if out_png is not None:
-    #     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-    #     fig.savefig(out_png, dpi=150)
-    #     print(f"[LS] periodogram saved -> {out_png}")
-    # plt.close("all")
-
-    return {
-        "frequency": frequency,
-        "power": power,
-        "best_period": best_period,
-        "best_freq": best_freq,
-        "fap": fap,
-        "ls": ls,
-        "t": t,
-        "mag": mag,
-        "err": err,
-    }
-
-
-def _auto_fourier_order(n_cycles: float) -> int:
-    """
-    Auto-select Fourier harmonic order from the number of observed cycles.
-    Fewer cycles → fewer free parameters to avoid over-fitting.
-    """
-    if n_cycles < 2:
-        return 1
-    elif n_cycles < 5:
-        return 3
-    else:
-        return min(6, FOURIER_N_MAX)
-
-
-def _select_harmonics_breger(
-    phase: np.ndarray,
-    mag: np.ndarray,
-    err: "np.ndarray | None",
-    max_harmonics: int,
-    sn_threshold: float = 4.0,
-) -> tuple:
-    """Breger et al. (1993) S/N 準則選諧波數。N=1 永遠接受。"""
-    n_data = len(mag)
-    best_n = 1
-    best_popt = np.array([])
-    best_pcov = np.array([])
-    sigma = err if (err is not None and np.isfinite(err).all()) else None
-
-    for n in range(1, max_harmonics + 1):
-        p0 = [float(np.nanmean(mag))] + [0.0] * (2 * n)
-        try:
-            popt, pcov = curve_fit(
-                _fourier_model, phase, mag,
-                p0=p0, sigma=sigma, absolute_sigma=True,
-                maxfev=50000,
-            )
-        except Exception:
-            break
-
-        residuals = mag - _fourier_model(phase, *popt)
-        sigma_res = float(np.std(residuals))
-        a_n = popt[1 + 2 * (n - 1)]
-        b_n = popt[2 + 2 * (n - 1)]
-        amp_n = float(np.sqrt(a_n ** 2 + b_n ** 2))
-        noise_level = sigma_res * np.sqrt(2.0 / n_data) if n_data > 0 else np.inf
-        sn = amp_n / noise_level if noise_level > 0 else 0.0
-
-        if sn >= sn_threshold or n == 1:
-            best_n = n
-            best_popt = popt
-            best_pcov = pcov
-        else:
-            break
-
-    if best_popt.size == 0:
-        raise RuntimeError("Fourier 擬合全部失敗，無法選取諧波數。")
-    return best_n, best_popt, best_pcov
-
-
-def _fourier_model(phase: np.ndarray, *params) -> np.ndarray:
-    """
-    Fourier series: V(φ) = a0 + Σ_n [a_n cos(2πnφ) + b_n sin(2πnφ)]
-    params = [a0, a1, b1, a2, b2, ...]
-    """
-    a0     = params[0]
-    result = np.full_like(phase, a0)
-    n_harm = (len(params) - 1) // 2
-    for i in range(n_harm):
-        a_n = params[1 + 2 * i]
-        b_n = params[2 + 2 * i]
-        result += a_n * np.cos(2 * np.pi * (i + 1) * phase)
-        result += b_n * np.sin(2 * np.pi * (i + 1) * phase)
-    return result
-
-
-def run_fourier_fit(
-    t: np.ndarray,
-    mag: np.ndarray,
-    period: float,
-    err: "np.ndarray | None" = None,
-    n_max: "int | None" = None,
-    t0: "float | None" = None,
-    out_png: "Path | None" = None,
-    target_name: str = "",
-    channel: str = "",
-    obs_date: str = "",
-    lat_deg: "float | None" = None,
-    lon_deg: "float | None" = None,
-) -> dict:
-    """
-    Phase-fold the light curve and fit a Fourier series.
-
-    Parameters
-    ----------
-    t       : time array (BJD_TDB days)
-    mag     : magnitude array
-    period  : best period in days (from Lomb-Scargle)
-    err     : magnitude uncertainties (optional)
-    n_max   : Fourier harmonic order; None → auto-selected
-    t0      : epoch of phase zero; None → uses t[0]
-
-    Returns
-    -------
-    dict with keys:
-        phase, mag_sorted, fit_phase, fit_mag  – for plotting
-        amplitude                              – peak-to-peak amplitude (mag)
-        n_harmonics                            – order used
-        r2                                     – R² of the Fourier fit
-        params                                 – fitted coefficients
-        residuals_rms                          – rms of residuals (mag)
-    """
-    if t0 is None:
-        t0 = float(t[0])
-
-    phase = ((t - t0) / period) % 1.0
-
-    n_cycles = (t.max() - t.min()) / period
-    if n_max is None:
-        # n_cycles 上限（< 2 週期不足以辨識高諧波）+ Breger S/N 準則
-        _cycles_cap = _auto_fourier_order(n_cycles)
-        best_n, popt, pcov = _select_harmonics_breger(
-            phase, mag, err, max_harmonics=min(FOURIER_N_MAX, _cycles_cap), sn_threshold=4.0
-        )
-        n_max = best_n
-        print(f"[Fourier] n_cycles ~= {n_cycles:.1f}  ->  Breger N={n_max}")
-    else:
-        print(f"[Fourier] n_cycles ~= {n_cycles:.1f}  ->  using {n_max} harmonics (fixed)")
-        p0 = [float(np.nanmean(mag))] + [0.0] * (2 * n_max)
-        sigma = err if (err is not None and np.isfinite(err).all()) else None
-        try:
-            popt, pcov = curve_fit(
-                _fourier_model, phase, mag,
-                p0=p0, sigma=sigma, absolute_sigma=True,
-                maxfev=50000,
-            )
-        except Exception as exc:
-            print(f"[WARN] Fourier fit failed: {exc}")
-            return {}
-
-    # ── R² and residuals ──────────────────────────────────────────────────────
-    mag_pred   = _fourier_model(phase, *popt)
-    ss_res     = float(np.sum((mag - mag_pred) ** 2))
-    ss_tot     = float(np.sum((mag - mag.mean()) ** 2))
-    r2         = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    rms_resid  = float(np.sqrt(np.mean((mag - mag_pred) ** 2)))
-
-    # ── Amplitude from smooth model ───────────────────────────────────────────
-    phi_dense  = np.linspace(0.0, 1.0, 1000)
-    fit_dense  = _fourier_model(phi_dense, *popt)
-    amplitude  = float(fit_dense.max() - fit_dense.min())
-
-    print(f"[Fourier] Amplitude = {amplitude:.4f} mag")
-    print(f"[Fourier] R2        = {r2:.4f}")
-    print(f"[Fourier] RMS resid = {rms_resid:.4f} mag")
-
-    sort_idx   = np.argsort(phase)
-    # # ── Phase-folded plot ─────────────────────────────────────────────────────
-    # # sort_idx   = np.argsort(phase)
-    # phase_ext  = np.concatenate([phase[sort_idx], phase[sort_idx] + 1.0])
-    # mag_ext    = np.concatenate([mag[sort_idx], mag[sort_idx]])
-    # fit_ext    = np.concatenate([phi_dense, phi_dense]) # dummy
-    # phi_ext    = np.concatenate([phi_dense, phi_dense + 1.0])
-    #
-    # n_show  = int(PHASE_FOLD_CYCLES)
-    # fig, ax = plt.subplots(figsize=(10, 5))
-    # ax.scatter(phase_ext[:len(phase_ext) // PHASE_FOLD_CYCLES * n_show],
-    #            mag_ext[:len(mag_ext) // PHASE_FOLD_CYCLES * n_show],
-    #            s=12, alpha=0.7, label="data", color="navy")
-    # ax.plot(phi_ext[:len(phi_ext) // PHASE_FOLD_CYCLES * n_show],
-    #         fit_ext[:len(fit_ext) // PHASE_FOLD_CYCLES * n_show],
-    #         "r-", lw=1.5, label=f"Fourier n={n_max}  R2={r2:.3f}")
-    # ax.invert_yaxis()
-    # ax.set_xlabel(f"Phase  (P = {period:.6f} d = {period * 24:.4f} h)",
-    #               loc="center", color="navy")
-    # ax.set_ylabel("Calibrated magnitude", color="navy")
-    #
-    # _ff_title_star = target_name if target_name else "Target"
-    # ax.set_title(f"{_ff_title_star} Phase-Folded Light Curve", fontsize=22, fontweight='bold', pad=10)
-    #
-    # _sigma_med_ff = (float(np.nanmedian(err))
-    #                  if err is not None and len(err) > 0 else float("nan"))
-    #
-    # # Metadata above frame
-    # ax.text(0.01, 1.02, obs_date if obs_date else "", transform=ax.transAxes,
-    #         ha="left", va="bottom", fontsize=14, color="navy")
-    # ax.text(1.0, 1.02, f"Reliability: σ_med = {_sigma_med_ff:.4f} mag",
-    #         transform=ax.transAxes, ha="right", va="bottom",
-    #         fontsize=14, color="saddlebrown")
-    #
-    # ax.legend(fontsize=12, loc="upper left", frameon=True, edgecolor='gray')
-    # ax.grid(True, alpha=0.3)
-    #
-    # # Coordinates inside frame
-    # if lat_deg is not None and lon_deg is not None:
-    #     ax.text(0.99, 0.97, f"{lat_deg:.2f}  {lon_deg:.2f}",
-    #             transform=ax.transAxes, ha="right", va="top",
-    #             fontsize=7, color="gray")
-    # fig.tight_layout()
-    # if out_png is not None:
-    #     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-    #     fig.savefig(out_png, dpi=150)
-    #     print(f"[Fourier] phase-fold plot saved -> {out_png}")
-    # plt.close("all")
-
-    return {
-        "phase": phase,
-        "mag_sorted": mag[sort_idx],
-        "fit_phase": phi_dense,
-        "fit_mag": fit_dense,
-        "amplitude": amplitude,
-        "n_harmonics": n_max,
-        "r2": r2,
-        "residuals_rms": rms_resid,
-        "params": popt,
-        "period": period,
-    }
-
-
-def save_3panel_period_plot(
-    ls_r: dict,
-    fit_r: dict,
-    target_name: str,
-    channel: str,
-    obs_date: str,
-    lat_deg: "float | None",
-    lon_deg: "float | None",
-    out_png: Path,
-    display_name: "str | None" = None,
-):
-    """
-    Export combined 3-panel diagnosis plot: LS Power, DFT Amplitude, Phase Fold.
-    Supports multi-color themes and report-style font sizes.
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.gridspec import GridSpec
-    import numpy as np
-
-    def _fmt_hms(h_val):
-        total_s = int(round(abs(h_val) * 3600))
-        hh = total_s // 3600
-        mm = (total_s % 3600) // 60
-        return f"{hh}:{mm:02d}"
-
-    def _classical_dft_amp(t, m, f_arr):
-        m_norm = m - np.mean(m)
-        n = len(t)
-        # Vectorized DFT for speed
-        phase_matrix = -2.0j * np.pi * t[:, None] * f_arr[None, :]
-        dft = np.sum(m_norm[:, None] * np.exp(phase_matrix), axis=0)
-        return (2.0 / n) * np.abs(dft)
-
-    t, mag, err = ls_r["t"], ls_r["mag"], ls_r["err"]
-    freq, power = ls_r["frequency"], ls_r["power"]
-    p1 = fit_r["period"]
-    r2 = fit_r["r2"]
-    n_harm = fit_r["n_harmonics"]
-    popt = fit_r["params"]
-
-    dft_amp = _classical_dft_amp(t, mag, freq)
-
-    # Search P2 near 0.05d (common artifact or feature)
-    p2_nearby_mask = (1/freq > 0.04) & (1/freq < 0.08)
-    p2_val = 0
-    if np.any(p2_nearby_mask):
-        p2_idx = np.argmax(power[p2_nearby_mask])
-        p2_val = (1/freq)[p2_nearby_mask][p2_idx]
-
-    # Plot Setup
-    fig = plt.figure(figsize=(18, 6), dpi=150)
-    gs = GridSpec(1, 3, width_ratios=[1, 0.7, 1.5]) 
-    
-    FS_TITLE = 18
-    FS_AXIS = 14
-    FS_LABELS = 13
-    FS_LEGEND = 11
-
-    _title_name = display_name if display_name else target_name
-    fig.text(0.02, 0.95, f"{_title_name} [{channel}]  {obs_date}",
-             fontsize=FS_TITLE+2, fontweight='bold', ha='left')
-    if lat_deg is not None:
-        fig.text(0.98, 0.97, f"{lat_deg:.2f}N {lon_deg:.2f}E",
-                 fontsize=FS_AXIS, color='#2d6a4f', ha='right', va='top')
-
-    def apply_sub_theme(ax, theme_color):
-        for spine in ax.spines.values():
-            spine.set_color(theme_color)
-        ax.xaxis.label.set_color(theme_color)
-        ax.yaxis.label.set_color(theme_color)
-        ax.tick_params(colors=theme_color, labelsize=FS_LABELS)
-        ax.title.set_color(theme_color)
-
-    # Sub 1: LS Power (Green)
-    ax0 = fig.add_subplot(gs[0])
-    ax0.plot(1/freq, power, lw=1.5, color='forestgreen')
-    ax0.axvline(p1, color='red', ls='--', lw=1.8, label=f"P = {_fmt_hms(p1*24)}")
-    if p2_val > 0:
-        ax0.axvline(p2_val, color='orange', ls='--', lw=1.8, label=f"P2 = {_fmt_hms(p2_val*24)}")
-    ax0.set_xlim(0, 0.3)
-    ax0.set_xlabel("Period (days)", fontsize=FS_AXIS)
-    ax0.set_ylabel("LS Power", fontsize=FS_AXIS)
-    ax0.set_title("Lomb-Scargle\nFAP=0.00e+00", fontsize=FS_TITLE)
-    ax0.legend(fontsize=FS_LEGEND, loc='lower right')
-    apply_sub_theme(ax0, 'forestgreen')
-
-    # Sub 2: DFT (Sienna)
-    ax1 = fig.add_subplot(gs[1])
-    ax1.plot(1/freq, dft_amp, lw=1.5, color='sienna')
-    ax1.axvline(p1, color='red', ls='--', lw=1.8)
-    ax1.text(0.97, 0.90, f"{_fmt_hms(p1*24)}", color='red', fontsize=FS_LABELS, fontweight='bold',
-             ha='right', va='top', transform=ax1.transAxes)
-    ax1.set_xlim(0, 0.3)
-    ax1.set_xlabel("Period (days)", fontsize=FS_AXIS)
-    ax1.set_ylabel("Amplitude (mag)", fontsize=FS_AXIS)
-    ax1.set_title("DFT Amplitude", fontsize=FS_TITLE)
-    apply_sub_theme(ax1, 'sienna')
-
-    # Sub 3: Phase Fold (Navy)
-    ax2 = fig.add_subplot(gs[2])
-    phi_dense = np.linspace(0, 2, 200)
-    mag_dense = _fourier_model(phi_dense % 1.0, *popt)
-    
-    phase = ((t - t[0]) / p1) % 1.0
-    phase_ext = np.concatenate([phase, phase + 1.0])
-    mag_ext = np.concatenate([mag, mag])
-    err_ext = np.concatenate([err, err]) if err is not None else np.zeros_like(mag_ext)
-    
-    ax2.errorbar(phase_ext, mag_ext, yerr=err_ext, fmt='o', ms=3, color='navy', 
-                 alpha=0.3, elinewidth=0.8, capsize=0, label="data (±1σ)")
-    ax2.plot(phi_dense, mag_dense, color='red', lw=2.5, label=f"Fourier n={n_harm} R2={r2:.3f}")
-    ax2.invert_yaxis()
-    ax2.set_xlabel("Phase (phi=0: max brightness)", fontsize=FS_AXIS)
-    ax2.set_ylabel("Calibrated magnitude", fontsize=FS_AXIS)
-    ax2.set_title("Phase-Folded LC + Fourier Fit", fontsize=FS_TITLE)
-    ax2.legend(fontsize=FS_LEGEND, loc='lower left')
-    apply_sub_theme(ax2, 'navy')
-    
-    _sigma_med = np.nanmedian(err) if err is not None else 0
-    fig.text(0.98, 0.95, f"Reliability: σ_med = {_sigma_med:.4f} mag", ha='right', va='top', 
-             fontsize=FS_AXIS, color='saddlebrown', fontweight='bold')
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.90])
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
-
+# ── 週期分析已移至 period_analysis.py（統一從 YAML 讀取參數）────────────────
+# 原內建 LS + Fourier 程式碼已保留於 photometry_ls_legacy.py，供手動使用。
+# 移出日期：2026-03-21
 
 # ── 執行 ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -4081,13 +3675,14 @@ if __name__ == "__main__":
         # ── 第一通道 cfg（用於比較星選取和孔徑估計）──────────────────────────
         try:
             cfg = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=CHANNELS[0],
-                                split_subdir=_args.split_subdir, out_tag=_args.out_tag)
+                                split_subdir=_args.split_subdir, out_tag=_args.out_tag,
+                                run_ts=_log_ts)
         except Exception as _e_cfg:
             print(f"[SKIP] {ACTIVE_TARGET}/{ACTIVE_DATE} cfg 建立失敗：{_e_cfg}")
             continue
 
         # ── Log 檔 handler（每個目標獨立 log 檔）─────────────────────────────
-        _log_path = cfg.out_dir / f"photometry_{ACTIVE_DATE}_{_log_ts}.log"
+        _log_path = cfg.run_root / "1_photometry" / f"photometry_{ACTIVE_DATE}_{_log_ts}.log"
         cfg.out_dir.mkdir(parents=True, exist_ok=True)
         _file_hdl = logging.FileHandler(_log_path, encoding="utf-8")
         _file_hdl.setLevel(logging.DEBUG)
@@ -4149,7 +3744,8 @@ if __name__ == "__main__":
             print(f"{'='*55}")
 
             cfg_ch = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=_ch,
-                                   split_subdir=_args.split_subdir, out_tag=_args.out_tag)
+                                   split_subdir=_args.split_subdir, out_tag=_args.out_tag,
+                                   run_ts=_log_ts)
             cfg_ch.aperture_radius = _shared_aperture_radius
             cfg_ch.gain_e_per_adu  = cfg.gain_e_per_adu
             cfg_ch.read_noise_e    = cfg.read_noise_e
@@ -4194,7 +3790,7 @@ if __name__ == "__main__":
                     )
                     if len(_gaia_r_raw) >= cfg_ch.ensemble_min_comp:
                         if hasattr(cfg_ch, "out_dir"):
-                            _cat_dir_r = Path(cfg_ch.out_dir) / "catalogs"
+                            _cat_dir_r = cfg_ch.run_root / "1_photometry" / "catalogs"
                             _cat_dir_r.mkdir(parents=True, exist_ok=True)
                             _gaia_r_raw.to_csv(_cat_dir_r / "catalog_GaiaDR3_Rc.csv", index=False)
                             print(f"  [R_GAIA] 星表已儲存 ({len(_gaia_r_raw)} 筆)")
@@ -4205,8 +3801,9 @@ if __name__ == "__main__":
 
         print(f"\n所有通道完成：{list(channel_results.keys())}")
 
-        # ── LS + Fourier 分析：全部通道（含 G2）──────────────────────────────
-        _ls_results_all: dict = {}
+        # ── 週期分析（統一使用 period_analysis.py）─────────────────────────
+        from period_analysis import run_period_analysis
+        _pa_any = False
         for _ls_ch, _ls_df in channel_results.items():
             if _ls_df is None:
                 continue
@@ -4216,37 +3813,40 @@ if __name__ == "__main__":
                 continue
             print(f"\n[LS] 通道 {_ls_ch}（有效幀數：{_n_ok}）")
             try:
-                _pa_dir  = cfg_ch.out_dir / "period_analysis"
-                _pa_dir.mkdir(parents=True, exist_ok=True)
-                _combined_png = _pa_dir / f"period_analysis_{ACTIVE_TARGET}_{_ls_ch}.png"
-                
-                _ls_r  = run_lomb_scargle(
-                    _ls_df, target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
-                    lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
+                _pa_dir = cfg_ch.run_root / "4_period_analysis"
+                # 準備 DataFrame 欄位名稱對應（period_analysis 期望 ok, bjd_tdb, m_var/m_var_norm, v_err）
+                _pa_df = _ls_df.copy()
+                if "v_err" not in _pa_df.columns and "t_sigma_mag" in _pa_df.columns:
+                    _pa_df["v_err"] = _pa_df["t_sigma_mag"]
+                _pa_result = run_period_analysis(
+                    _pa_df,
+                    target_name=ACTIVE_TARGET,
+                    channel=_ls_ch,
+                    out_dir=_pa_dir,
                 )
-                _fit_r = run_fourier_fit(
-                    _ls_r["t"], _ls_r["mag"],
-                    _ls_r["best_period"], _ls_r["err"],
-                    target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
-                    lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
-                )
-                
-                if _fit_r:
-                    save_3panel_period_plot(
-                        _ls_r, _fit_r,
-                        target_name=ACTIVE_TARGET, channel=_ls_ch, obs_date=ACTIVE_DATE,
-                        lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
-                        out_png=_combined_png,
-                        display_name=getattr(cfg, "display_name", None),
-                    )
-                    print(f"[PA] Combined plot saved -> {_combined_png}")
-                
-                _ls_results_all[_ls_ch] = {"ls": _ls_r, "fit": _fit_r}
+                if _pa_result:
+                    _pa_any = True
+                    _ls_r = _pa_result.get("ls_result", {})
+                    _bp = _ls_r.get("best_period", np.nan)
+                    _fap = _ls_r.get("fap", np.nan)
+                    if np.isfinite(_bp):
+                        print(f"[LS] Best period = {_bp:.6f} d  ({_bp * 24:.4f} h)")
+                        print(f"[LS] FAP         = {_fap:.2e}")
+                    else:
+                        print(f"[LS] {_ls_ch} 週期分析無有效結果（keys: {list(_pa_result.keys())}）")
+                    _fit_r = _pa_result.get("fit_result", {})
+                    if _fit_r:
+                        _amp = _fit_r.get("amplitude", np.nan)
+                        print(f"[Fourier] Amplitude = {_amp:.4f} mag")
+                    elif _ls_r:
+                        print(f"[Fourier] 擬合失敗或跳過")
+                else:
+                    print(f"[LS] {_ls_ch} run_period_analysis 回傳空結果")
             except Exception as _e_ls:
                 print(f"[LS] {_ls_ch} 失敗：{_e_ls}")
 
-        if not _ls_results_all:
-            print("[LS] 跳過（所有通道有效幀數 < 10）")
+        if not _pa_any:
+            print("[LS] 跳過（所有通道有效幀數 < 10 或分析失敗）")
 
         # ── G1/G2 比值光變曲線 ────────────────────────────────────────────────
         _dg1 = channel_results.get("G1")
@@ -4272,14 +3872,14 @@ if __name__ == "__main__":
                     )
                     _mg["mag_diff_G1G2"] = _mg["m_G1"] - _mg["m_G2"]
                     # CSV 輸出
-                    _ratio_csv = cfg_ch.out_dir / f"G1G2_ratio_{ACTIVE_DATE}.csv"
+                    _ratio_csv = cfg_ch.run_root / "1_photometry" / f"G1G2_ratio_{ACTIVE_DATE}.csv"
                     _mg[["bjd_tdb", "flux_ratio_G1G2", "mag_diff_G1G2",
                           "flux_G1", "flux_G2", "m_G1", "m_G2"]].to_csv(
                         _ratio_csv, index=False, float_format="%.8f"
                     )
                     print(f"[G1/G2] 比值 CSV：{_ratio_csv}（{len(_mg)} 幀）")
                     # 繪圖：flux ratio + mag diff
-                    _ratio_png = cfg_ch.out_dir / f"G1G2_ratio_{ACTIVE_DATE}.png"
+                    _ratio_png = cfg_ch.run_root / "3_light_curve" / f"G1G2_ratio_{ACTIVE_DATE}.png"
                     # sharex=False：兩軸各自設 formatter，避免互相覆蓋
                     _fig_r, _ax_r = plt.subplots(
                         2, 1, figsize=(12, 6), sharex=False,
@@ -4431,31 +4031,21 @@ if __name__ == "__main__":
                     _fig_r.savefig(_ratio_png, dpi=150, bbox_inches="tight")
                     plt.close("all")
                     print(f"[G1/G2] 比值圖：{_ratio_png}")
-                    # LS on G1/G2 ratio
+                    # LS on G1/G2 ratio（使用 period_analysis）
                     if len(_mg) >= 10:
                         try:
                             _ratio_df = pd.DataFrame({
-                                "bjd_tdb":     _mg["bjd_tdb"].values,
-                                "m_var":       _mg["mag_diff_G1G2"].values,
-                                "t_sigma_mag": np.full(len(_mg), 0.001),
-                                "ok":          1,
+                                "bjd_tdb": _mg["bjd_tdb"].values,
+                                "v_mag":   _mg["mag_diff_G1G2"].values,
+                                "v_err":   np.full(len(_mg), 0.001),
+                                "ok":      1,
                             })
-                            _pa_dir_r = cfg_ch.out_dir / "period_analysis"
-                            _pa_dir_r.mkdir(parents=True, exist_ok=True)
-                            _ls_ratio = run_lomb_scargle(
+                            _pa_dir_r = cfg_ch.run_root / "4_period_analysis"
+                            run_period_analysis(
                                 _ratio_df,
-                                out_png=_pa_dir_r / f"periodogram_G1G2ratio_{ACTIVE_DATE}.png",
-                                target_name=ACTIVE_TARGET, channel="G1/G2 ratio",
-                                obs_date=ACTIVE_DATE,
-                                lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
-                            )
-                            run_fourier_fit(
-                                _ls_ratio["t"], _ls_ratio["mag"],
-                                _ls_ratio["best_period"], _ls_ratio["err"],
-                                out_png=_pa_dir_r / f"phase_fold_G1G2ratio_{ACTIVE_DATE}.png",
-                                target_name=ACTIVE_TARGET, channel="G1/G2 ratio",
-                                obs_date=ACTIVE_DATE,
-                                lat_deg=cfg.obs_lat_deg, lon_deg=cfg.obs_lon_deg,
+                                target_name=ACTIVE_TARGET,
+                                channel="G1G2ratio",
+                                out_dir=_pa_dir_r,
                             )
                             print("[G1/G2] ratio LS + Fourier 完成")
                         except Exception as _e_ratio:
