@@ -783,7 +783,7 @@ def main(argv: list[str] | None = None) -> int:
             ok: bool = runner(config_path)
         elapsed = time.monotonic() - step_start
 
-        status = "✓ 完成" if ok else "✗ 失敗"
+        status = "OK 完成" if ok else "FAIL 失敗"
         print(f"\n  {status}  （耗時 {elapsed:.1f} 秒）")
         results[step] = ok
 
@@ -804,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {'─':>3}  {step:<18}  （未執行）")
             all_ok = False
         else:
-            mark = "✓" if results[step] else "✗"
+            mark = "OK" if results[step] else "FAIL"
             print(f"  {mark:>3}  {step:<18}")
             if not results[step]:
                 all_ok = False
@@ -819,7 +819,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[WARNING] 有步驟失敗，請檢查上方錯誤訊息。")
         return 1
 
-    print("\n✅ 所有步驟完成。")
+    print("\n[OK] 所有步驟完成。")
     if "photometry" in steps_to_run and "period_analysis" not in steps_to_run:
         print("   下一步：")
         print("     1. 開啟 photometry/Photometry.ipynb 執行測光分析（Step 4）")

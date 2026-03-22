@@ -61,8 +61,10 @@ cameras:
 obs_sessions:
   - date: "20251122"
     site: "Tataka (Shandonpu Parking)"   # 塔塔加上東埔停車場
-    telescope: "VixenR200SS"
-    camera: "Canon6D2"
+    telescope: "Vixen R200SS"            # OTA（光學管）
+    mount: "Takahashi EM-11 Temma3"      # 赤道儀
+    camera: "Canon EOS 6D Mark II"       # 相機（已移除 IR-cut）
+    cal_label: "R200SS_6D2"              # 校正資料夾標籤
     targets: ["AlVel", "CCAnd", "Gaia375"]
     calibration_date: "20251122"
     dark_temp_c: 5.3
@@ -74,14 +76,16 @@ obs_sessions:
 
   - date: "20251220"
     site: "Tataka (Shandonpu Parking)"
-    telescope: "VixenR200SS"
-    camera: "Canon6D2"
+    telescope: "Vixen R200SS"
+    mount: "Takahashi EM-11 Temma3"
+    camera: "Canon EOS 6D Mark II"
+    cal_label: "R200SS_6D2"
     targets: ["V1162Ori", "V1643Ori", "V1373Ori", "HHOri", "Gaia301"]
     calibration_date: "20251220"
     dark_temp_c: 3.7    # 或 null
     light_temp_c: 4     # 或 null
     iso: 3200
-    obs_lat_deg: 23.48119126688765
+    obs_lat_deg: 23.48119126688965
     obs_lon_deg: 120.8853953430719
     obs_height_m: 2610
 
@@ -214,13 +218,17 @@ debayer:
 comparison_stars:
   search_radius_arcmin: 40.0
   min_stars: 3
-  max_stars: 15
+  # max_stars: 15                    # 2026-03-22 前：15 顆但從未生效
+  max_stars: 20                      # 100 導致 64 暗星拖垮 ZP fit（slope 0.1）；20 顆近目標亮度即可
   min_separation_arcsec: 10.0
-  comp_mag_bright: 1.5      # 比目標星亮最多 N 等
-  comp_mag_faint:  1.5      # 比目標星暗最多 N 等
+  # comp_mag_bright: 1.5      # 2026-03-22 前：對稱 ±1.5 等
+  # comp_mag_faint:  1.5
+  comp_mag_bright: 2.0      # 2026-03-22：亮端放寬（亮星 S/N 高，ZP leverage 強）
+  comp_mag_faint:  1.5      # 暗端維持（暗星噪聲大，多了拖累回歸）
   comp_mag_min: 6.0         # 固定下限（不飽和）
   comp_mag_max: 13.0        # 固定上限
-  catalog_priority: ["AAVSO", "APASS", "Tycho2"]
+  # catalog_priority: ["AAVSO", "APASS", "Tycho2"]          # 2026-03-22 前：無 GaiaDR3，R/B 通道缺星等欄位
+  catalog_priority: ["AAVSO", "APASS", "Tycho2", "GaiaDR3"]  # 2026-03-22：加入 Gaia DR3，R 通道用 G->Rc 轉換
   aavso_min_stars: 3
   aavso_fov_arcmin: 100
   aavso_maglimit: 15.0
@@ -240,7 +248,7 @@ photometry:
   robust_regression_sigma: 3.0
   robust_regression_max_iter: 5
   robust_regression_min_points: 3
-  aperture_growth_radii: [3, 4, 5, 6, 7, 8, 10, 12, 15]  # pixels
+  aperture_growth_radii: [3, 4, 5, 6, 7, 8, 10, 12]  # pixels；舊值含 15，39" 過大移除
   sky_annulus_inner_px: 15
   sky_annulus_outer_px: 25
   max_fwhm_px: 8.0
@@ -255,7 +263,7 @@ photometry:
   peak_ratio_k: 3.0     # 自適應門檻倍數；peak_ratio < median - k×MAD 時剔除
   zp_intercept_sigma: 3.0  # ZP 截距突變閾值（倍 MAD）；薄雲/透明度驟變偵測
   sky_sigma: 3.0           # 背景突升閾值（倍 MAD）；起霧/散射光偵測
-  aperture_growth_fraction: 0.95
+  aperture_growth_fraction: 0.97  # 舊值 0.95→0.99（太大）；0.97 在 r_max=12 下約 9-10px
 
 
 # -----------------------------------------------------------------------------

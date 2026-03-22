@@ -789,7 +789,7 @@ def run_pre_whitening(
                [amplitude_iter, noise_level, sn_threshold * noise_level],
                color=["steelblue", "gray", "tomato"], alpha=0.8)
         ax.set_ylabel("mag")
-        ax.set_title(f"S/N = {sn:.2f}  ({'✓ 繼續' if sn >= sn_threshold else '✗ 停止'})")
+        ax.set_title(f"S/N = {sn:.2f}  ({'[OK] continue' if sn >= sn_threshold else '[STOP]'})")
 
         plt.tight_layout()
         fig_rows.append(fig_iter)

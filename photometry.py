@@ -84,7 +84,7 @@ class Cfg:
     comp_mag_faint: float = 2.0       # 比目標星暗最多 N 等
     comp_mag_min: float = 4.0         # 動態計算後填入
     comp_mag_max: float = 12.0        # 動態計算後填入
-    comp_max: int = 15
+    comp_max: int = 20    # 100→64星拖垮ZP fit; 20顆近目標亮度即可
     comp_fwhm_min: float = 2.0
     comp_fwhm_max: float = 8.0
     comp_min_sep_arcsec: float = 30.0
@@ -105,7 +105,7 @@ class Cfg:
     aperture_radius: float = 8.0
     aperture_min_radius: int = 2
     aperture_max_radius: int = 12
-    aperture_growth_fraction: float = 0.95
+    aperture_growth_fraction: float = 0.97
     annulus_r_in: float | None = None
     annulus_r_out: float | None = None
     saturation_threshold: float = 65536.0  # yaml saturation_adu 覆蓋此預設值；65536=全開（14-bit 物理最大值，以 R² 監控非線性取代硬截斷）
@@ -294,7 +294,15 @@ def cfg_from_yaml(
     iso          = int(session.get("iso", 0))
 
     tel_cfg = yaml_dict.get("telescopes", {}).get(telescope_id, {})
-    cam_cfg = yaml_dict.get("cameras", {}).get(camera_id, {})
+    _cameras = yaml_dict.get("cameras", {})
+    cam_cfg = _cameras.get(camera_id, {})
+    if not cam_cfg:
+        # session camera 全名 vs cameras 區塊簡稱不匹配 → 模糊搜尋
+        for _ckey, _cval in _cameras.items():
+            if isinstance(_cval, dict) and (_cval.get("name", "") == camera_id or camera_id in _ckey or _ckey in camera_id):
+                cam_cfg = _cval
+                print(f"  [WARN] camera '{camera_id}' 不在 cameras 區塊，模糊匹配到 '{_ckey}'")
+                break
     obs_cfg = yaml_dict.get("observatory", {})
     ap_cfg  = yaml_dict.get("photometry", {})   # aperture 參數位於 photometry: 區塊
     cmp_cfg = yaml_dict.get("comparison_stars", {})
@@ -534,10 +542,6 @@ def batch_plate_solve_all(timeout_sec: int = 180, force: bool = False):
         except Exception as e:
             fail += 1
             print("[FAIL]", f.name, ":", e)
-
-    print(f"ASTAP finished: ok={ok}, fail={fail}, total_wcs={len(out_paths)}")
-    return out_paths
-
 
     print(f"ASTAP finished: ok={ok}, fail={fail}, total_wcs={len(out_paths)}")
     return out_paths
@@ -912,11 +916,16 @@ def _growth_radius_for_star(
     r_min: int,
     r_max: int,
     growth_fraction: float,
+    annulus_r_in=None,
+    annulus_r_out=None,
 ) -> "float | None":
     radii  = np.arange(r_min, r_max + 0.5, 0.5)
     fluxes = []
+    # 顯式傳入 annulus 參數，避免依賴全域 cfg
+    _ann_in  = annulus_r_in if annulus_r_in is not None else getattr(cfg, 'annulus_r_in', None)
+    _ann_out = annulus_r_out if annulus_r_out is not None else getattr(cfg, 'annulus_r_out', None)
     for r in radii:
-        r_in, r_out = compute_annulus_radii(r, cfg.annulus_r_in, cfg.annulus_r_out)
+        r_in, r_out = compute_annulus_radii(r, _ann_in, _ann_out)
         phot = aperture_photometry(image, x, y, r, r_in, r_out)
         fluxes.append(
             phot["flux_net"] if phot.get("ok") == 1 and np.isfinite(phot.get("flux_net"))
@@ -944,8 +953,15 @@ def estimate_aperture_radius(
 
     stars_xy: list[tuple[float, float]] = []
     if comp_df is not None and len(comp_df) > 0:
-        sub = (comp_df.sort_values("m_cat") if "m_cat" in comp_df.columns
-               else comp_df).head(max_stars)
+        # 按星等接近目標星排序（而非取最亮），避免亮星 PSF 過集中導致孔徑偏小
+        if "m_cat" in comp_df.columns:
+            _vmag_t = float(getattr(cfg, "vmag_approx", np.nan)) if 'cfg' in globals() else np.nan
+            if np.isfinite(_vmag_t):
+                sub = comp_df.iloc[(comp_df["m_cat"] - _vmag_t).abs().argsort()].head(max_stars)
+            else:
+                sub = comp_df.sort_values("m_cat").head(max_stars)
+        else:
+            sub = comp_df.head(max_stars)
         for _, row in sub.iterrows():
             x, y = radec_to_pixel(wcs_obj, float(row["ra_deg"]), float(row["dec_deg"]))
             if in_bounds(img, x, y, margin=int(r_max + 6)):
@@ -961,15 +977,21 @@ def estimate_aperture_radius(
             if in_bounds(img, x, y, margin=int(r_max + 6)):
                 stars_xy.append((x, y))
 
+    # 從全域 cfg 取 annulus 和 saturation 參數（暫保 fallback，逐步消除全域依賴）
+    _ann_in  = getattr(cfg, 'annulus_r_in', None) if 'cfg' in dir() or 'cfg' in globals() else None
+    _ann_out = getattr(cfg, 'annulus_r_out', None) if 'cfg' in dir() or 'cfg' in globals() else None
+    _sat_th  = getattr(cfg, 'saturation_threshold', None) if 'cfg' in dir() or 'cfg' in globals() else None
+
     radii = []
     for x, y in stars_xy:
-        r_sel = _growth_radius_for_star(img, x, y, r_min, r_max, growth_fraction)
+        r_sel = _growth_radius_for_star(img, x, y, r_min, r_max, growth_fraction,
+                                         annulus_r_in=_ann_in, annulus_r_out=_ann_out)
         if r_sel is None:
             continue
-        if cfg.saturation_threshold is not None:
-            r_in, r_out = compute_annulus_radii(r_sel, cfg.annulus_r_in, cfg.annulus_r_out)
+        if _sat_th is not None:
+            r_in, r_out = compute_annulus_radii(r_sel, _ann_in, _ann_out)
             phot = aperture_photometry(img, x, y, r_sel, r_in, r_out)
-            if is_saturated(phot.get("max_pix", np.nan), cfg.saturation_threshold):
+            if is_saturated(phot.get("max_pix", np.nan), _sat_th):
                 continue
         radii.append(r_sel)
     return float(np.nanmedian(radii)) if radii else None
@@ -1629,7 +1651,16 @@ def fetch_apass_cone(
 
     結果欄位統一為 ra_deg, dec_deg, vmag, e_vmag, bmag, e_bmag, rmag, e_rmag。
     """
-    # 1. 嘗試本機快取
+    # 1a. 2026-03-22: 嘗試全天本機星表
+    try:
+        from tools.local_catalog import query_local_apass as _qla
+        _local = _qla(ra_deg, dec_deg, radius_deg=radius_deg)
+        if len(_local) > 0:
+            return _local
+    except Exception:
+        pass
+
+    # 1b. 嘗試 per-field 本機快取（舊版）
     if cache_dir is None:
         cache_dir = Path(__file__).parent.parent / "data" / "catalogs" / "apass"
     if cache_dir.exists():
@@ -1694,6 +1725,17 @@ def fetch_tycho2_cone(
     誤差傳遞：e_V = sqrt(e_VT² + 0.090² × (e_BT² + e_VT²))
     BT 或 VT 缺失的星跳過。
     """
+    # 2026-03-22: 優先查本機全天星表
+    try:
+        from tools.local_catalog import query_local_tycho2 as _qlt
+        _local = _qlt(ra_deg, dec_deg, radius_deg=radius_arcmin / 60.0,
+                       mag_min=mag_min, mag_max=mag_max)
+        if len(_local) > 0:
+            print(f"  [Tycho-2] 本機全天星表命中：{len(_local)} 筆")
+            return _local
+    except Exception:
+        pass
+
     try:
         from astroquery.vizier import Vizier
         from astropy.coordinates import SkyCoord as _SkyCoord
@@ -1760,9 +1802,19 @@ def fetch_gaia_dr3_cone(
       Rc = G - (0.02275 + 0.3961c - 0.1243c² - 0.01396c³ + 0.003775c⁴)
     B   ：G→B   (使用者指定公式)
       B = G + 0.0939 + 0.6758c + 0.0743c²
-      ⚠️ 僅適用 BP-RP < 2，超出範圍仍計算但標記 warn_color
+      [WARN] 僅適用 BP-RP < 2，超出範圍仍計算但標記 warn_color
     Gaia 亮星容忍：mag_min 最小 6.0（G<3 才飽和）。
     """
+    # 2026-03-22: 優先查本機全天星表
+    try:
+        from tools.local_catalog import query_local_gaia as _qlg
+        _local = _qlg(ra_deg, dec_deg, radius_deg=radius_arcmin / 60.0,
+                       mag_min=mag_min, mag_max=mag_max, channel=channel)
+        if len(_local) > 0:
+            return _local
+    except Exception:
+        pass  # 本機不可用時 fallback 到線上
+
     try:
         from astroquery.vizier import Vizier
         from astropy.coordinates import SkyCoord as _SkyCoord
@@ -2089,7 +2141,11 @@ def auto_select_comps(
                     "V": ["err_mag_v", "e_vmag", "e_v", "v_err", "vmag_err"],
                     "r": ["err_mag_r", "e_rmag", "e_r", "r_err", "rmag_err"],
                 }
-                _mag_col = _pick_col(apass_raw, _mag_cands.get(_band, _mag_cands["V"]))
+                try:
+                    _mag_col = _pick_col(apass_raw, _mag_cands.get(_band, _mag_cands["V"]))
+                except KeyError:
+                    print(f"  [WARN] APASS 無 {_band} 波段星等欄位，跳過（可用欄位：{list(apass_raw.columns)}）")
+                    continue
                 _err_col = next(
                     (c for c in _err_cands.get(_band, _err_cands["V"]) if c in apass_raw.columns),
                     None,
@@ -2173,6 +2229,18 @@ def auto_select_comps(
     active_df     = None
     active_source = "NONE"
 
+    # ── 5b. VSX 已知變星排除（比較星不能是變星）──────────────────────────────
+    if len(combined_raw) > 0:
+        try:
+            from tools.local_catalog import query_vsx_cone, filter_known_variables
+            _vsx = query_vsx_cone(ra_t, dec_t, radius_deg=cfg.apass_radius_deg)
+            if len(_vsx) > 0:
+                _n_before_vsx = len(combined_raw)
+                combined_raw = filter_known_variables(combined_raw, _vsx, match_arcsec=10.0)
+                print(f"  [VSX] 比較星候選：{_n_before_vsx} → {len(combined_raw)}（排除已知變星）")
+        except Exception as _e_vsx:
+            print(f"  [VSX] 變星排除跳過：{_e_vsx}")
+
     if len(combined_raw) > 0:
         active_df = _catalog_direct_phot(
             combined_raw, "ra_deg", "dec_deg", "m_cat", "m_err",
@@ -2202,6 +2270,27 @@ def auto_select_comps(
         d_arcsec  = float(tgt_sc.separation(sc_c).arcsec)
         weight    = 1.0 / (d_arcsec + epsilon) ** 2    # w_i = 1 / (d_i + ε)²
         comp_refs.append((ra_c, dec_c, m_cat, m_err, weight))
+
+    # ── 6b. comp_max 截斷（安全上限，防止極端密集場計算過慢）─────────────────
+    # 按 m_cat 與目標星的差距排序（星等越接近越優先），保留最佳 comp_max 顆。
+    # comp_max=0 表示不截斷（全部使用，由 Broeg 加權自行處理品質）。
+    if cfg.comp_max > 0 and len(comp_refs) > cfg.comp_max:
+        _vmag_t = float(getattr(cfg, "vmag_approx", np.nan))
+        if np.isfinite(_vmag_t):
+            # 按 |m_cat - vmag_target| 排序，星等最接近的優先
+            comp_refs.sort(key=lambda x: abs(x[2] - _vmag_t))
+        else:
+            # fallback：按距離加權（近的優先）
+            comp_refs.sort(key=lambda x: x[4], reverse=True)
+        _n_before = len(comp_refs)
+        comp_refs = comp_refs[:cfg.comp_max]
+        print(f"[比較星] comp_max={cfg.comp_max}：{_n_before} → {len(comp_refs)} 顆"
+              f"（按星等接近度排序）")
+        # 同步更新 active_df
+        _kept_coords = {(r[0], r[1]) for r in comp_refs}
+        active_df = active_df[
+            active_df.apply(lambda row: (row["ra_deg"], row["dec_deg"]) in _kept_coords, axis=1)
+        ].reset_index(drop=True)
 
     # ── 7. 檢查星 ──────────────────────────────────────────────────────────────
     catalog_for_check = aavso_matched if aavso_matched is not None and len(aavso_matched) > 0 else apass_matched
@@ -2443,7 +2532,10 @@ def plot_light_curve(
         return
 
     # Filter valid points
-    d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
+    # ensemble_normalize 啟用時優先用 m_var_norm；否則退回 m_var
+    _mag_col = "m_var_norm" if ("m_var_norm" in df.columns
+                                 and np.isfinite(df["m_var_norm"]).any()) else "m_var"
+    d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df[_mag_col])].copy()
     if len(d) == 0:
         print("[PLOT] No valid photometry points to plot.")
         return
@@ -2483,11 +2575,12 @@ def plot_light_curve(
     fig, ax = plt.subplots(figsize=(12, 4))
 
     # Error bars or dots
+    _y_vals = d[_mag_col].values
     if "t_sigma_mag" in d.columns and np.isfinite(d["t_sigma_mag"]).any():
-        ax.errorbar(bjd_arr, d["m_var"].values, yerr=d["t_sigma_mag"].values,
+        ax.errorbar(bjd_arr, _y_vals, yerr=d["t_sigma_mag"].values,
                     fmt="o", ms=4, capsize=2, lw=0.8, label="± σ", zorder=3)
     else:
-        ax.plot(bjd_arr, d["m_var"].values, "o-", ms=4, lw=0.8, label="± σ", zorder=3)
+        ax.plot(bjd_arr, _y_vals, "o-", ms=4, lw=0.8, label="± σ", zorder=3)
 
     ax.invert_yaxis()
     ax.set_xlim(bjd_min - 0.002, bjd_max + 0.002)
@@ -2517,7 +2610,8 @@ def plot_light_curve(
 
     # Labels
     ax.set_xlabel("Local Time (HH:MM)", color="navy", loc="left", fontsize=9, labelpad=2)
-    ax.set_ylabel("Calibrated Magnitude (mag)")
+    _ylabel = "Calibrated Magnitude (mag)" if _mag_col == "m_var" else "Ensemble-Normalized Magnitude (mag)"
+    ax.set_ylabel(_ylabel)
 
     # Title: Bold, Large (22), pad (10)
     _title_star = getattr(cfg, "display_name", None) or getattr(cfg, "target_name", "Target")
@@ -2696,6 +2790,7 @@ def run_photometry_on_wcs_dir(
         # ── [2] Sharpness Index 篩選 ─────────────────────────────────────────
         # S = flux(r=3px) / flux(r=8px)（均扣背景，對象：最亮未飽和比較星）
         # S < sharpness_min 代表星點過度擴散或拖影，剔除該幀。
+        # 注意：刻意用最亮比較星而非目標星 — 亮星 S/N 高，sharpness 判斷更穩定。
         _sharpness = np.nan
         _sharpness_min = float(getattr(cfg, "sharpness_min", 0.3))
         if _sharpness_min > 0 and comp_refs:
@@ -2736,15 +2831,15 @@ def run_photometry_on_wcs_dir(
         # ── [2b] Peak-ratio 篩選（次鏡起霧 / 甜甜圈 PSF 偵測）─────────────────
         # peak_ratio = t_max_pix / t_flux_net
         # 次鏡起霧時中心被掏空，峰值相對總通量驟降。
-        # peak_ratio_min: 0.0 = 停用；建議值 0.090（由資料驅動設定）。
+        # [DEPRECATED] peak_ratio_min: 固定門檻，已由自適應 peak_ratio_k 取代。
+        # peak_ratio_min > 0 仍可運作但不建議使用。
         _peak_ratio_min = float(getattr(cfg, "peak_ratio_min", 0.0))
-        _peak_ratio = np.nan
-        if _peak_ratio_min > 0:
-            phot_t_pr = aperture_photometry(img, xt, yt, ap_radius, r_in, r_out)
-            _flux_pr  = phot_t_pr.get("flux_net", np.nan)
-            _peak_pr  = phot_t_pr.get("max_pix",  np.nan)
-            if np.isfinite(_flux_pr) and np.isfinite(_peak_pr) and _flux_pr > 0:
-                _peak_ratio = float(_peak_pr / _flux_pr)
+        # 計算 peak_ratio（重用已有的 phot_t，不重複做 aperture_photometry）
+        _flux_pr = phot_t.get("flux_net", np.nan)
+        _peak_pr = phot_t.get("max_pix",  np.nan)
+        _peak_ratio = float(_peak_pr / _flux_pr) if (
+            np.isfinite(_flux_pr) and np.isfinite(_peak_pr) and _flux_pr > 0
+        ) else np.nan
         rec["peak_ratio"] = _peak_ratio
         if _peak_ratio_min > 0 and np.isfinite(_peak_ratio) and _peak_ratio < _peak_ratio_min:
             rec["ok"] = 0
@@ -2788,6 +2883,10 @@ def run_photometry_on_wcs_dir(
             # 若星表誤差已知，納入誤差加權（誤差越大，權重越低）
             if m_err is not None and np.isfinite(m_err) and float(m_err) > 0:
                 weight /= float(m_err) ** 2
+            # 實測 S/N 加權（暫時停用，待驗證影響後再啟用）
+            # _flux_c = phot_c.get("flux_net", 0.0)
+            # if _flux_c > 0:
+            #     weight *= np.sqrt(_flux_c)
             comp_m_inst.append(m_inst_c)
             comp_m_cat.append(float(m_cat))
             comp_weights.append(weight)
@@ -2841,24 +2940,24 @@ def run_photometry_on_wcs_dir(
                 _diag_bright, _diag_faint,
             )
 
-        if fit is None:
-            zp   = float(np.nanmedian(comp_m_cat - comp_m_inst))
-            a, b, r2 = 1.0, -zp, np.nan
-            mask = np.isfinite(comp_m_inst) & np.isfinite(comp_m_cat)
-        else:
-            a, b, r2, mask = fit["a"], fit["b"], fit["r2"], fit["mask"]
-            # 若目標儀器星等在比較星範圍外（外插），降級為 slope=1 純偏移
-            _inst_min = float(np.nanmin(comp_m_inst[mask])) if mask.any() else np.nan
-            _inst_max = float(np.nanmax(comp_m_inst[mask])) if mask.any() else np.nan
-            if np.isfinite(_inst_min) and (m_inst_t < _inst_min or m_inst_t > _inst_max):
-                zp = float(np.nanmedian(comp_m_cat[mask] - comp_m_inst[mask]))
-                a, b = 1.0, -zp
-                _phot_logger.info(
-                    "[ZP] target m_inst=%.3f 在比較星範圍 [%.3f, %.3f] 外，降級為 slope=1",
-                    m_inst_t, _inst_min, _inst_max,
-                )
+        # ── ZP 計算：永遠用 slope=1.0（純差分測光）──────────────────────
+        # 差分測光原理：同一幀的 ZP 對所有星相同，m_var = m_inst - (-ZP)
+        # regression 只保留做品質監控（slope deviation、R² 異常偵測）
+        mask = np.isfinite(comp_m_inst) & np.isfinite(comp_m_cat)
+        zp   = float(np.nanmedian(comp_m_cat[mask] - comp_m_inst[mask])) if mask.any() else np.nan
+        a, b = 1.0, -zp   # m_var = (m_inst - b) / a = m_inst + zp
 
-        if not np.isfinite(a) or a == 0:
+        # regression 結果僅供監控，不影響 m_var 計算
+        if fit is not None:
+            _a_fit, _r2_fit = fit["a"], fit["r2"]
+            mask = fit["mask"]  # 用 robust regression 的 inlier mask 更新 ZP
+            zp = float(np.nanmedian(comp_m_cat[mask] - comp_m_inst[mask])) if mask.any() else zp
+            a, b = 1.0, -zp
+            r2 = _r2_fit
+        else:
+            _a_fit, r2 = np.nan, np.nan
+
+        if not np.isfinite(zp):
             rows.append(rec)
             continue
 
@@ -2894,12 +2993,13 @@ def run_photometry_on_wcs_dir(
         )
         snr = float(1.0857 / sigma_mag) if np.isfinite(sigma_mag) and sigma_mag > 0 else np.nan
 
-        # ── FLAG_SLOPE_DEVIATION（§3.8）：|a − 1.0| > 0.05 ──────────────────
-        _slope_flag = int(abs(a - 1.0) > 0.05)
+        # ── FLAG_SLOPE_DEVIATION（§3.8）：regression slope 監控 ────────────
+        # a 永遠 = 1.0（差分測光），_a_fit 是 regression 的 slope（品質指標）
+        _slope_flag = int(np.isfinite(_a_fit) and abs(_a_fit - 1.0) > 0.05)
         if _slope_flag:
             _phot_logger.debug(
-                "[FLAG] slope_deviation a=%.4f (|a-1|=%.4f > 0.05) in %s",
-                a, abs(a - 1.0), f.name,
+                "[FLAG] slope_deviation a_fit=%.4f (|a-1|=%.4f > 0.05) in %s",
+                _a_fit, abs(_a_fit - 1.0), f.name,
             )
 
         rec.update({
@@ -2915,11 +3015,12 @@ def run_photometry_on_wcs_dir(
             "ap_radius": ap_radius,
             "annulus_r_in": r_in,
             "annulus_r_out": r_out,
-            "zp_slope": a,
-            "zp_intercept": b,
-            "zp_r2": r2,
+            "zp_slope": a,           # 永遠 1.0
+            "zp_intercept": b,       # = -ZP
+            "zp_r2": r2,             # regression R²（監控用）
             "comp_used": comp_used,
             "flag_slope_dev": _slope_flag,
+            "zp_slope_fit": _a_fit,  # regression slope（監控用，取代 flag_extrapolated）
             "m_var": m_var,
         })
 
@@ -3132,6 +3233,7 @@ def run_photometry_on_wcs_dir(
     pd.DataFrame(_rej_rows).to_csv(_rej_path, index=False, encoding="utf-8-sig")
     print(f"[剔除統計] saved → {_rej_path}")
 
+    # 第一次寫入（ensemble normalize 後會再寫一次，更新 m_var_norm/delta_ensemble）
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
     n_written = len(df)
@@ -3392,23 +3494,25 @@ def run_photometry_on_wcs_dir(
             _cur += _dt_local.timedelta(minutes=10)
 
     _lc_obs_date = str(out_csv.stem).split("_")[-1]
-    plot_light_curve(df, out_png, channel, cfg, obs_date=_lc_obs_date)
+    # 光變曲線圖移至 ensemble normalize 之後繪製（使用 m_var_norm）
 
     # ── Check star residuals ──────────────────────────────────────────────────
     if check_star is not None and "k_minus_c" in df.columns:
         k = df[(df["ok"] == 1) & np.isfinite(df[time_key])
                & np.isfinite(df["k_minus_c"])].copy()
         if len(k) > 1:
-            k["t_rel_d"] = k[time_key] - t0
+            k["t_rel_d"] = k[time_key] - _t0
             sigma_k = float(np.nanstd(k["k_minus_c"]))
             flag    = " [!] EXCEEDS THRESHOLD" if sigma_k > cfg.check_star_max_sigma else ""
             print(f"[CHECK] K-C sigma = {sigma_k:.5f} mag "
                   f"(threshold = {cfg.check_star_max_sigma}){flag}")
             fig2, ax2 = plt.subplots(figsize=(10, 3))
             ax2.plot(k["t_rel_d"], k["k_minus_c"], "o-", ms=4, lw=0.8)
-            ax2.xaxis.set_major_formatter(plt.FuncFormatter(_fmt_dhm))
+            ax2.xaxis.set_major_formatter(plt.FuncFormatter(
+                lambda x, _: f"{int(x)}d {int((x % 1)*24)}h {int(((x % 1)*24 % 1)*60)}m"
+            ))
             ax2.invert_yaxis()
-            ax2.set_xlabel(xlabel)
+            ax2.set_xlabel("t_rel (days)")
             ax2.set_ylabel("K - C  (mag)")
             ax2.set_title("Check Star Validation")
             ax2.grid(True, alpha=0.4)
@@ -3454,6 +3558,9 @@ def run_photometry_on_wcs_dir(
         # ensemble 停用：m_var_norm 直通 m_var
         df["m_var_norm"] = df["m_var"]
         df["delta_ensemble"] = np.nan
+
+    # ── 光變曲線圖（ensemble 之後重畫，使用 m_var_norm）──────────────────────
+    plot_light_curve(df, out_png, channel, cfg, obs_date=_lc_obs_date)
 
     # ── 單通道摘要報告 ──────────────────────────────────────────────────────────
     try:
@@ -3559,6 +3666,8 @@ if __name__ == "__main__":
 
     # ── Logger 初始化 ──────────────────────────────────────────────────────────
     _log_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if _args.out_tag:
+        _log_ts = f"{_log_ts}_{_args.out_tag}"
     _logger   = logging.getLogger("photometry")
     _logger.setLevel(logging.DEBUG)
     # Console：只印重要摘要訊息
@@ -3701,6 +3810,9 @@ if __name__ == "__main__":
         print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
 
         # ── 比較星選取（天球座標，通道無關，只做一次）────────────────────────
+        # 注意：此時用 YAML 預設孔徑（8px）做初選測光。
+        # 孔徑估計在之後用比較星做，正式測光用估計後的孔徑。
+        # 初選與正式孔徑的微小差異（~1-2px）不影響比較星篩選結果。
         try:
             (comp_refs, comp_df_matched, check_star,
              aavso_matched, apass_matched, active_source) = auto_select_comps(
@@ -3711,7 +3823,7 @@ if __name__ == "__main__":
             continue
         print(f"check_star：{check_star}")
 
-        # ── 孔徑估計（以第一通道為準，所有通道共用）──────────────────────────
+        # ── 孔徑估計（用比較星，亮度接近目標星）──────────────────────────────
         if cfg.aperture_auto:
             ap_r = estimate_aperture_radius(
                 wcs_files[0], comp_df_matched,
@@ -3747,8 +3859,11 @@ if __name__ == "__main__":
                                    split_subdir=_args.split_subdir, out_tag=_args.out_tag,
                                    run_ts=_log_ts)
             cfg_ch.aperture_radius = _shared_aperture_radius
-            cfg_ch.gain_e_per_adu  = cfg.gain_e_per_adu
-            cfg_ch.read_noise_e    = cfg.read_noise_e
+            # gain/read_noise：cfg_ch 從 sensor_db 讀取；若為 None 才從首通道 fallback
+            if cfg_ch.gain_e_per_adu is None and cfg.gain_e_per_adu is not None:
+                cfg_ch.gain_e_per_adu = cfg.gain_e_per_adu
+            if cfg_ch.read_noise_e is None and cfg.read_noise_e is not None:
+                cfg_ch.read_noise_e = cfg.read_noise_e
 
             _split_dir = cfg_ch.wcs_dir
             _fits_ch   = sorted(_split_dir.glob(f"*_{_ch}.fits"))
@@ -4036,7 +4151,7 @@ if __name__ == "__main__":
                         try:
                             _ratio_df = pd.DataFrame({
                                 "bjd_tdb": _mg["bjd_tdb"].values,
-                                "v_mag":   _mg["mag_diff_G1G2"].values,
+                                "m_var":   _mg["mag_diff_G1G2"].values,
                                 "v_err":   np.full(len(_mg), 0.001),
                                 "ok":      1,
                             })

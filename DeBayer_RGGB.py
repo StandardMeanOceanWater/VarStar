@@ -347,11 +347,11 @@ def run_debayer(config_path: "str | Path") -> None:
             print(f"\n[完成] {target}/{date}：成功 {success} 幀，失敗 {failed} 幀")
             print(f"       輸出目錄：{split_base}/{{R,G1,G2,B}}/")
 
-    print("\n" + "🔭 " * 20)
+    print("\n" + "=" * 20)
     print("所有 Session 拆色完成。")
     print("G2 通道僅供品質驗證（G1 vs G2 residual rms = PRNU 估計值）。")
     print("下一步：Photometry.ipynb")
-    print("🔭 " * 20)
+    print("=" * 20)
 
 
 # =============================================================================

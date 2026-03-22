@@ -568,10 +568,10 @@ def run_plate_solve(config_path: str | Path) -> None:
                     ok = _run_astrometry_net(fits_path, out_path, anet_cfg)
 
                 if ok:
-                    print("✓")
+                    print("OK")
                     success += 1
                 else:
-                    print("✗")
+                    print("FAIL")
                     failed += 1
 
             print(
@@ -580,10 +580,10 @@ def run_plate_solve(config_path: str | Path) -> None:
             )
             print(f"       WCS 輸出目錄：{wcs_dir}")
 
-    print("\n" + "🔭 " * 20)
+    print("\n" + "=" * 20)
     print("所有 Session 星圖解算完成。")
     print("下一步：DeBayer_RGGB.py → Photometry.ipynb")
-    print("🔭 " * 20)
+    print("=" * 20)
 
 
 # =============================================================================

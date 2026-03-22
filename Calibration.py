@@ -172,7 +172,10 @@ def resolve_session_paths(
     _group = _tgt_cfg.get("group", target)
     _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
     field_root = data_root / _date_fmt / _group
-    _cal_label = f"{date}_{session.get('telescope', '')}_{session.get('camera', '')}"
+    _cal_label = session.get("cal_label")
+    if not _cal_label:
+        _cal_label = f"{session.get('telescope', '')}_{session.get('camera', '')}"
+    _cal_label = f"{date}_{_cal_label}"
     shared_cal = data_root / "share" / "calibration" / _cal_label
 
     light_temp_c: Optional[float] = session.get("light_temp_c")
@@ -185,6 +188,32 @@ def resolve_session_paths(
         if shared.exists() and any(shared.iterdir()):
             return shared
         return None
+
+    def _find_flat_dirs_by_format() -> Dict[str, Path]:
+        """
+        掃描所有 flat* 目錄，依檔案格式分類回傳。
+
+        Returns
+        -------
+        dict : {"cr2": Path, "fits": Path} 視實際存在而定。
+        """
+        result: Dict[str, Path] = {}
+        if not shared_cal.exists():
+            return result
+        for d in sorted(shared_cal.iterdir()):
+            if not d.is_dir() or not d.name.lower().startswith("flat"):
+                continue
+            files = [f for f in d.iterdir() if f.is_file()]
+            if not files:
+                continue
+            has_cr2 = any(f.suffix.lower() == ".cr2" for f in files)
+            has_fits = any(f.suffix.lower() in (".fits", ".fit") for f in files)
+            # 每種格式只取第一個找到的目錄
+            if has_cr2 and "cr2" not in result:
+                result["cr2"] = d
+            if has_fits and "fits" not in result:
+                result["fits"] = d
+        return result
 
     def _parse_temp(subdir: Path) -> Optional[float]:
         """嘗試從子目錄名稱解析溫度（°C）；失敗回傳 None。"""
@@ -280,6 +309,7 @@ def resolve_session_paths(
         "light_dir": field_root / "raw",
         "dark_dir": dark_dir,
         "flat_dir": _find_cal_dir("flat"),
+        "flat_dirs_by_format": _find_flat_dirs_by_format(),
         "bias_dir": _find_cal_dir("bias"),
         "calibrated_dir": field_root / "wcs",
         "masters_dir": shared_cal / "masters",
@@ -809,17 +839,37 @@ def run_calibration(config_path: str | Path) -> None:
                 )
 
         dark_files = _list_image_files(paths_ref["dark_dir"])
-        flat_files = _list_image_files(paths_ref["flat_dir"])
         bias_files = _list_image_files(paths_ref["bias_dir"])
+
+        # ── Flat：依格式分別建 Master ──────────────────────────────────────
+        flat_dirs_by_fmt = paths_ref.get("flat_dirs_by_format", {})
+        # 舊的 flat_dir 做 fallback（向後相容）
+        if not flat_dirs_by_fmt and paths_ref.get("flat_dir"):
+            flat_files_old = _list_image_files(paths_ref["flat_dir"])
+            if flat_files_old:
+                # 偵測格式
+                _ext0 = flat_files_old[0].suffix.lower()
+                _key = "cr2" if _ext0 == ".cr2" else "fits"
+                flat_dirs_by_fmt = {_key: paths_ref["flat_dir"]}
+
+        # 為每種格式收集 flat 檔案
+        flat_files_by_fmt: Dict[str, List[Path]] = {}
+        for fmt, fdir in flat_dirs_by_fmt.items():
+            flist = _list_image_files(fdir)
+            if flist:
+                flat_files_by_fmt[fmt] = flist
+                print(f"  Flat ({fmt.upper()}) : {len(flist)} 幀  →  {fdir}")
+
+        has_any_flat = len(flat_files_by_fmt) > 0
 
         cal_mode = determine_cal_mode(
             has_dark=len(dark_files) > 0,
             has_bias=len(bias_files) > 0,
-            has_flat=len(flat_files) > 0,
+            has_flat=has_any_flat,
         )
         print(f"  校正模式（CAL_MODE）：{cal_mode}")
 
-        # 合成 Master 幀（masters 存到第一個 target 的目錄）
+        # 合成 Master 幀
         paths_ref["masters_dir"].mkdir(parents=True, exist_ok=True)
         save_masters = cfg.get("calibration", {}).get("save_masters", True)
 
@@ -848,22 +898,24 @@ def run_calibration(config_path: str | Path) -> None:
                 fits.writeto(dark_out, master_dark, overwrite=True)
                 print(f"  [儲存] Master Dark → {dark_out.name}")
 
-        master_flat_norm: Optional[np.ndarray] = None
-        if flat_files:
+        # 為每種格式建 Master Flat
+        master_flat_by_fmt: Dict[str, np.ndarray] = {}
+        for fmt, flist in flat_files_by_fmt.items():
             flat_raw = create_master(
-                flat_files, "Master Flat", chunk_size, tz_offset
+                flist, f"Master Flat ({fmt.upper()})", chunk_size, tz_offset
             )
-            master_flat_norm = normalize_flat(
-                flat_raw, master_bias, bad_pixel_thr
-            )
+            mf = normalize_flat(flat_raw, master_bias, bad_pixel_thr)
+            master_flat_by_fmt[fmt] = mf
             del flat_raw
             gc.collect()
             if save_masters:
+                _suffix = "" if fmt == "cr2" else f"_{fmt}"
                 flat_out = (
-                    paths_ref["masters_dir"] / f"master_flat_norm_{date}.fits"
+                    paths_ref["masters_dir"]
+                    / f"master_flat_norm_{date}{_suffix}.fits"
                 )
-                fits.writeto(flat_out, master_flat_norm, overwrite=True)
-                print(f"  [儲存] Master Flat（歸一化）→ {flat_out.name}")
+                fits.writeto(flat_out, mf, overwrite=True)
+                print(f"  [儲存] Master Flat ({fmt.upper()}) → {flat_out.name}")
 
         # ── 逐 target 校正 ───────────────────────────────────────────────────
         for target in targets_list:
@@ -877,9 +929,15 @@ def run_calibration(config_path: str | Path) -> None:
                 print(f"  [SKIP] 找不到 Light 幀：{paths['light_dir']}")
                 continue
 
+            # 統計 light 的格式分佈
+            _light_cr2 = [f for f in light_files if f.suffix.lower() == ".cr2"]
+            _light_fits = [f for f in light_files
+                           if f.suffix.lower() in (".fits", ".fit")]
             print(f"  Light  : {len(light_files)} 幀  →  {paths['light_dir']}")
+            if _light_cr2 and _light_fits:
+                print(f"           [WARN] 混合格式："
+                      f"{len(_light_fits)} FITS + {len(_light_cr2)} CR2")
             print(f"  Dark   : {len(dark_files)} 幀  →  {paths_ref['dark_dir']}")
-            print(f"  Flat   : {len(flat_files)} 幀  →  {paths_ref['flat_dir']}")
             print(f"  Bias   : {len(bias_files)} 幀  →  {paths_ref['bias_dir']}")
 
             paths["calibrated_dir"].mkdir(parents=True, exist_ok=True)
@@ -901,6 +959,31 @@ def run_calibration(config_path: str | Path) -> None:
                         saturation_adu=sat_adu,
                         iso=iso if iso > 0 else None,
                     )
+
+                    # ── 選擇格式匹配的 Master Flat ─────────────────────────
+                    _l_ext = light_path.suffix.lower()
+                    _l_fmt = "cr2" if _l_ext == ".cr2" else "fits"
+                    master_flat_norm: Optional[np.ndarray] = None
+                    _flat_match = "none"
+
+                    if _l_fmt in master_flat_by_fmt:
+                        # 格式完全匹配
+                        master_flat_norm = master_flat_by_fmt[_l_fmt]
+                        _flat_match = "match"
+                    elif master_flat_by_fmt:
+                        # 格式不匹配，用可用的（並警告）
+                        _alt_fmt = next(iter(master_flat_by_fmt))
+                        master_flat_norm = master_flat_by_fmt[_alt_fmt]
+                        _flat_match = "mismatch"
+                        if idx == 0:
+                            print(
+                                f"\n  [WARN] [格式不匹配] Light 為 "
+                                f"{_l_fmt.upper()}，"
+                                f"但 Flat 為 {_alt_fmt.upper()}。\n"
+                                f"     暗角校正可能不準確（不同讀出路徑的"
+                                f"漸暈模式不同）。\n"
+                                f"     建議：補拍與 Light 相同格式的 Flat。"
+                            )
 
                     # ── 天文校正公式 ────────────────────────────────────────
                     cal = light.copy()
@@ -953,10 +1036,19 @@ def run_calibration(config_path: str | Path) -> None:
                         .get("focal_length_mm", ""),
                         "[mm] Focal length",
                     )
+                    header["FLATFMT"] = (
+                        _flat_match,
+                        "Flat format: match/mismatch/none",
+                    )
                     header["HISTORY"] = (
                         "Calibrated by Calibration.py (variable star pipeline)"
                     )
                     header["HISTORY"] = f"CAL_MODE={cal_mode}  ISO={iso}"
+                    if _flat_match == "mismatch":
+                        header["HISTORY"] = (
+                            f"WARNING: Flat format mismatch "
+                            f"(Light={_l_fmt}, Flat={_alt_fmt})"
+                        )
 
                     out_name = f"Cal_{light_path.stem}_{idx + 1:04d}.fits"
                     out_path = out_dir / out_name
@@ -974,13 +1066,13 @@ def run_calibration(config_path: str | Path) -> None:
             print(f"       輸出目錄：{out_dir}")
 
         # 釋放 Master 幀記憶體供下一個 session 使用
-        del master_bias, master_dark, master_flat_norm
+        del master_bias, master_dark, master_flat_by_fmt
         gc.collect()
 
-    print("\n" + "🔭 " * 20)
+    print("\n" + "=" * 60)
     print("所有 Session 校正完成。輸出為保留 Bayer 排列的 float32 線性 FITS。")
     print("下一步：plate_solve.py → DeBayer_RGGB.py → Photometry.ipynb")
-    print("🔭 " * 20)
+    print("=" * 60)
 
 
 # =============================================================================
