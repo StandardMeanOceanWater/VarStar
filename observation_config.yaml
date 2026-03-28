@@ -84,7 +84,7 @@ obs_sessions:
     targets: ["V1162Ori", "V1643Ori", "V1373Ori", "HHOri", "Gaia301"]
     camera_label: "6D2_ISO3200"          # bias/dark 來源資料夾
     scope_label:  "R200SS_6D2"           # flat 來源資料夾
-    flat_date:    "20251221"             # flat master 檔名日期；對應 share/calibration/master/ 內的檔名
+    flat_date:    "20251221"             # flat master 檔名日期；對應 share/calibration/flat/.../資料夾名稱
     dark_temp_c: 3.7                     # 指定使用的 dark 溫度子目錄（°C）
     light_temp_c: 4                      # 觀測當晚氣溫（°C）
     # calib_date 不填：bias/dark master 檔名日期由 EXIF 自動讀取，避免手動記錯

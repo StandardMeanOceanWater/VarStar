@@ -1089,7 +1089,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         # 預設尋找同目錄的 observation_config.yaml
-        default_cfg = Path(__file__).parent.parent / "observation_config.yaml"
+        default_cfg = Path(__file__).parent / "observation_config.yaml"
         cfg_path = default_cfg
     else:
         cfg_path = Path(sys.argv[1])

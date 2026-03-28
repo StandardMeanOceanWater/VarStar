@@ -362,7 +362,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        default_cfg = Path(__file__).parent.parent / "observation_config.yaml"
+        default_cfg = Path(__file__).parent / "observation_config.yaml"
         cfg_path = default_cfg
     else:
         cfg_path = Path(sys.argv[1])
