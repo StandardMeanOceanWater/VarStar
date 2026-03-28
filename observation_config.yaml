@@ -1,6 +1,6 @@
 # ============================================================
 # 變星測光管線設定檔  Variable Star Pipeline Configuration
-# 版本：v1.1  |  日期：2026-03-14
+# 版本：v1.61 |  日期：2026-03-28
 # 修改這個檔案即可切換目標、路徑、儀器參數
 #
 # ⚠️ 修訂規則（防止修改互相覆蓋）：
@@ -64,11 +64,13 @@ obs_sessions:
     telescope: "Vixen R200SS"            # OTA（光學管）
     mount: "Takahashi EM-11 Temma3"      # 赤道儀
     camera: "Canon EOS 6D Mark II"       # 相機（已移除 IR-cut）
-    cal_label: "R200SS_6D2"              # 校正資料夾標籤
     targets: ["AlVel", "CCAnd", "Gaia375"]
-    calibration_date: "20251122"
-    dark_temp_c: 5.3
-    light_temp_c: 7
+    camera_label: "6D2_ISO3200"          # bias/dark 來源資料夾
+    scope_label:  "R200SS_6D2"           # flat 來源資料夾
+    flat_date:    "20260313"             # flat master 檔名日期；對應 share/calibration/master/ 內的檔名
+    dark_temp_c: 5.3                     # 指定使用的 dark 溫度子目錄（°C）；選最接近 light_temp_c 者
+    light_temp_c: 7                      # 觀測當晚氣溫（°C）；dark 子目錄選取依據
+    # calib_date 不填：bias/dark master 檔名日期由 EXIF 自動讀取，避免手動記錯
     iso: 3200
     obs_lat_deg: 24.076856
     obs_lon_deg: 121.171665
@@ -79,11 +81,13 @@ obs_sessions:
     telescope: "Vixen R200SS"
     mount: "Takahashi EM-11 Temma3"
     camera: "Canon EOS 6D Mark II"
-    cal_label: "R200SS_6D2"
     targets: ["V1162Ori", "V1643Ori", "V1373Ori", "HHOri", "Gaia301"]
-    calibration_date: "20251220"
-    dark_temp_c: 3.7    # 或 null
-    light_temp_c: 4     # 或 null
+    camera_label: "6D2_ISO3200"          # bias/dark 來源資料夾
+    scope_label:  "R200SS_6D2"           # flat 來源資料夾
+    flat_date:    "20251221"             # flat master 檔名日期；對應 share/calibration/master/ 內的檔名
+    dark_temp_c: 3.7                     # 指定使用的 dark 溫度子目錄（°C）
+    light_temp_c: 4                      # 觀測當晚氣溫（°C）
+    # calib_date 不填：bias/dark master 檔名日期由 EXIF 自動讀取，避免手動記錯
     iso: 3200
     obs_lat_deg: 23.48119126688965
     obs_lon_deg: 120.8853953430719
@@ -170,7 +174,9 @@ targets:    # JIN親手核對，誰再動它誰死
 # -----------------------------------------------------------------------------
 calibration:
   tz_offset_hours: 8              # 台灣 UTC+8，用於 EXIF 時間轉換
-  chunk_size: 10                  # Remedian 每批幀數（RAM 控制）
+  median_chunk_size: 10           # Remedian 每批幀數（RAM 控制）；key 須與 Calibration.py 第 698 行一致
+  flat_bad_pixel_threshold: 0.3   # flat 歸一化後低於此值視為壞像素
+  save_masters: true              # 合成後是否寫出 master FITS 到 share/calibration/master/
 
 # -----------------------------------------------------------------------------
 # 7. 星圖解算 (Astrometry)
@@ -286,10 +292,15 @@ timing:
 # 12. 大氣消光修正 (Atmospheric Extinction)
 # -----------------------------------------------------------------------------
 extinction:
+  # 2026-03-27 暫停：差分測光中比較星已抵銷大部分消光，再扣可能重複，待驗證後再啟用
+  # coefficients:
+  #   R: 0.10
+  #   G: 0.13
+  #   B: 0.22
   coefficients:
-    R: 0.10
-    G: 0.13
-    B: 0.22
+    R: 0.0
+    G: 0.0
+    B: 0.0
   airmass_method: "young1994"
   max_airmass: 99
   alt_min_airmass: 99   # 暫時關閉 airmass 門檻

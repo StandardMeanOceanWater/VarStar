@@ -1,5 +1,5 @@
 # 變星測光管線 — 狀態快照
-**最後更新：2026-03-16 UTC+8 | 版號 v1.35 | 本檔永遠只有一份，直接覆蓋更新**
+**最後更新：2026-03-28 UTC+8 | 版號 v1.61 | 本檔永遠只有一份，直接覆蓋更新**
 
 ---
 
@@ -196,6 +196,75 @@
 ---
 
 ## 5. 修訂歷程
+
+---
+
+### 2026-03-28 UTC+8 (v1.61)
+
+**對話主題：校正幀基礎架構重建 — 三分立路徑 + 集中 Master 目錄**
+
+**背景**
+- 原架構：bias/dark/flat 全放同一個 `share/calibration/{date}_{scope}_{cam}/` 資料夾，flat 的實際拍攝日期與資料夾名稱脫鉤，pipeline 不知情。
+- 本次重建的核心：Bias/Dark/Flat 依賴條件不同（bias=相機、dark=相機+溫度、flat=相機+望遠鏡），各自有獨立來源路徑。
+
+**新資料夾結構**
+```
+share/calibration/
+├── bias/6D2_ISO3200/           ← raw CR2 bias 幀
+├── dark/6D2_ISO3200/3.7C/      ← raw CR2 dark 幀（按溫度分子目錄）
+├── dark/6D2_ISO3200/5.3C/
+├── flat/R200SS_6D2/20251220/   ← raw CR2 天光平場（12/20 凌晨）
+├── flat/R200SS_6D2/20260313/   ← raw FITS 天光平場（3/13 學校補拍）
+└── master/                     ← 所有合成 Master 集中存放
+    ├── master_bias_20251221_cr2.fits
+    ├── master_dark_20251221_3.7c_cr2.fits
+    ├── master_dark_20251221_5.3c_cr2.fits
+    ├── master_flat_20251221_cr2.fits
+    └── master_flat_20260313_fits.fits
+```
+
+**Master 命名規則**
+- 格式：`master_{type}_{拍攝日期}_{溫度（dark only）}_{原始格式}.fits`
+- 全小寫；日期從 EXIF 自動讀取，不由 YAML 手填（避免記錯）
+- flat 日期來自 YAML `flat_date`（選擇用哪批 flat 資料夾，必須手填）
+
+**`Calibration.py` 修改**
+1. `resolve_session_paths()`：
+   - 移除 `shared_cal` 單一路徑，改為 `bias_root`/`dark_root`/`flat_root` 三條獨立路徑
+   - YAML 新欄位：`camera_label`（bias/dark 子目錄）、`scope_label`（flat 子目錄）、`flat_date`
+   - 回傳 dict 改為 `masters_dir`（統一指向 `share/calibration/master/`）
+2. `_list_image_files()`：排除 `master_*` 前綴，防止已合成 master 被當 raw 幀
+3. `_has_images()`：同上，排除 `master_*`，防止 dark root 被誤判
+4. `_find_flat_dirs_by_format()`：排除 `master_*`，防止舊 master 觸發假 FITS 平場
+5. `_find_dark_dir()`：修正閉包變數遮蔽 bug（`for dark_root` → `for _dark_candidate`）
+6. `run_calibration()`：master 儲存路徑改用 `masters_dir`，命名對應新規則
+
+**`observation_config.yaml` 修改**
+1. 兩個 session 移除 `cal_label`/`calibration_date`，改為 `camera_label`/`scope_label`/`flat_date`
+2. `calib_date` 欄位**不填**，改由 EXIF 自動讀取（見 make_masters.py）
+3. `calibration` section：`chunk_size` 改正為 `median_chunk_size`（修正長期失效的 key）
+4. 補上 `flat_bad_pixel_threshold: 0.3` 和 `save_masters: true`（原在注解區，現在生效）
+5. `dark_temp_c`/`light_temp_c`/`flat_date` 加上用途說明注解
+6. ⚠️ Section 編號 9 重複（Bayer 拆色 / 比較星選取），不影響程式，待下次整理
+
+**新工具**
+- `tools/make_masters.py`：獨立 master 合成工具，不跑科學幀校正
+  - `calib_date`：YAML 有 `calib_date` 欄位用 YAML，否則從 EXIF 自動讀取
+  - 已存在的 master 自動 SKIP，不重複合成
+  - 支援 `--date YYYYMMDD` 只跑指定 session
+- `tools/g1g2_flatcheck.py`：三幀 G1/G2 比值空間分布診斷工具
+
+**本次確認的 ISO 情況**
+- bias/dark/flat（CR2）全部 ISO 3200（EXIF 驗證）
+- 11/22 科學幀（FITS/NINA）：GAIN=0（NINA DSLR driver 已知 bug，不記錄 ISO）
+- 12/20 科學幀（CR2）：ISO 3200 ✓
+- 3/13 FITS flat：GAIN=14（NINA 索引值），使用者確認實際為 ISO 3200
+
+**待辦（本次未完成）**
+- [ ] 科學幀 superflat 方案討論中（G1/G2 空間分布顯示 flat 校正後反而更糟）
+- [ ] bias/dark G1/G2 三條橫線確認（可能提示需要拍攝抖動）
+- [ ] 重新校正科學幀（使用新 master）
+- [ ] YAML Section 編號 9 重複修正
 
 ---
 

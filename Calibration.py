@@ -172,47 +172,45 @@ def resolve_session_paths(
     _group = _tgt_cfg.get("group", target)
     _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
     field_root = data_root / _date_fmt / _group
-    _cal_label = session.get("cal_label")
-    if not _cal_label:
-        _cal_label = f"{session.get('telescope', '')}_{session.get('camera', '')}"
-    _cal_label = f"{date}_{_cal_label}"
-    shared_cal = data_root / "share" / "calibration" / _cal_label
+    # ── 三分立校正路徑 ────────────────────────────────────────────────────────
+    # bias/dark 依相機+ISO；flat 依望遠鏡+相機+拍攝日期
+    _camera_label = str(session.get("camera_label", "6D2_ISO3200"))
+    _scope_label  = str(session.get("scope_label",  "R200SS_6D2"))
+    _flat_date    = str(session.get("flat_date", date))
+
+    cal_root  = data_root / "share" / "calibration"
+    bias_root = cal_root / "bias" / _camera_label
+    dark_root = cal_root / "dark" / _camera_label
+    flat_root = cal_root / "flat" / _scope_label / _flat_date
 
     light_temp_c: Optional[float] = session.get("light_temp_c")
     if light_temp_c is not None:
         light_temp_c = float(light_temp_c)
 
-    def _find_cal_dir(frame_type: str) -> Optional[Path]:
-        """搜尋 shared calibration 目錄。"""
-        shared = shared_cal / frame_type
-        if shared.exists() and any(shared.iterdir()):
-            return shared
+    def _find_bias_dir() -> Optional[Path]:
+        """bias 目錄：bias/{camera_label}/"""
+        if bias_root.exists() and _has_images(bias_root):
+            return bias_root
         return None
 
     def _find_flat_dirs_by_format() -> Dict[str, Path]:
         """
-        掃描所有 flat* 目錄，依檔案格式分類回傳。
-
-        Returns
-        -------
-        dict : {"cr2": Path, "fits": Path} 視實際存在而定。
+        flat 目錄：flat/{scope_label}/{flat_date}/
+        依檔案格式回傳 {"cr2": Path, "fits": Path}。
         """
         result: Dict[str, Path] = {}
-        if not shared_cal.exists():
+        if not flat_root.exists():
             return result
-        for d in sorted(shared_cal.iterdir()):
-            if not d.is_dir() or not d.name.lower().startswith("flat"):
-                continue
-            files = [f for f in d.iterdir() if f.is_file()]
-            if not files:
-                continue
-            has_cr2 = any(f.suffix.lower() == ".cr2" for f in files)
-            has_fits = any(f.suffix.lower() in (".fits", ".fit") for f in files)
-            # 每種格式只取第一個找到的目錄
-            if has_cr2 and "cr2" not in result:
-                result["cr2"] = d
-            if has_fits and "fits" not in result:
-                result["fits"] = d
+        files = [f for f in flat_root.iterdir()
+                 if f.is_file() and not f.name.lower().startswith("master_")]
+        if not files:
+            return result
+        has_cr2  = any(f.suffix.lower() == ".cr2" for f in files)
+        has_fits = any(f.suffix.lower() in (".fits", ".fit") for f in files)
+        if has_cr2:
+            result["cr2"]  = flat_root
+        if has_fits:
+            result["fits"] = flat_root
         return result
 
     def _parse_temp(subdir: Path) -> Optional[float]:
@@ -224,7 +222,9 @@ def resolve_session_paths(
         """判斷目錄內是否有支援格式的影像（不遞迴）。"""
         valid_exts = {".fit", ".fits", ".cr2"}
         return any(
-            f.is_file() and f.suffix.lower() in valid_exts
+            f.is_file()
+            and f.suffix.lower() in valid_exts
+            and not f.name.lower().startswith("master_")
             for f in directory.iterdir()
         )
 
@@ -235,25 +235,25 @@ def resolve_session_paths(
         resolved_dark_temp_c 優先取 session['dark_temp_c']；
         若未填，則從子目錄名稱解析。
         """
-        # 候選位置
+        # 候選位置：dark/{camera_label}/
         candidates = [
-            shared_cal / "dark",
+            dark_root,
         ]
         explicit_temp: Optional[float] = session.get("dark_temp_c")
         if explicit_temp is not None:
             explicit_temp = float(explicit_temp)
 
-        for dark_root in candidates:
-            if not dark_root.exists():
+        for _dark_candidate in candidates:
+            if not _dark_candidate.exists():
                 continue
 
             # ── 情況 1：根層直接有影像 ────────────────────────────────────
-            if _has_images(dark_root):
-                return dark_root, explicit_temp
+            if _has_images(_dark_candidate):
+                return _dark_candidate, explicit_temp
 
             # ── 情況 2：有子目錄 ──────────────────────────────────────────
             subdirs = sorted(
-                [d for d in dark_root.iterdir() if d.is_dir()],
+                [d for d in _dark_candidate.iterdir() if d.is_dir()],
                 key=lambda d: d.name,
             )
             if not subdirs:
@@ -306,14 +306,16 @@ def resolve_session_paths(
     dark_dir, resolved_dark_temp = _find_dark_dir()
 
     return {
-        "light_dir": field_root / "raw",
-        "dark_dir": dark_dir,
-        "flat_dir": _find_cal_dir("flat"),
+        "light_dir":           field_root / "raw",
+        "bias_dir":            _find_bias_dir(),
+        "dark_dir":            dark_dir,
+        "flat_dir":            flat_root if flat_root.exists() else None,
         "flat_dirs_by_format": _find_flat_dirs_by_format(),
-        "bias_dir": _find_cal_dir("bias"),
-        "calibrated_dir": field_root / "wcs",
-        "masters_dir": shared_cal / "masters",
-        "dark_temp_c": resolved_dark_temp,
+        "calibrated_dir":      field_root / "wcs",
+        # 集中 master 目錄（bias/dark master 日期由 run_calibration 從 EXIF 讀取）
+        "masters_dir":  cal_root / "master",
+        "flat_date":    _flat_date,
+        "dark_temp_c":  resolved_dark_temp,
         "light_temp_c": light_temp_c,
     }
 
@@ -495,6 +497,7 @@ def _list_image_files(directory: Optional[Path]) -> List[Path]:
         if f.is_file()
         and f.suffix.lower() in valid_exts
         and not f.name.startswith("._")
+        and not f.name.lower().startswith("master_")   # 排除已合成的 master 幀
     ]
     return sorted(set(files))
 
@@ -870,8 +873,10 @@ def run_calibration(config_path: str | Path) -> None:
         print(f"  校正模式（CAL_MODE）：{cal_mode}")
 
         # 合成 Master 幀
-        paths_ref["masters_dir"].mkdir(parents=True, exist_ok=True)
         save_masters = cfg.get("calibration", {}).get("save_masters", True)
+        _masters_dir = paths_ref["masters_dir"]
+        _calib_date  = paths_ref.get("calib_date", date)
+        _flat_date   = paths_ref.get("flat_date", date)
 
         master_bias: Optional[np.ndarray] = None
         if bias_files:
@@ -879,9 +884,10 @@ def run_calibration(config_path: str | Path) -> None:
                 bias_files, "Master Bias", chunk_size, tz_offset
             )
             if save_masters:
-                bias_out = paths_ref["masters_dir"] / f"master_bias_{date}.fits"
+                _masters_dir.mkdir(parents=True, exist_ok=True)
+                bias_out = _masters_dir / f"master_bias_{_calib_date}_cr2.fits"
                 fits.writeto(bias_out, master_bias, overwrite=True)
-                print(f"  [儲存] Master Bias → {bias_out.name}")
+                print(f"  [儲存] Master Bias → {bias_out}")
 
         master_dark: Optional[np.ndarray] = None
         if dark_files:
@@ -894,9 +900,11 @@ def run_calibration(config_path: str | Path) -> None:
                 else dark_raw
             )
             if save_masters:
-                dark_out = paths_ref["masters_dir"] / f"master_dark_{date}.fits"
+                _masters_dir.mkdir(parents=True, exist_ok=True)
+                _temp_tag = f"_{paths_ref['dark_temp_c']}c" if paths_ref.get("dark_temp_c") is not None else ""
+                dark_out = _masters_dir / f"master_dark_{_calib_date}{_temp_tag}_cr2.fits"
                 fits.writeto(dark_out, master_dark, overwrite=True)
-                print(f"  [儲存] Master Dark → {dark_out.name}")
+                print(f"  [儲存] Master Dark → {dark_out}")
 
         # 為每種格式建 Master Flat
         master_flat_by_fmt: Dict[str, np.ndarray] = {}
@@ -909,13 +917,10 @@ def run_calibration(config_path: str | Path) -> None:
             del flat_raw
             gc.collect()
             if save_masters:
-                _suffix = "" if fmt == "cr2" else f"_{fmt}"
-                flat_out = (
-                    paths_ref["masters_dir"]
-                    / f"master_flat_norm_{date}{_suffix}.fits"
-                )
+                _masters_dir.mkdir(parents=True, exist_ok=True)
+                flat_out = _masters_dir / f"master_flat_{_flat_date}_{fmt}.fits"
                 fits.writeto(flat_out, mf, overwrite=True)
-                print(f"  [儲存] Master Flat ({fmt.upper()}) → {flat_out.name}")
+                print(f"  [儲存] Master Flat ({fmt.upper()}) → {flat_out}")
 
         # ── 逐 target 校正 ───────────────────────────────────────────────────
         for target in targets_list:
