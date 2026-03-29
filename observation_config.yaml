@@ -1,6 +1,6 @@
 # ============================================================
 # 變星測光管線設定檔  Variable Star Pipeline Configuration
-# 版本：v1.61 |  日期：2026-03-28
+# 版本：v1.62 |  日期：2026-03-29
 # 修改這個檔案即可切換目標、路徑、儀器參數
 #
 # ⚠️ 修訂規則（防止修改互相覆蓋）：
@@ -85,7 +85,7 @@ obs_sessions:
     camera_label: "6D2_ISO3200"          # bias/dark 來源資料夾
     scope_label:  "R200SS_6D2"           # flat 來源資料夾
     flat_date:    "20251221"             # flat master 檔名日期；對應 share/calibration/flat/.../資料夾名稱
-    dark_temp_c: 3.7                     # 指定使用的 dark 溫度子目錄（°C）
+    dark_temp_c: 5.3                     # 3.7°C dark 為 1/30s（近似 bias），改用 5.3°C 30s dark
     light_temp_c: 4                      # 觀測當晚氣溫（°C）
     # calib_date 不填：bias/dark master 檔名日期由 EXIF 自動讀取，避免手動記錯
     iso: 3200

@@ -195,21 +195,18 @@ def resolve_session_paths(
 
     def _find_flat_dirs_by_format() -> Dict[str, Path]:
         """
-        flat 目錄：flat/{scope_label}/{flat_date}/
-        依檔案格式回傳 {"cr2": Path, "fits": Path}。
+        flat raw 目錄（僅供 master 不存在時重建用）。
+        flat/{scope_label}/{flat_date}/ → 偵測格式回傳。
+        主要路徑已改為直接從 master 目錄選取，此函式為 fallback。
         """
         result: Dict[str, Path] = {}
         if not flat_root.exists():
             return result
         files = [f for f in flat_root.iterdir()
                  if f.is_file() and not f.name.lower().startswith("master_")]
-        if not files:
-            return result
-        has_cr2  = any(f.suffix.lower() == ".cr2" for f in files)
-        has_fits = any(f.suffix.lower() in (".fits", ".fit") for f in files)
-        if has_cr2:
-            result["cr2"]  = flat_root
-        if has_fits:
+        if any(f.suffix.lower() == ".cr2" for f in files):
+            result["cr2"] = flat_root
+        if any(f.suffix.lower() in (".fits", ".fit") for f in files):
             result["fits"] = flat_root
         return result
 
@@ -470,6 +467,28 @@ def read_raw_image(
             # 移除 BZERO / BSCALE 避免重複縮放
             for key in ("BZERO", "BSCALE"):
                 header.remove(key, ignore_missing=True)
+
+            # ── EXPTIME：先從標頭讀，失敗時從 NINA 檔名解析 ────────────────
+            # NINA 已知 bug：某段時間 EXPTIME 寫錯或遺失（含錯誤座標問題）
+            # NINA 檔名格式：{date}_{time}__{exptime}_{gain}s_{idx}.fits
+            _exptime_val: Optional[float] = None
+            for _ekey in ("EXPTIME", "EXPOSURE", "EXP_TIME"):
+                try:
+                    _v = float(header.get(_ekey, 0) or 0)
+                    if _v > 0:
+                        _exptime_val = _v
+                        break
+                except (TypeError, ValueError):
+                    pass
+            if _exptime_val is None or _exptime_val <= 0:
+                import re as _re
+                _m = _re.search(r'__(\d+\.?\d+)_', filepath.stem)
+                if _m:
+                    _exptime_val = float(_m.group(1))
+                    print(f"  [WARN] {filepath.name}: EXPTIME 標頭無效，"
+                          f"從檔名解析 = {_exptime_val}s")
+            if _exptime_val is not None and _exptime_val > 0:
+                header["EXPTIME"] = (_exptime_val, "[s] Exposure time")
     else:
         raise ValueError(f"不支援的格式：{filepath.suffix}")
 
@@ -597,6 +616,8 @@ def normalize_flat(
     bad_pixel_threshold: float = 0.3,
     sigma_clip_iters: int = 3,
     sigma_clip_sigma: float = 3.0,
+    dark_rate: Optional[np.ndarray] = None,
+    t_flat: Optional[float] = None,
 ) -> np.ndarray:
     """
     平場歸一化，含 sigma clipping 和壞像素保護。
@@ -628,6 +649,9 @@ def normalize_flat(
     flat = flat_raw.copy().astype(np.float64)
     if master_bias is not None:
         flat -= master_bias.astype(np.float64)
+    # 公式 4：Flat_pure = Flat − Bias − dark_rate × t_flat
+    if dark_rate is not None and t_flat is not None and t_flat > 0:
+        flat -= dark_rate.astype(np.float64) * t_flat
 
     # Sigma clipping（Gemini G-2 建議）
     mask = np.ones(flat.shape, dtype=bool)
@@ -914,48 +938,102 @@ def run_calibration(config_path: str | Path) -> None:
                 print(f"  [儲存] Master Bias → {bias_out}")
 
         master_dark: Optional[np.ndarray] = None
+        t_dark: Optional[float] = None          # 暗場曝光時間（秒），用於 dark_rate 縮放
         _dark_temp_c = paths_ref.get("dark_temp_c")
         _dark_temp_tag = f"{_dark_temp_c:.1f}c" if _dark_temp_c is not None else None
-        _dark_cached = (
-            _glob_master(f"master_dark_*_{_dark_temp_tag}_cr2.fits")
-            if _dark_temp_tag else _glob_master("master_dark_*_cr2.fits")
+
+        # 從 master 目錄載入（需同時讀 EXPTIME header 以計算 dark_rate）
+        _dark_master_pattern = (
+            f"master_dark_*_{_dark_temp_tag}_cr2.fits"
+            if _dark_temp_tag else "master_dark_*_cr2.fits"
         )
-        if _dark_cached is not None:
-            master_dark = _dark_cached
+        _dark_candidates = sorted(_masters_dir.glob(_dark_master_pattern)) \
+                           if _masters_dir.exists() else []
+        if _dark_candidates:
+            _dark_path = _dark_candidates[-1]
+            print(f"  [載入] {_dark_path.name}")
+            master_dark = fits.getdata(str(_dark_path)).astype(np.float32)
+            try:
+                t_dark = float(fits.getheader(str(_dark_path)).get("EXPTIME") or 0) or None
+            except Exception:
+                t_dark = None
         elif dark_files:
-            dark_raw = create_master(
-                dark_files, "Master Dark", chunk_size, tz_offset
-            )
+            # 從 raw 重建
+            t_dark_raw = None
+            try:
+                _dk0, _dk0_hdr = read_raw_image(dark_files[0], tz_offset_hours=tz_offset)
+                t_dark_raw = float(_dk0_hdr.get("EXPTIME") or 0) or None
+            except Exception:
+                pass
+            t_dark = t_dark_raw
+            dark_raw = create_master(dark_files, "Master Dark", chunk_size, tz_offset)
             master_dark = (
-                dark_raw - master_bias
-                if master_bias is not None
-                else dark_raw
+                dark_raw - master_bias if master_bias is not None else dark_raw
             )
             if save_masters:
                 _masters_dir.mkdir(parents=True, exist_ok=True)
                 _temp_tag = f"_{_dark_temp_tag}" if _dark_temp_tag else ""
                 dark_out = _masters_dir / f"master_dark_{_calib_date}{_temp_tag}_cr2.fits"
-                fits.writeto(dark_out, master_dark, overwrite=True)
-                print(f"  [儲存] Master Dark → {dark_out}")
+                _dk_hdr = fits.Header()
+                if t_dark is not None:
+                    _dk_hdr["EXPTIME"] = (t_dark, "[s] Dark frame exposure time")
+                fits.writeto(dark_out, master_dark, header=_dk_hdr, overwrite=True)
+                print(f"  [儲存] Master Dark → {dark_out}  (t_dark={t_dark}s)")
 
-        # 為每種格式建 Master Flat
+        # dark_rate：bias 已扣除的暗場 ÷ 曝光時間 = 每秒暗電流（DN/s）
+        dark_rate: Optional[np.ndarray] = None
+        if master_dark is not None and t_dark and t_dark > 0:
+            dark_rate = master_dark.astype(np.float32) / t_dark
+            print(f"  dark_rate 計算完成（t_dark={t_dark}s）")
+        elif master_dark is not None:
+            print("  [WARN] t_dark 未知，dark 不縮放（假設 t_dark = t_light）")
+
+        # 為每種格式載入 Master Flat
+        # 主路徑：直接從 master 目錄 glob master_flat_*_{fmt}.fits，選最近日期
+        # fallback：master 不存在時從 raw 重建
         master_flat_by_fmt: Dict[str, np.ndarray] = {}
-        for fmt in (list(flat_files_by_fmt.keys()) or ["cr2", "fits"]):
-            _flat_cached = _glob_master(f"master_flat_{_flat_date}_{fmt}.fits")
-            if _flat_cached is not None:
-                master_flat_by_fmt[fmt] = _flat_cached
+        _session_date_int = int(date)
+
+        def _parse_master_flat_date(p: Path) -> int:
+            """從 master_flat_{date}_{fmt}.fits 解析日期整數，解析失敗回傳 0。"""
+            try:
+                return int(p.stem.split("_")[2])
+            except (IndexError, ValueError):
+                return 0
+
+        for fmt in ["cr2", "fits"]:
+            # 從 master 目錄選最近日期的 master flat
+            candidates = sorted(_masters_dir.glob(f"master_flat_*_{fmt}.fits")) \
+                         if _masters_dir.exists() else []
+            if candidates:
+                chosen = min(candidates,
+                             key=lambda p: abs(_parse_master_flat_date(p) - _session_date_int))
+                print(f"  [載入 Flat/{fmt.upper()}] {chosen.name}")
+                master_flat_by_fmt[fmt] = fits.getdata(str(chosen)).astype(np.float32)
             elif fmt in flat_files_by_fmt:
+                # master 不存在 → 從 raw 重建並儲存
+                # 讀 t_flat（公式 4 需要）
+                _t_flat: Optional[float] = None
+                try:
+                    _, _fhdr = read_raw_image(
+                        flat_files_by_fmt[fmt][0], tz_offset_hours=tz_offset
+                    )
+                    _t_flat = float(_fhdr.get("EXPTIME") or 0) or None
+                except Exception:
+                    pass
                 flat_raw = create_master(
                     flat_files_by_fmt[fmt],
                     f"Master Flat ({fmt.upper()})", chunk_size, tz_offset
                 )
-                mf = normalize_flat(flat_raw, master_bias, bad_pixel_thr)
+                mf = normalize_flat(flat_raw, master_bias, bad_pixel_thr,
+                                    dark_rate=dark_rate, t_flat=_t_flat)
                 master_flat_by_fmt[fmt] = mf
                 del flat_raw
                 gc.collect()
                 if save_masters:
                     _masters_dir.mkdir(parents=True, exist_ok=True)
-                    flat_out = _masters_dir / f"master_flat_{_flat_date}_{fmt}.fits"
+                    _raw_flat_date = flat_dirs_by_fmt.get(fmt, Path(_flat_date)).name
+                    flat_out = _masters_dir / f"master_flat_{_raw_flat_date}_{fmt}.fits"
                     fits.writeto(flat_out, mf, overwrite=True)
                     print(f"  [儲存] Master Flat ({fmt.upper()}) → {flat_out}")
 
@@ -1027,10 +1105,20 @@ def run_calibration(config_path: str | Path) -> None:
                                 f"     建議：補拍與 Light 相同格式的 Flat。"
                             )
 
-                    # ── 天文校正公式 ────────────────────────────────────────
+                    # ── 天文校正公式（公式 7）────────────────────────────────
+                    # Calibrated = (Light_linear − Bias − dark_rate × t_light)
+                    #              / master_Flat_norm
+                    # Light_linear = Light − BL（已由 rawpy 完成）
                     cal = light.copy()
 
-                    if master_dark is not None:
+                    _t_light = float(header.get("EXPTIME") or 0)
+                    if dark_rate is not None and _t_light > 0:
+                        # 公式 3：Dark_scaled = dark_rate × t_light
+                        cal -= master_bias.astype(np.float32) \
+                               if master_bias is not None else 0
+                        cal -= dark_rate * _t_light
+                    elif master_dark is not None:
+                        # t_dark 未知：直接扣整幀暗場（假設 t_dark = t_light）
                         cal -= master_dark
                     elif master_bias is not None:
                         cal -= master_bias
