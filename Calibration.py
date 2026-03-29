@@ -272,24 +272,34 @@ def resolve_session_paths(
                     unparsed.append(sd)
 
             if parsed:
-                ref_temp = light_temp_c  # 以觀測溫度為基準
-                if ref_temp is not None:
-                    # 選最接近觀測溫度的 dark
+                if explicit_temp is not None:
+                    # dark_temp_c 明確指定 → 直接選最接近該值的目錄
                     chosen_temp, chosen_dir = min(
-                        parsed, key=lambda x: abs(x[0] - ref_temp)
+                        parsed, key=lambda x: abs(x[0] - explicit_temp)
+                    )
+                    if abs(chosen_temp - explicit_temp) > 0.5:
+                        print(
+                            f"  [WARN] dark_temp_c={explicit_temp}°C，"
+                            f"最近子目錄為 {chosen_dir.name}（差 "
+                            f"{abs(chosen_temp - explicit_temp):.1f}°C）"
+                        )
+                elif light_temp_c is not None:
+                    # 自動模式：選最接近觀測氣溫的 dark
+                    chosen_temp, chosen_dir = min(
+                        parsed, key=lambda x: abs(x[0] - light_temp_c)
+                    )
+                    print(
+                        f"  [INFO] dark 自動選溫：light_temp={light_temp_c}°C "
+                        f"→ {chosen_dir.name}"
                     )
                 else:
-                    # 無觀測溫度：選最低溫（dark current 最小）
+                    # 無任何溫度資訊：選最低溫（dark current 最小）
                     chosen_temp, chosen_dir = min(parsed, key=lambda x: x[0])
                     print(
-                        f"  [WARN] session 未填 light_temp_c，"
+                        f"  [WARN] session 未填 dark_temp_c / light_temp_c，"
                         f"dark 子目錄自動選最低溫：{chosen_dir.name}"
                     )
-                resolved_temp = (
-                    explicit_temp
-                    if explicit_temp is not None
-                    else chosen_temp
-                )
+                resolved_temp = chosen_temp
                 return chosen_dir, resolved_temp
 
             # 全部無法解析溫度
@@ -872,14 +882,28 @@ def run_calibration(config_path: str | Path) -> None:
         )
         print(f"  校正模式（CAL_MODE）：{cal_mode}")
 
-        # 合成 Master 幀
+        # 合成 Master 幀（有快取就直接載入，否則從 raw 重建）
         save_masters = cfg.get("calibration", {}).get("save_masters", True)
         _masters_dir = paths_ref["masters_dir"]
         _calib_date  = paths_ref.get("calib_date", date)
         _flat_date   = paths_ref.get("flat_date", date)
 
+        def _glob_master(pattern: str) -> Optional[np.ndarray]:
+            """在 masters_dir 以 glob 搜尋，找到則載入最新的一個，否則回傳 None。"""
+            if not _masters_dir.exists():
+                return None
+            matches = sorted(_masters_dir.glob(pattern))
+            if not matches:
+                return None
+            chosen = matches[-1]
+            print(f"  [載入] {chosen.name}")
+            return fits.getdata(str(chosen)).astype(np.float32)
+
         master_bias: Optional[np.ndarray] = None
-        if bias_files:
+        _bias_cached = _glob_master("master_bias_*_cr2.fits")
+        if _bias_cached is not None:
+            master_bias = _bias_cached
+        elif bias_files:
             master_bias = create_master(
                 bias_files, "Master Bias", chunk_size, tz_offset
             )
@@ -890,7 +914,15 @@ def run_calibration(config_path: str | Path) -> None:
                 print(f"  [儲存] Master Bias → {bias_out}")
 
         master_dark: Optional[np.ndarray] = None
-        if dark_files:
+        _dark_temp_c = paths_ref.get("dark_temp_c")
+        _dark_temp_tag = f"{_dark_temp_c:.1f}c" if _dark_temp_c is not None else None
+        _dark_cached = (
+            _glob_master(f"master_dark_*_{_dark_temp_tag}_cr2.fits")
+            if _dark_temp_tag else _glob_master("master_dark_*_cr2.fits")
+        )
+        if _dark_cached is not None:
+            master_dark = _dark_cached
+        elif dark_files:
             dark_raw = create_master(
                 dark_files, "Master Dark", chunk_size, tz_offset
             )
@@ -901,26 +933,31 @@ def run_calibration(config_path: str | Path) -> None:
             )
             if save_masters:
                 _masters_dir.mkdir(parents=True, exist_ok=True)
-                _temp_tag = f"_{paths_ref['dark_temp_c']}c" if paths_ref.get("dark_temp_c") is not None else ""
+                _temp_tag = f"_{_dark_temp_tag}" if _dark_temp_tag else ""
                 dark_out = _masters_dir / f"master_dark_{_calib_date}{_temp_tag}_cr2.fits"
                 fits.writeto(dark_out, master_dark, overwrite=True)
                 print(f"  [儲存] Master Dark → {dark_out}")
 
         # 為每種格式建 Master Flat
         master_flat_by_fmt: Dict[str, np.ndarray] = {}
-        for fmt, flist in flat_files_by_fmt.items():
-            flat_raw = create_master(
-                flist, f"Master Flat ({fmt.upper()})", chunk_size, tz_offset
-            )
-            mf = normalize_flat(flat_raw, master_bias, bad_pixel_thr)
-            master_flat_by_fmt[fmt] = mf
-            del flat_raw
-            gc.collect()
-            if save_masters:
-                _masters_dir.mkdir(parents=True, exist_ok=True)
-                flat_out = _masters_dir / f"master_flat_{_flat_date}_{fmt}.fits"
-                fits.writeto(flat_out, mf, overwrite=True)
-                print(f"  [儲存] Master Flat ({fmt.upper()}) → {flat_out}")
+        for fmt in (list(flat_files_by_fmt.keys()) or ["cr2", "fits"]):
+            _flat_cached = _glob_master(f"master_flat_{_flat_date}_{fmt}.fits")
+            if _flat_cached is not None:
+                master_flat_by_fmt[fmt] = _flat_cached
+            elif fmt in flat_files_by_fmt:
+                flat_raw = create_master(
+                    flat_files_by_fmt[fmt],
+                    f"Master Flat ({fmt.upper()})", chunk_size, tz_offset
+                )
+                mf = normalize_flat(flat_raw, master_bias, bad_pixel_thr)
+                master_flat_by_fmt[fmt] = mf
+                del flat_raw
+                gc.collect()
+                if save_masters:
+                    _masters_dir.mkdir(parents=True, exist_ok=True)
+                    flat_out = _masters_dir / f"master_flat_{_flat_date}_{fmt}.fits"
+                    fits.writeto(flat_out, mf, overwrite=True)
+                    print(f"  [儲存] Master Flat ({fmt.upper()}) → {flat_out}")
 
         # ── 逐 target 校正 ───────────────────────────────────────────────────
         for target in targets_list:
