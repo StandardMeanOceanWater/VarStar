@@ -711,7 +711,7 @@ def determine_cal_mode(
 # 主校正管線
 # =============================================================================
 
-def run_calibration(config_path: str | Path) -> None:
+def run_calibration(config_path: str | Path, *, no_flat: bool = False) -> None:
     """
     主校正管線入口。
 
@@ -735,8 +735,9 @@ def run_calibration(config_path: str | Path) -> None:
     if not sessions:
         raise ValueError("observation_config.yaml 裡沒有 obs_sessions。")
 
+    _mode_tag = " [NO-FLAT: Bias+Dark only]" if no_flat else ""
     print("\n" + "=" * 60)
-    print("  變星測光管線 — 影像校正模組  Calibration.py")
+    print(f"  變星測光管線 — 影像校正模組  Calibration.py{_mode_tag}")
     print("=" * 60)
 
     for session in sessions:
@@ -994,6 +995,10 @@ def run_calibration(config_path: str | Path) -> None:
         master_flat_by_fmt: Dict[str, np.ndarray] = {}
         _session_date_int = int(date)
 
+        if no_flat:
+            print("  [NO-FLAT] 跳過 Flat 載入，僅做 Bias+Dark 校正")
+            master_flat_by_fmt = {}
+
         def _parse_master_flat_date(p: Path) -> int:
             """從 master_flat_{date}_{fmt}.fits 解析日期整數，解析失敗回傳 0。"""
             try:
@@ -1001,7 +1006,7 @@ def run_calibration(config_path: str | Path) -> None:
             except (IndexError, ValueError):
                 return 0
 
-        for fmt in ["cr2", "fits"]:
+        for fmt in ([] if no_flat else ["cr2", "fits"]):
             # 從 master 目錄選最近日期的 master flat
             candidates = sorted(_masters_dir.glob(f"master_flat_*_{fmt}.fits")) \
                          if _masters_dir.exists() else []
@@ -1060,8 +1065,12 @@ def run_calibration(config_path: str | Path) -> None:
             print(f"  Dark   : {len(dark_files)} 幀  →  {paths_ref['dark_dir']}")
             print(f"  Bias   : {len(bias_files)} 幀  →  {paths_ref['bias_dir']}")
 
-            paths["calibrated_dir"].mkdir(parents=True, exist_ok=True)
-            out_dir = paths["calibrated_dir"]
+            if no_flat:
+                _cal_dir = paths["calibrated_dir"].parent / "wcs_darkonly"
+            else:
+                _cal_dir = paths["calibrated_dir"]
+            _cal_dir.mkdir(parents=True, exist_ok=True)
+            out_dir = _cal_dir
 
             print(f"\n[校正] 開始逐幀校正 {len(light_files)} 張 Light 幀…")
             success = 0

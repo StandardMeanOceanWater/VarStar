@@ -115,7 +115,7 @@ _STEP_DEFAULTS: list[str] = [s[0] for s in _STEPS if s[2]]
 # 步驟執行函式
 # =============================================================================
 
-def _run_calibration(config_path: Path) -> bool:
+def _run_calibration(config_path: Path, no_flat: bool = False) -> bool:
     """
     呼叫 Calibration.run_calibration()。
 
@@ -126,7 +126,7 @@ def _run_calibration(config_path: Path) -> bool:
     """
     try:
         from Calibration import run_calibration
-        run_calibration(config_path)
+        run_calibration(config_path, no_flat=no_flat)
         return True
     except ImportError as exc:
         print(
@@ -140,11 +140,13 @@ def _run_calibration(config_path: Path) -> bool:
         return False
 
 
-def _run_plate_solve(config_path: Path, auto_yes: bool = False) -> bool:
+def _run_plate_solve(config_path: Path, auto_yes: bool = False, raw_mode: bool = False,
+                     src_dir: str = "", wcs_out_dir: str = "") -> bool:
     """呼叫 plate_solve.run_plate_solve()，完成後自動執行 VSX 查詢。"""
     try:
         from plate_solve import run_plate_solve
-        run_plate_solve(config_path)
+        run_plate_solve(config_path, raw_mode=raw_mode,
+                        src_dir=src_dir, wcs_out_dir=wcs_out_dir)
     except ImportError as exc:
         print(
             f"[ERROR] 無法匯入 plate_solve.py：{exc}\n"
@@ -369,11 +371,13 @@ def _vsx_append_targets(
     print(f"[VSX] {len(new_blocks)} 筆目標已寫入 {config_path.name}（標注 auto_added）")
 
 
-def _run_debayer(config_path: Path) -> bool:
+def _run_debayer(config_path: Path, raw_mode: bool = False,
+                 wcs_subdir: str = "", splits_subdir: str = "") -> bool:
     """呼叫 DeBayer_RGGB.run_debayer()。"""
     try:
         from DeBayer_RGGB import run_debayer
-        run_debayer(config_path)
+        run_debayer(config_path, raw_mode=raw_mode,
+                    wcs_subdir=wcs_subdir, splits_subdir=splits_subdir)
         return True
     except ImportError as exc:
         print(
@@ -679,6 +683,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="auto_yes",
         help="VSX 自動新增目標時跳過確認提示（預設：互動確認）。",
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help=(
+            "跳過校正，直接用 raw FITS 解星/拆色/測光。"
+            "中間產物寫入 wcs_raw/、splits_raw/，不影響校正版資料。"
+        ),
+    )
+    parser.add_argument(
+        "--no-flat",
+        action="store_true",
+        dest="no_flat",
+        help=(
+            "只做 Bias+Dark 校正（跳過 Flat），用於測試校正幀品質。"
+            "中間產物寫入 wcs_darkonly/、splits_darkonly/。"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -756,8 +777,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 執行 ──────────────────────────────────────────────────────────────────
     sep = "=" * 60
+    if args.raw:
+        _raw_tag = "  [RAW MODE — 跳過校正，直接用原始影像]"
+    elif args.no_flat:
+        _raw_tag = "  [NO-FLAT — Bias+Dark only，跳過 Flat]"
+    else:
+        _raw_tag = ""
     print(f"\n{sep}")
-    print("  變星測光管線  run_pipeline.py")
+    print(f"  變星測光管線  run_pipeline.py{_raw_tag}")
     print(f"  設定檔  ：{config_path}")
     print(f"  執行步驟：{', '.join(steps_to_run)}")
     if "period_analysis" in steps_to_run:
@@ -778,7 +805,23 @@ def main(argv: list[str] | None = None) -> int:
         step_start = time.monotonic()
         runner = _STEP_RUNNERS[step]
         if step == "plate_solve":
-            ok: bool = runner(config_path, auto_yes=args.auto_yes)
+            if args.no_flat:
+                ok: bool = runner(config_path, auto_yes=args.auto_yes,
+                                  src_dir="wcs_darkonly", wcs_out_dir="wcs_darkonly")
+            else:
+                ok: bool = runner(config_path, auto_yes=args.auto_yes, raw_mode=args.raw)
+        elif step == "calibration":
+            if args.raw:
+                print("  [SKIP] --raw 模式：跳過校正步驟。")
+                ok = True
+            else:
+                ok = runner(config_path, no_flat=args.no_flat)
+        elif step in ("debayer",):
+            if args.no_flat:
+                ok: bool = runner(config_path, wcs_subdir="wcs_darkonly",
+                                  splits_subdir="splits_darkonly")
+            else:
+                ok: bool = runner(config_path, raw_mode=args.raw)
         else:
             ok: bool = runner(config_path)
         elapsed = time.monotonic() - step_start

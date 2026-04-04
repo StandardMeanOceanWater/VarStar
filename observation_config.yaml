@@ -17,7 +17,7 @@
 # -----------------------------------------------------------------------------
 paths:
   local:
-    project_root: "D:/VarStar"
+    project_root: "E:/VarStar"
   colab:
     project_root: "/content/drive/Shareddrives/VarStar"
 
@@ -225,7 +225,7 @@ comparison_stars:
   search_radius_arcmin: 40.0
   min_stars: 3
   # max_stars: 15                    # 2026-03-22 前：15 顆但從未生效
-  max_stars: 20                      # 100 導致 64 暗星拖垮 ZP fit（slope 0.1）；20 顆近目標亮度即可
+  max_stars: 0                       # 0=不截斷，用全部通過篩選的星做回歸（星等範圍由 comp_mag_bright/faint 控制）
   min_separation_arcsec: 10.0
   # comp_mag_bright: 1.5      # 2026-03-22 前：對稱 ±1.5 等
   # comp_mag_faint:  1.5
@@ -249,6 +249,7 @@ comparison_stars:
 # 10. 孔徑測光 (Aperture Photometry)
 # -----------------------------------------------------------------------------
 photometry:
+  alt_min_airmass: 99     # 暫時關閉 airmass 門檻（設 99 = 不截斷）
   channels: ["R", "G1", "B"]
   use_g2_as_independent: false
   robust_regression_sigma: 3.0
@@ -302,8 +303,8 @@ extinction:
     G: 0.0
     B: 0.0
   airmass_method: "young1994"
-  max_airmass: 99
-  alt_min_airmass: 99   # 暫時關閉 airmass 門檻
+  max_airmass: 99       # (legacy, 不再使用)
+  # alt_min_airmass 已移至 photometry: 區段
 
 # -----------------------------------------------------------------------------
 # 13. 週期分析 (Period Analysis)

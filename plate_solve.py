@@ -47,7 +47,7 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS  # noqa: F401  (保留供呼叫端 import)
 
-from Calibration import load_config
+from Calibration import load_config, read_raw_image
 
 
 # =============================================================================
@@ -474,7 +474,8 @@ def _run_astrometry_net(
 # 主解算管線
 # =============================================================================
 
-def run_plate_solve(config_path: str | Path) -> None:
+def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
+                    src_dir: str = "", wcs_out_dir: str = "") -> None:
     """
     主星圖解算管線入口。
 
@@ -497,8 +498,9 @@ def run_plate_solve(config_path: str | Path) -> None:
     astap_cfg = astro_cfg.get("astap", {})
     anet_cfg = astro_cfg.get("astrometry_net", {})
 
+    _mode_tag = " [RAW MODE]" if raw_mode else ""
     print("\n" + "=" * 60)
-    print(f"  變星測光管線 — 星圖解算模組  plate_solve.py  [{backend}]")
+    print(f"  變星測光管線 — 星圖解算模組  plate_solve.py  [{backend}]{_mode_tag}")
     print("=" * 60)
 
     sessions = cfg.get("obs_sessions", [])
@@ -520,52 +522,94 @@ def run_plate_solve(config_path: str | Path) -> None:
             _group = _tgt_cfg.get("group", target)
             _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             field_root = data_root / _date_fmt / _group
-            cal_dir = field_root / "wcs"
-            wcs_dir = cal_dir  # WCS output to same directory
+            if src_dir:
+                cal_dir = field_root / src_dir
+                wcs_dir = field_root / (wcs_out_dir or src_dir)
+            elif raw_mode:
+                cal_dir = field_root / "raw"
+                wcs_dir = field_root / "wcs_raw"
+            else:
+                cal_dir = field_root / "wcs"
+                wcs_dir = cal_dir  # WCS output to same directory
             wcs_dir.mkdir(parents=True, exist_ok=True)
 
+            # ── 收集 FITS + CR2 檔案清單 ─────────────────────────────
             fits_files = sorted(
                 f for f in cal_dir.glob("*.fits")
                 if f.is_file() and "wcs" not in f.stem.lower()
             )
+            cr2_files = sorted(
+                f for f in cal_dir.iterdir()
+                if f.is_file() and f.suffix.lower() == ".cr2"
+                and not (wcs_dir / (f.stem + "_wcs.fits")).exists()
+            )
+            if cr2_files:
+                print(f"  [CR2] 偵測到 {len(cr2_files)} 個 CR2 待解算")
 
-            if not fits_files:
-                print(f"[SKIP] {target}/{date}：calibrated/ 目錄裡找不到 FITS。")
-                continue
+            # 合併 FITS 和 CR2（CR2 需逐檔暫存轉換）
+            all_sources = [(f, False) for f in fits_files] + \
+                          [(f, True) for f in cr2_files]
+            total_count = len(fits_files) + len(cr2_files) + \
+                sum(1 for f in fits_files
+                    if (wcs_dir / (f.stem + "_wcs.fits")).exists())
 
-            # 取得 hint 座標（修正 NINA 標頭 RA/DEC 不可靠問題）
             ra_hint, spd_hint = _get_hint_for_target(cfg, target)
             if ra_hint is not None:
                 print(
-                    f"\n[Session] {target} / {date}  ({len(fits_files)} 幀)"
+                    f"\n[Session] {target} / {date}  ({total_count} 幀)"
                     f"  hint RA={ra_hint:.4f}h SPD={spd_hint:.4f}°"
                 )
             else:
                 print(
-                    f"\n[Session] {target} / {date}  ({len(fits_files)} 幀)"
+                    f"\n[Session] {target} / {date}  ({total_count} 幀)"
                     f"  hint 未設定（yaml 無目標座標）"
                 )
 
+            if not all_sources and total_count == 0:
+                _src = "raw/" if raw_mode else "wcs/"
+                print(f"[SKIP] {target}/{date}：{_src} 目錄裡找不到 FITS/CR2。")
+                continue
+
             success = failed = skipped = 0
-            for fits_path in fits_files:
-                out_path = wcs_dir / (fits_path.stem + "_wcs.fits")
+            for src_path, is_cr2 in all_sources:
+                out_path = wcs_dir / (src_path.stem + "_wcs.fits")
 
                 if out_path.exists():
                     skipped += 1
                     continue
 
-                print(f"  解算：{fits_path.name} … ", end="", flush=True)
+                # CR2：逐檔轉暫存 FITS，解算後刪除
+                tmp_fits = None
+                if is_cr2:
+                    try:
+                        data, hdr = read_raw_image(src_path)
+                        tmp_fits = cal_dir / (src_path.stem + "_tmp.fits")
+                        fits.writeto(tmp_fits, data, header=hdr,
+                                     overwrite=True)
+                        solve_path = tmp_fits
+                    except Exception as exc:
+                        print(f"  [WARN] CR2→FITS 失敗：{src_path.name} — {exc}")
+                        failed += 1
+                        continue
+                else:
+                    solve_path = src_path
+
+                print(f"  解算：{src_path.name} … ", end="", flush=True)
 
                 if backend == "astap":
                     ok = _run_astap(
-                        fits_path,
+                        solve_path,
                         out_path,
                         astap_cfg,
                         ra_hint_h=ra_hint,
                         spd_hint_deg=spd_hint,
                     )
                 else:
-                    ok = _run_astrometry_net(fits_path, out_path, anet_cfg)
+                    ok = _run_astrometry_net(solve_path, out_path, anet_cfg)
+
+                # 清理暫存
+                if tmp_fits is not None and tmp_fits.exists():
+                    tmp_fits.unlink()
 
                 if ok:
                     print("OK")
@@ -573,6 +617,14 @@ def run_plate_solve(config_path: str | Path) -> None:
                 else:
                     print("FAIL")
                     failed += 1
+
+            # 統計已跳過的 WCS 檔案
+            skipped = sum(1 for f in cal_dir.iterdir()
+                         if f.suffix.lower() in (".fits", ".cr2")
+                         and "wcs" not in f.stem.lower()
+                         and "_tmp" not in f.stem
+                         and (wcs_dir / (f.stem + "_wcs.fits")).exists()
+                         ) - success
 
             print(
                 f"\n[完成] {target}/{date}：成功 {success}，失敗 {failed}，"

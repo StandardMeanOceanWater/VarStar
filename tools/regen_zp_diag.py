@@ -47,7 +47,7 @@ def regen_one(target, date, out_tag, channels, cfg_yaml):
     tgt_dir  = DATA_ROOT / target
     out_dir  = tgt_dir / out_dir_name
     cat_dir  = out_dir / "catalogs"
-    diag_dir = out_dir / "zeropoint_diag"
+    diag_dir = out_dir / "calibration_diag"
     diag_dir.mkdir(parents=True, exist_ok=True)
 
     # 讀 catalog（合併 AAVSO + APASS + Tycho2）

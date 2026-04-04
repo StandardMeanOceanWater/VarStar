@@ -222,7 +222,8 @@ def _build_channel_header(
 # 主拆色管線
 # =============================================================================
 
-def run_debayer(config_path: "str | Path") -> None:
+def run_debayer(config_path: "str | Path", *, raw_mode: bool = False,
+                wcs_subdir: str = "", splits_subdir: str = "") -> None:
     """
     主 Bayer 拆色管線入口。
 
@@ -239,8 +240,9 @@ def run_debayer(config_path: "str | Path") -> None:
     if not sessions:
         raise ValueError("observation_config.yaml 裡沒有 obs_sessions。")
 
+    _mode_tag = " [RAW MODE]" if raw_mode else ""
     print("\n" + "=" * 60)
-    print("  變星測光管線 — Bayer 拆色模組  DeBayer_RGGB.py")
+    print(f"  變星測光管線 — Bayer 拆色模組  DeBayer_RGGB.py{_mode_tag}")
     print("=" * 60)
 
     for session in sessions:
@@ -277,12 +279,20 @@ def run_debayer(config_path: "str | Path") -> None:
             _group = target_cfg.get("group", target)
             _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             field_root = data_root / _date_fmt / _group
-            wcs_dir = field_root / "wcs"
-            split_base = field_root / "splits"
+            if wcs_subdir:
+                wcs_dir = field_root / wcs_subdir
+                split_base = field_root / (splits_subdir or wcs_subdir.replace("wcs", "splits"))
+            elif raw_mode:
+                wcs_dir = field_root / "wcs_raw"
+                split_base = field_root / "splits_raw"
+            else:
+                wcs_dir = field_root / "wcs"
+                split_base = field_root / "splits"
 
             wcs_files = sorted(wcs_dir.glob("*_wcs.fits"))
             if not wcs_files:
-                print(f"[SKIP] {target}/{date}：wcs/ 目錄裡找不到 *_wcs.fits。")
+                _src = "wcs_raw/" if raw_mode else "wcs/"
+                print(f"[SKIP] {target}/{date}：{_src} 目錄裡找不到 *_wcs.fits。")
                 continue
 
             print(f"\n[Session] {target} / {date}  ({len(wcs_files)} 幀)")

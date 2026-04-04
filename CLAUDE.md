@@ -41,7 +41,7 @@ D:\VarStar\
             └── {TARGET}\
                 └── {YYYYMMDD_HHMM}\  ← 每次執行獨立
                     ├── 1_photometry\
-                    ├── 2_zeropoint_diag\
+                    ├── 2_calibration_diag\
                     ├── 3_light_curve\
                     └── 4_period_analysis\
 ```

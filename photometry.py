@@ -40,7 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +52,9 @@ from astropy.stats import sigma_clipped_stats
 from astropy.time import Time
 ATime = Time   # 別名，供函式內部使用（避免 local import 遮蔽）
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
 from photutils.detection import DAOStarFinder, IRAFStarFinder
 
 # ── Module-level logger（__main__ 會加 handler；函數直接用此 logger）──────────
@@ -68,7 +71,7 @@ class Cfg:
     out_dir: Path = Path(".")
     phot_out_csv: Path = Path("photometry.csv")
     phot_out_png: Path = Path("light_curve.png")
-    zeropoint_diag_dir: Path = Path("zeropoint_diag")
+    zeropoint_diag_dir: Path = Path("calibration_diag")
     run_root: Path = Path(".")     # output/{date}/{group}/{target}/{timestamp}/
 
     # ── 目標 ──────────────────────────────────────────────────────────────────
@@ -201,7 +204,7 @@ def cfg_from_yaml(
     target: str,
     session_date: str,
     channel: str = "B",
-    split_subdir: str = "split",
+    split_subdir: str = "splits",
     out_tag: "str | None" = None,
     run_ts: "str | None" = None,
 ) -> Cfg:
@@ -245,7 +248,6 @@ def cfg_from_yaml(
         raise ValueError(
             f"{target}：yaml targets 缺少 dec_deg 或 dec_hint_deg，無法繼續。"
         )
-        print(f"[WARN] {target}：yaml 缺少 dec_deg / dec_hint_deg，座標設為 0.0")
     vmag    = float(tgt.get("vmag_approx", 8.0))
     display = tgt.get("display_name", target)
 
@@ -331,13 +333,13 @@ def cfg_from_yaml(
     # ── 路徑 ───────────────────────────────────────────────────────────────────
     # 測光通道：split/B/（拆色後 B 通道；FITS 內含 WCS，由 DeBayer_RGGB.py 傳遞）
     channel = str(channel).upper()   # 使用傳入參數，不從 yaml 讀
-    wcs_dir  = field_root / "splits" / channel
+    wcs_dir  = field_root / split_subdir / channel
     # ── 輸出目錄（時間戳制，每次執行獨立）─────────────────────────────────
     _run_ts = run_ts or datetime.now().strftime("%Y%m%d_%H%M")
     run_root = project_root / "output" / _date_fmt / group / target / _run_ts
     out_dir  = run_root / "1_photometry"
     out_dir.mkdir(parents=True, exist_ok=True)
-    diag_dir = run_root / "2_zeropoint_diag"
+    diag_dir = run_root / "2_calibration_diag"
     diag_dir.mkdir(parents=True, exist_ok=True)
     lc_dir   = run_root / "3_light_curve"
     lc_dir.mkdir(parents=True, exist_ok=True)
@@ -348,7 +350,29 @@ def cfg_from_yaml(
     _band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
     phot_band = _band_map.get(channel.upper(), "V")
 
-    return Cfg(
+    # ── Auto-fill：phot_cfg 中與 Cfg 欄位同名的 key 自動帶入 ──────────────
+    # 手動指定的值（下方 Cfg(...)）優先；auto-fill 只補漏。
+    _auto = {}
+    _cfg_fields = {f.name: f for f in fields(Cfg)}
+    for _key, _val in phot_cfg.items():
+        if _key in _cfg_fields and _val is not None:
+            _ftype = _cfg_fields[_key].type
+            try:
+                if _ftype in (float, "float"):
+                    _auto[_key] = float(_val)
+                elif _ftype in (int, "int"):
+                    _auto[_key] = int(_val)
+                elif _ftype in (bool, "bool"):
+                    _auto[_key] = bool(_val)
+                elif _ftype in (str, "str"):
+                    _auto[_key] = str(_val)
+                else:
+                    _auto[_key] = _val
+            except (ValueError, TypeError):
+                pass  # 轉型失敗就跳過，讓手動值或預設值生效
+
+    # ── 手動指定的值（優先於 auto-fill）────────────────────────────────────
+    _manual = dict(
         # 路徑
         run_root=run_root,
         wcs_dir=wcs_dir,
@@ -381,10 +405,7 @@ def cfg_from_yaml(
         save_zeropoint_diagnostic=bool(cmp_cfg.get("save_zeropoint_diagnostic", True)),
 
         # 孔徑測光
-        # yaml photometry: 區塊用 aperture_growth_radii list；
-        # aperture_auto / aperture_radius / aperture_growth_fraction 為程式內部預設。
-        # sky_annulus_inner_px / sky_annulus_outer_px 對應 annulus_r_in / annulus_r_out。
-        aperture_auto=True,                   # yaml 無此欄位，固定 True（生長曲線法）
+        aperture_auto=True,
         aperture_radius=float(ap_cfg.get("aperture_radius", 8.0)),
         aperture_min_radius=int(min(ap_cfg.get("aperture_growth_radii", [2]), default=2)),
         aperture_max_radius=int(max(ap_cfg.get("aperture_growth_radii", [12]), default=12)),
@@ -401,11 +422,10 @@ def cfg_from_yaml(
         iso_setting=iso,
         phot_band=phot_band,
 
-        # 板塊比例尺（用於權重 ε）
+        # 板塊比例尺
         plate_scale_arcsec=plate_scale,
 
-        # 觀測站（BJD_TDB 計算用）
-        # 優先從 obs_sessions[i] 讀取，fallback 到頂層 observatory 區塊
+        # 觀測站
         obs_lat_deg=(
             float(session["obs_lat_deg"]) if "obs_lat_deg" in session
             else float(obs_cfg["latitude_deg"]) if "latitude_deg" in obs_cfg
@@ -421,26 +441,7 @@ def cfg_from_yaml(
             else float(obs_cfg.get("elevation_m", 0.0))
         ),
 
-        # 穩健回歸
-        robust_regression_sigma=float(phot_cfg.get("robust_regression_sigma", 3.0)),
-        robust_regression_max_iter=int(phot_cfg.get("robust_regression_max_iter", 5)),
-        robust_regression_min_points=int(phot_cfg.get("robust_regression_min_points", 3)),
-
-        # Ensemble 正規化（Broeg 2005）
-        ensemble_normalize=bool(phot_cfg.get("ensemble_normalize", False)),
-        ensemble_min_comp=int(phot_cfg.get("ensemble_min_comp", 3)),
-        ensemble_max_iter=int(phot_cfg.get("ensemble_max_iter", 10)),
-        ensemble_convergence_tol=float(
-            phot_cfg.get("ensemble_convergence_tol", 1e-4)
-        ),
-
-        # 幀品質篩選
-        sharpness_min=float(phot_cfg.get("sharpness_min", 0.3)),
-        zp_r2_min=float(phot_cfg.get("zp_r2_min", 0.0)),
-        peak_ratio_min=float(phot_cfg.get("peak_ratio_min", 0.0)),
-        peak_ratio_k=float(phot_cfg.get("peak_ratio_k", 0.0)),
-        zp_intercept_sigma=float(phot_cfg.get("zp_intercept_sigma", 0.0)),
-        sky_sigma=float(phot_cfg.get("sky_sigma", 0.0)),
+        # 消光
         extinction_k=_resolve_extinction_k(yaml_dict, channel, phot_cfg),
 
         # 舊版相容
@@ -453,6 +454,10 @@ def cfg_from_yaml(
                            .get("db_path", "C:/Program Files/astap/d80")),
         wcs_out_dir=wcs_dir,
         stars_csv=out_dir / "stars_detected.csv",
+    )
+    # auto-fill 墊底，手動值覆蓋
+    _merged = {**_auto, **_manual}
+    return Cfg(**_merged
     )
 
 
@@ -1991,16 +1996,221 @@ def _save_zeropoint_diagnostic(
     ax.set_xlabel("Catalogue magnitude  $m_{cat}$")
     ax.set_ylabel("Instrumental magnitude  $m_{inst}$")
     ax.set_title(
-        f"校正擬合線診斷  [{frame_name}]\n"
+        f"Calibration Fit Diagnostic  [{frame_name}]\n"
         f"Active source: {active_source}",
         fontsize=9,
     )
     ax.legend(fontsize=7, loc="upper left")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    out_path = diag_dir / f"zp_diag_{Path(frame_name).stem}.png"
+    out_path = diag_dir / f"cal_diag_{Path(frame_name).stem}.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
+def _load_or_build_field_catalog(
+    channel_name: str,
+    cfg,
+    ra_t: float,
+    dec_t: float,
+    field_cat_dir: Path,
+) -> "tuple[pd.DataFrame, list[str]]":
+    """
+    Load cached field catalog for a channel, or query catalogs and build it.
+
+    Returns (combined_raw, sources_used).
+    combined_raw has columns: ra_deg, dec_deg, m_cat, m_err, source.
+    """
+    field_cat_path = field_cat_dir / f"field_catalog_{channel_name}.csv"
+    _catalog_raws: "list[pd.DataFrame]" = []
+    _sources_used: "list[str]" = []
+
+    if field_cat_path.exists():
+        print(f"  [field catalog] read: {field_cat_path.name}")
+        combined_raw = pd.read_csv(field_cat_path)
+        if "source" in combined_raw.columns:
+            _sources_used = sorted(combined_raw["source"].dropna().unique().tolist())
+    else:
+        for _cat_name in cfg.catalog_priority:
+            _cat_name_up = str(_cat_name).upper()
+
+            if _cat_name_up == "AAVSO":
+                seq_df = None
+                if cfg.aavso_seq_csv is not None and Path(cfg.aavso_seq_csv).exists():
+                    seq_df = read_aavso_seq_csv(Path(cfg.aavso_seq_csv))
+                elif cfg.aavso_star_name and cfg.aavso_use_api:
+                    try:
+                        seq_df = fetch_aavso_vsp_api(
+                            cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit,
+                            ra_deg=ra_t, dec_deg=dec_t,
+                        )
+                    except Exception as exc:
+                        print(f"  [WARN] AAVSO API query failed: {exc}")
+                if seq_df is not None and len(seq_df) > 0:
+                    _std = seq_df.rename(columns={"m_cat": "vmag", "m_err": "e_vmag"})
+                    _std = _std[["ra_deg", "dec_deg", "vmag"] +
+                                 (["e_vmag"] if "e_vmag" in _std.columns else [])].copy()
+                    _std["source"] = "AAVSO"
+                    _catalog_raws.append(_std)
+                    _sources_used.append("AAVSO")
+
+            elif _cat_name_up == "APASS":
+                apass_raw = fetch_apass_cone(
+                    ra_t, dec_t, radius_deg=cfg.apass_radius_deg, maxrec=cfg.apass_maxrec,
+                )
+                if len(apass_raw) > 0:
+                    _ra_col  = _pick_col(apass_raw, ["ra", "raj2000", "ra_deg", "ra_icrs"])
+                    _dec_col = _pick_col(apass_raw, ["dec", "dej2000", "dec_deg", "dec_icrs"])
+                    _band = getattr(cfg, "phot_band", "V")
+                    _mag_cands = {
+                        "B": ["mag_b", "bmag", "b", "b_mag"],
+                        "V": ["mag_v", "vmag", "v", "v_mag"],
+                        "r": ["mag_r", "rmag", "r", "r_mag", "r_sloan"],
+                    }
+                    _err_cands = {
+                        "B": ["err_mag_b", "e_bmag", "e_b", "b_err", "bmag_err"],
+                        "V": ["err_mag_v", "e_vmag", "e_v", "v_err", "vmag_err"],
+                        "r": ["err_mag_r", "e_rmag", "e_r", "r_err", "rmag_err"],
+                    }
+                    try:
+                        _mag_col = _pick_col(apass_raw, _mag_cands.get(_band, _mag_cands["V"]))
+                    except KeyError:
+                        print(f"  [WARN] APASS has no {_band} band, skipping")
+                        continue
+                    _err_col = next(
+                        (c for c in _err_cands.get(_band, _err_cands["V"]) if c in apass_raw.columns),
+                        None,
+                    )
+                    _cols_needed = [_ra_col, _dec_col, _mag_col] + ([_err_col] if _err_col else [])
+                    _std = apass_raw[_cols_needed].copy().rename(columns={
+                        _ra_col: "ra_deg", _dec_col: "dec_deg",
+                        _mag_col: "vmag",
+                        **({_err_col: "e_vmag"} if _err_col else {}),
+                    })
+                    _std["source"] = "APASS"
+                    _catalog_raws.append(_std)
+                    _sources_used.append("APASS")
+
+            elif _cat_name_up == "TYCHO2":
+                tycho_raw = fetch_tycho2_cone(
+                    ra_t, dec_t,
+                    radius_arcmin=cfg.apass_radius_deg * 60.0,
+                    mag_min=cfg.comp_mag_min, mag_max=cfg.comp_mag_max,
+                )
+                if len(tycho_raw) > 0:
+                    _keep_tycho = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
+                    for _extra_tycho in ["BT", "VT"]:
+                        if _extra_tycho in tycho_raw.columns:
+                            _keep_tycho.append(_extra_tycho)
+                    _std = tycho_raw[_keep_tycho].copy()
+                    _catalog_raws.append(_std)
+                    _sources_used.append("Tycho2")
+
+            elif _cat_name_up in ("GAIA", "GAIADR3", "GAIA_DR3"):
+                _gaia_channel = getattr(cfg, "phot_band", "G1")
+                _band_to_ch = {"V": "G1", "B": "B", "r": "R"}
+                _gaia_channel = _band_to_ch.get(_gaia_channel, _gaia_channel)
+                gaia_raw = fetch_gaia_dr3_cone(
+                    ra_t, dec_t,
+                    radius_arcmin=cfg.apass_radius_deg * 60.0,
+                    mag_min=cfg.comp_mag_min,
+                    mag_max=cfg.comp_mag_max,
+                    channel=_gaia_channel,
+                )
+                if len(gaia_raw) > 0:
+                    _keep_cols = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
+                    for _extra in ["Gmag", "BPmag", "RPmag", "warn_color"]:
+                        if _extra in gaia_raw.columns:
+                            _keep_cols.append(_extra)
+                    _std = gaia_raw[_keep_cols].copy()
+                    _catalog_raws.append(_std)
+                    _sources_used.append("GaiaDR3")
+
+        # Merge and deduplicate (position < 3 arcsec → keep higher priority)
+        if not _catalog_raws:
+            combined_raw = pd.DataFrame()
+        else:
+            combined_raw = pd.concat(_catalog_raws, ignore_index=True)
+            if len(combined_raw) > 1:
+                from astropy.coordinates import SkyCoord as _SC
+                keep = np.ones(len(combined_raw), dtype=bool)
+                coords = _SC(
+                    combined_raw["ra_deg"].values * u.deg,
+                    combined_raw["dec_deg"].values * u.deg,
+                )
+                for i in range(len(combined_raw)):
+                    if not keep[i]:
+                        continue
+                    seps = coords[i].separation(coords).arcsec
+                    dups = np.where((seps < 3.0) & (np.arange(len(combined_raw)) > i))[0]
+                    keep[dups] = False
+                combined_raw = combined_raw[keep].reset_index(drop=True)
+
+        # Save cache
+        if len(combined_raw) > 0:
+            field_cat_dir.mkdir(parents=True, exist_ok=True)
+            combined_raw.to_csv(field_cat_path, index=False, encoding="utf-8-sig")
+            print(f"  [field catalog] saved: {field_cat_path.name} ({len(combined_raw)} rows)")
+
+    # Standardize column names
+    if len(combined_raw) > 0:
+        combined_raw = combined_raw.rename(columns={"vmag": "m_cat", "e_vmag": "m_err"})
+        if "m_err" not in combined_raw.columns:
+            combined_raw["m_err"] = np.nan
+        print(f"  [catalog] {'+'.join(_sources_used)}: {len(combined_raw)} stars total")
+
+    return combined_raw, _sources_used
+
+
+def _remap_comp_refs_to_band(
+    comp_refs: list,
+    channel_name: str,
+    cfg_ch,
+    field_cat_dir: Path,
+    ra_t: float,
+    dec_t: float,
+) -> list:
+    """
+    Replace m_cat in comp_refs with values from the correct band catalog.
+
+    comp_refs from auto_select_comps may have m_cat from the first channel's
+    band.  This function loads the correct field catalog for *this* channel
+    and cross-matches by position (< 3 arcsec) to get the right m_cat.
+    """
+    combined_raw, sources_used = _load_or_build_field_catalog(
+        channel_name, cfg_ch, ra_t, dec_t, field_cat_dir,
+    )
+    if len(combined_raw) == 0:
+        print(f"  [band remap] {channel_name}: no catalog, keeping original m_cat")
+        return comp_refs
+
+    from astropy.coordinates import SkyCoord as _SC
+    cat_coords = _SC(
+        combined_raw["ra_deg"].values * u.deg,
+        combined_raw["dec_deg"].values * u.deg,
+    )
+
+    new_refs = []
+    n_matched = 0
+    n_dropped = 0
+    for ref in comp_refs:
+        ra_c, dec_c, _old_mcat, _old_merr, weight = ref[0], ref[1], ref[2], ref[3], ref[4]
+        ref_coord = _SC(ra_c * u.deg, dec_c * u.deg)
+        seps = ref_coord.separation(cat_coords).arcsec
+        idx = int(seps.argmin())
+        if seps[idx] < 3.0:
+            m_cat = float(combined_raw.iloc[idx]["m_cat"])
+            m_err = float(combined_raw.iloc[idx].get("m_err", np.nan))
+            if np.isfinite(m_cat):
+                new_refs.append((ra_c, dec_c, m_cat, m_err, weight))
+                n_matched += 1
+                continue
+        n_dropped += 1
+
+    print(f"  [band remap] {channel_name} ({cfg_ch.phot_band}): "
+          f"{n_matched} matched, {n_dropped} dropped "
+          f"(sources: {'+'.join(sources_used)})")
+    return new_refs
 
 
 def auto_select_comps(
@@ -2093,153 +2303,13 @@ def auto_select_comps(
               f"邊界排除={n_bounds}  飽和排除={n_sat}  測光失敗={n_phot}  通過={len(rows)}")
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # ── 3–5. 視場星表快取 / 全天查詢 ──────────────────────────────────────────
-    # 查詢順序由 cfg.catalog_priority 決定（yaml 設定，預設 [AAVSO, APASS]）。
-    # 各星表結果合併後去重（位置 < 3 arcsec 保留優先順序較前的來源）。
-    # 合併後統一進強制孔徑測光流程（_catalog_direct_phot）。
-    # 視場星表 CSV 已存在時直接讀取，跳過全天 CSV 載入。
-
+    # ── 3–5. 視場星表快取 / 全天查詢（委派給 _load_or_build_field_catalog）────
     _channel_name   = cfg.wcs_dir.name                        # G1 / G2 / R / B
     _field_cat_dir  = cfg.out_dir.parent.parent / "catalogs"
-    _field_cat_path = _field_cat_dir / f"field_catalog_{_channel_name}.csv"
 
-    _catalog_raws: "list[pd.DataFrame]" = []
-    _sources_used: "list[str]" = []
-
-    if _field_cat_path.exists():
-        print(f"  [視場星表] 讀取：{_field_cat_path.name}")
-        combined_raw = pd.read_csv(_field_cat_path)
-        if "source" in combined_raw.columns:
-            _sources_used = sorted(combined_raw["source"].dropna().unique().tolist())
-    else:
-        for _cat_name in cfg.catalog_priority:
-            _cat_name_up = str(_cat_name).upper()
-
-            if _cat_name_up == "AAVSO":
-                seq_df = None
-                if cfg.aavso_seq_csv is not None and Path(cfg.aavso_seq_csv).exists():
-                    seq_df = read_aavso_seq_csv(Path(cfg.aavso_seq_csv))
-                elif cfg.aavso_star_name and cfg.aavso_use_api:
-                    try:
-                        seq_df = fetch_aavso_vsp_api(
-                            cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit,
-                            ra_deg=ra_t, dec_deg=dec_t,
-                        )
-                    except Exception as exc:
-                        print(f"  [WARN] AAVSO API 查詢失敗：{exc}")
-                if seq_df is not None and len(seq_df) > 0:
-                    _std = seq_df.rename(columns={"m_cat": "vmag", "m_err": "e_vmag"})
-                    _std = _std[["ra_deg", "dec_deg", "vmag"] +
-                                 (["e_vmag"] if "e_vmag" in _std.columns else [])].copy()
-                    _std["source"] = "AAVSO"
-                    _catalog_raws.append(_std)
-                    _sources_used.append("AAVSO")
-
-            elif _cat_name_up == "APASS":
-                apass_raw = fetch_apass_cone(
-                    ra_t, dec_t, radius_deg=cfg.apass_radius_deg, maxrec=cfg.apass_maxrec,
-                )
-                if len(apass_raw) > 0:
-                    _ra_col  = _pick_col(apass_raw, ["ra", "raj2000", "ra_deg", "ra_icrs"])
-                    _dec_col = _pick_col(apass_raw, ["dec", "dej2000", "dec_deg", "dec_icrs"])
-                    _band = getattr(cfg, "phot_band", "V")
-                    _mag_cands = {
-                        "B": ["mag_b", "bmag", "b", "b_mag"],
-                        "V": ["mag_v", "vmag", "v", "v_mag"],
-                        "r": ["mag_r", "rmag", "r", "r_mag", "r_sloan"],
-                    }
-                    _err_cands = {
-                        "B": ["err_mag_b", "e_bmag", "e_b", "b_err", "bmag_err"],
-                        "V": ["err_mag_v", "e_vmag", "e_v", "v_err", "vmag_err"],
-                        "r": ["err_mag_r", "e_rmag", "e_r", "r_err", "rmag_err"],
-                    }
-                    try:
-                        _mag_col = _pick_col(apass_raw, _mag_cands.get(_band, _mag_cands["V"]))
-                    except KeyError:
-                        print(f"  [WARN] APASS 無 {_band} 波段星等欄位，跳過（可用欄位：{list(apass_raw.columns)}）")
-                        continue
-                    _err_col = next(
-                        (c for c in _err_cands.get(_band, _err_cands["V"]) if c in apass_raw.columns),
-                        None,
-                    )
-                    _cols_needed = [_ra_col, _dec_col, _mag_col] + ([_err_col] if _err_col else [])
-                    _std = apass_raw[_cols_needed].copy().rename(columns={
-                        _ra_col: "ra_deg", _dec_col: "dec_deg",
-                        _mag_col: "vmag",
-                        **({_err_col: "e_vmag"} if _err_col else {}),
-                    })
-                    _std["source"] = "APASS"
-                    _catalog_raws.append(_std)
-                    _sources_used.append("APASS")
-
-            elif _cat_name_up == "TYCHO2":
-                tycho_raw = fetch_tycho2_cone(
-                    ra_t, dec_t,
-                    radius_arcmin=cfg.apass_radius_deg * 60.0,
-                    mag_min=cfg.comp_mag_min, mag_max=cfg.comp_mag_max,
-                )
-                if len(tycho_raw) > 0:
-                    _keep_tycho = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
-                    for _extra_tycho in ["BT", "VT"]:
-                        if _extra_tycho in tycho_raw.columns:
-                            _keep_tycho.append(_extra_tycho)
-                    _std = tycho_raw[_keep_tycho].copy()
-                    _catalog_raws.append(_std)
-                    _sources_used.append("Tycho2")
-
-            elif _cat_name_up in ("GAIA", "GAIADR3", "GAIA_DR3"):
-                _gaia_channel = getattr(cfg, "phot_band", "G1")
-                # phot_band 使用 APASS 波段名（V/B/r），轉換回通道名稱
-                _band_to_ch = {"V": "G1", "B": "B", "r": "R"}
-                _gaia_channel = _band_to_ch.get(_gaia_channel, _gaia_channel)
-                gaia_raw = fetch_gaia_dr3_cone(
-                    ra_t, dec_t,
-                    radius_arcmin=cfg.apass_radius_deg * 60.0,
-                    mag_min=cfg.comp_mag_min,
-                    mag_max=cfg.comp_mag_max,
-                    channel=_gaia_channel,
-                )
-                if len(gaia_raw) > 0:
-                    _keep_cols = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
-                    for _extra in ["Gmag", "BPmag", "RPmag", "warn_color"]:
-                        if _extra in gaia_raw.columns:
-                            _keep_cols.append(_extra)
-                    _std = gaia_raw[_keep_cols].copy()
-                    _catalog_raws.append(_std)
-                    _sources_used.append("GaiaDR3")
-
-        # 合併並去重：位置 < 3 arcsec 保留優先順序較前的
-        if not _catalog_raws:
-            combined_raw = pd.DataFrame()
-        else:
-            combined_raw = pd.concat(_catalog_raws, ignore_index=True)
-            if len(combined_raw) > 1:
-                from astropy.coordinates import SkyCoord as _SC
-                keep = np.ones(len(combined_raw), dtype=bool)
-                coords = _SC(
-                    combined_raw["ra_deg"].values * u.deg,
-                    combined_raw["dec_deg"].values * u.deg,
-                )
-                for i in range(len(combined_raw)):
-                    if not keep[i]:
-                        continue
-                    seps = coords[i].separation(coords).arcsec
-                    dups = np.where((seps < 3.0) & (np.arange(len(combined_raw)) > i))[0]
-                    keep[dups] = False
-                combined_raw = combined_raw[keep].reset_index(drop=True)
-
-        # 儲存視場小星表（供下次直接讀取，跳過全天 CSV 載入）
-        if len(combined_raw) > 0:
-            _field_cat_dir.mkdir(parents=True, exist_ok=True)
-            combined_raw.to_csv(_field_cat_path, index=False, encoding="utf-8-sig")
-            print(f"  [視場星表] 儲存：{_field_cat_path.name}（{len(combined_raw)} 筆）")
-
-    # 統一欄位名稱：vmag → m_cat，e_vmag → m_err
-    if len(combined_raw) > 0:
-        combined_raw = combined_raw.rename(columns={"vmag": "m_cat", "e_vmag": "m_err"})
-        if "m_err" not in combined_raw.columns:
-            combined_raw["m_err"] = np.nan
-        print(f"  [星表合併] {'+'.join(_sources_used)}：合併後 {len(combined_raw)} 筆")
+    combined_raw, _sources_used = _load_or_build_field_catalog(
+        _channel_name, cfg, ra_t, dec_t, _field_cat_dir,
+    )
 
     # 強制孔徑測光篩選
     aavso_matched = None   # 保留給 check_star 選取用（診斷）
@@ -2324,13 +2394,11 @@ def auto_select_comps(
     if hasattr(cfg, "out_dir") and cfg.out_dir is not None:
         _cat_dir = cfg.run_root / "1_photometry" / "catalogs"
         _cat_dir.mkdir(parents=True, exist_ok=True)
-        for _raw_df in _catalog_raws:
-            if len(_raw_df) == 0:
-                continue
-            _src_name = str(_raw_df["source"].iloc[0]) if "source" in _raw_df.columns else "unknown"
-            _cat_csv = _cat_dir / f"catalog_{_src_name}.csv"
-            _raw_df.to_csv(_cat_csv, index=False)
-            print(f"  [星表] 已儲存 → {_cat_csv}  ({len(_raw_df)} 筆)")
+        if len(combined_raw) > 0 and "source" in combined_raw.columns:
+            for _src_name, _raw_df in combined_raw.groupby("source"):
+                _cat_csv = _cat_dir / f"catalog_{_src_name}.csv"
+                _raw_df.to_csv(_cat_csv, index=False)
+                print(f"  [星表] 已儲存 → {_cat_csv}  ({len(_raw_df)} 筆)")
 
     return comp_refs, active_df, check_star, aavso_matched, apass_matched, active_source, _vsx
 
@@ -2477,9 +2545,15 @@ def ensemble_normalize(
     m_var_col = df_out.get("m_var") if "m_var" in df_out.columns else pd.Series(
         np.nan, index=df_out.index
     )
+    # delta_new 是儀器星等空間的漂移量；m_var 是校正星等空間 (m_inst-b)/a。
+    # 轉換：delta_catalog = delta_inst / a，才能從 m_var 中正確扣除。
+    _zp_slope = df_out["zp_slope"].values if "zp_slope" in df_out.columns else np.ones(len(df_out))
+    _zp_slope_safe = np.where(np.isfinite(_zp_slope) & (_zp_slope != 0), _zp_slope, 1.0)
+    delta_scaled = delta_new / _zp_slope_safe
+
     m_var_norm = np.where(
-        np.isfinite(df_out["m_var"].values) & np.isfinite(delta_new),
-        df_out["m_var"].values - delta_new,
+        np.isfinite(df_out["m_var"].values) & np.isfinite(delta_scaled),
+        df_out["m_var"].values - delta_scaled,
         np.nan,
     )
     df_out["m_var_norm"] = m_var_norm
@@ -3010,6 +3084,17 @@ def run_photometry_on_wcs_dir(
             )
 
         m_var       = (m_inst_t - b) / a
+        # ── 外插檢查：目標星儀器星等是否在比較星範圍內 ─────────────────────
+        _comp_m_inst_used = comp_m_inst[mask]
+        _flag_extrap = 0
+        if len(_comp_m_inst_used) >= 2:
+            _m_lo, _m_hi = float(np.nanmin(_comp_m_inst_used)), float(np.nanmax(_comp_m_inst_used))
+            if np.isfinite(m_inst_t) and (m_inst_t < _m_lo or m_inst_t > _m_hi):
+                _flag_extrap = 1
+                _phot_logger.warning(
+                    "[EXTRAP] target m_inst=%.3f outside comp range [%.3f, %.3f] in %s",
+                    m_inst_t, _m_lo, _m_hi, f.name,
+                )
         comp_used   = int(np.count_nonzero(mask))
         sigma_mag   = mag_error_from_flux(
             flux_net=phot_t["flux_net"],
@@ -3049,6 +3134,7 @@ def run_photometry_on_wcs_dir(
             "comp_used": comp_used,
             "flag_slope_dev": _slope_flag,
             "zp_slope_fit": _a_fit,  # regression slope（監控用，取代 flag_extrapolated）
+            "flag_extrapolated": _flag_extrap,
             "m_var": m_var,
         })
 
@@ -3274,7 +3360,7 @@ def run_photometry_on_wcs_dir(
     if cfg.save_zeropoint_diagnostic:
         try:
             _zp_diag_path = cfg.zeropoint_diag_dir / (
-                f"zp_overview_{out_csv.stem.split('_')[1]}_{out_csv.stem.split('_', 1)[-1]}.png"
+                f"cal_overview_{out_csv.stem.split('_')[1]}_{out_csv.stem.split('_', 1)[-1]}.png"
             )
             _df_ok = df[df["ok"] == 1].copy()
             fig_diag, axes_diag = plt.subplots(
@@ -3296,8 +3382,8 @@ def run_photometry_on_wcs_dir(
                     lw=1, ls="--", label=f"median={_df_ok['zp_residual_rms'].median():.4f}"
                 )
                 ax_ts.set_xlabel(time_key.upper())
-                ax_ts.set_ylabel("校正殘差 RMS (mag)")
-                ax_ts.set_title("校正殘差 RMS vs. 時間")
+                ax_ts.set_ylabel("Calibration Residual RMS (mag)")
+                ax_ts.set_title("Calibration Residual RMS vs. Time")
                 ax_ts.legend(fontsize=8)
                 ax_ts.grid(True, alpha=0.3)
 
@@ -3384,11 +3470,14 @@ def run_photometry_on_wcs_dir(
                     _xl = np.linspace(_mc[_ok_pts].min(), _mc[_ok_pts].max(), 100)
                     ax_sc.plot(_xl, _a * _xl + _b, "r-", lw=1.5,
                                label=f"$m_{{inst}}={_a:.3f}\\,m_{{cat}}+({_b:.3f})$  $R^2={_r2:.3f}$")
-                # 目標星紅圈
-                if np.isfinite(_tgt_mcat) and np.isfinite(_tgt_minst):
-                    ax_sc.scatter([_tgt_mcat], [_tgt_minst], s=80, marker="o",
-                                  facecolors="none", edgecolors="red", linewidths=1.8,
-                                  zorder=5, label=f"target  $m_{{cat}}$={_tgt_mcat:.1f}")
+                # 目標星紅圈：畫在 (m_var, m_inst) — m_var = (m_inst - b) / a
+                if _fit and np.isfinite(_tgt_minst):
+                    _a_d, _b_d = _fit["a"], _fit["b"]
+                    if np.isfinite(_a_d) and _a_d != 0:
+                        _tgt_mvar = (_tgt_minst - _b_d) / _a_d
+                        ax_sc.scatter([_tgt_mvar], [_tgt_minst], s=80, marker="o",
+                                      facecolors="none", edgecolors="red", linewidths=1.8,
+                                      zorder=5, label=f"target  $m_{{var}}$={_tgt_mvar:.1f}")
                 if _ok_pts.any():
                     _xr = np.array([_mc[_ok_pts].min(), _mc[_ok_pts].max()])
                     ax_sc.plot(_xr, _xr, "k--", lw=0.8, alpha=0.4, label="ideal")
@@ -3396,9 +3485,9 @@ def run_photometry_on_wcs_dir(
                 ax_sc.set_xlabel(f"$m_{{cat}}$ ({cfg.phot_band})")
                 ax_sc.set_ylabel("$m_{inst}$")
                 if np.isfinite(_diag_bright) and np.isfinite(_diag_faint):
-                    ax_sc.set_title(f"校正擬合線 — Frame 1  ({_diag_bright:.1f}–{_diag_faint:.1f} mag)")
+                    ax_sc.set_title(f"Calibration Fit — Frame 1  ({_diag_bright:.1f}–{_diag_faint:.1f} mag)")
                 else:
-                    ax_sc.set_title("校正擬合線 — Frame 1")
+                    ax_sc.set_title("Calibration Fit — Frame 1")
                 ax_sc.legend(fontsize=7, frameon=False)
                 ax_sc.grid(True, alpha=0.3)
             else:
@@ -3406,16 +3495,16 @@ def run_photometry_on_wcs_dir(
                            transform=ax_sc.transAxes, ha="center", va="center")
 
             fig_diag.suptitle(
-                f"校正診斷  |  {cfg.target_name}  "
+                f"Calibration Diagnostic  |  {cfg.target_name}  "
                 f"channel={channel}  {out_csv.stem}",
                 fontsize=10
             )
             fig_diag.tight_layout()
             fig_diag.savefig(_zp_diag_path, dpi=150)
             plt.close(fig_diag)
-            print(f"[診斷圖] saved → {_zp_diag_path}")
+            print(f"[cal_diag] saved → {_zp_diag_path}")
         except Exception as _e:
-            print(f"[WARN] 零點診斷圖輸出失敗：{_e}")
+            print(f"[WARN] calibration diagnostic failed: {_e}")
 
     # ── Rejection timeline 圖 ────────────────────────────────────────────────
     try:
@@ -3529,7 +3618,8 @@ def run_photometry_on_wcs_dir(
         k = df[(df["ok"] == 1) & np.isfinite(df[time_key])
                & np.isfinite(df["k_minus_c"])].copy()
         if len(k) > 1:
-            k["t_rel_d"] = k[time_key] - _t0
+            _t0_check = float(k[time_key].min())
+            k["t_rel_d"] = k[time_key] - _t0_check
             sigma_k = float(np.nanstd(k["k_minus_c"]))
             flag    = " [!] EXCEEDS THRESHOLD" if sigma_k > cfg.check_star_max_sigma else ""
             print(f"[CHECK] K-C sigma = {sigma_k:.5f} mag "
@@ -3684,15 +3774,21 @@ if __name__ == "__main__":
                          help="觀測日期（例如 20251220）")
     _parser.add_argument("--channels", default=None, nargs="+",
                          help="通道列表（例如 --channels R G1 B）")
-    _parser.add_argument("--split_subdir", default="split",
-                         help="split 子目錄名稱（例如 splitNINA）")
+    _parser.add_argument("--split_subdir", default="splits",
+                         help="split 子目錄名稱（例如 splits_raw）")
     _parser.add_argument("--all", action="store_true",
                          help="處理 yaml 中所有 obs_sessions 的全部目標")
     _parser.add_argument("--out-tag", default=None, dest="out_tag",
                          help="輸出子目錄後綴，例如 sat65536 → output_sat65536（不填則用 output）")
     _parser.add_argument("--no-vsx", action="store_true", dest="no_vsx",
                          help="跳過 VSX 額外目標星測光，只跑主目標")
+    _parser.add_argument("--raw", action="store_true",
+                         help="使用 raw 未校正影像（splits_raw/）")
     _args = _parser.parse_args()
+    if _args.raw:
+        _args.split_subdir = "splits_raw"
+        if not _args.out_tag:
+            _args.out_tag = "raw"
 
     # ── Logger 初始化 ──────────────────────────────────────────────────────────
     _log_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3878,6 +3974,20 @@ if __name__ == "__main__":
         print(f"孔徑 r={cfg.aperture_radius:.2f}  r_in={ap_r_in:.2f}  r_out={ap_r_out:.2f}")
         _shared_aperture_radius = cfg.aperture_radius
 
+        # ── 預建所有通道的視場星表快取（避免重複 cone search）──────────────
+        _field_cat_dir_pre = cfg.out_dir.parent.parent / "catalogs"
+        _ra_t_pre, _dec_t_pre = cfg.target_radec_deg
+        for _ch_pre in CHANNELS:
+            _fc_path = _field_cat_dir_pre / f"field_catalog_{_ch_pre}.csv"
+            if _fc_path.exists():
+                continue
+            _cfg_pre = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=_ch_pre,
+                                     split_subdir=_args.split_subdir, out_tag=_args.out_tag,
+                                     run_ts=_log_ts)
+            _load_or_build_field_catalog(
+                _ch_pre, _cfg_pre, _ra_t_pre, _dec_t_pre, _field_cat_dir_pre,
+            )
+
         # ── 多通道測光迴圈 ────────────────────────────────────────────────────
         channel_results: dict = {}
 
@@ -3905,6 +4015,13 @@ if __name__ == "__main__":
             print(f"  FITS 張數：{len(_fits_ch)}")
             print(f"  輸出 CSV ：{cfg_ch.phot_out_csv}")
 
+            # ── 比較星 m_cat 波段重映射（每通道用正確星表）──
+            _field_cat_dir_ch = cfg_ch.out_dir.parent.parent / "catalogs"
+            _ra_t_ch, _dec_t_ch = cfg_ch.target_radec_deg
+            _comp_refs_ch = _remap_comp_refs_to_band(
+                comp_refs, _ch, cfg_ch, _field_cat_dir_ch, _ra_t_ch, _dec_t_ch,
+            )
+
             # 同視野多目標：傳入共用比較星快取
             _active_field_key = _get_field_key(ACTIVE_TARGET, ACTIVE_DATE)
             _active_cache = _field_caches.get(_active_field_key) if _active_field_key else None
@@ -3912,7 +4029,7 @@ if __name__ == "__main__":
                 _split_dir,
                 cfg_ch.phot_out_csv,
                 cfg_ch.phot_out_png,
-                comp_refs=comp_refs,
+                comp_refs=_comp_refs_ch,
                 check_star=check_star,
                 ap_radius=cfg_ch.aperture_radius,
                 channel=_ch,
@@ -4295,8 +4412,11 @@ if __name__ == "__main__":
                                 # 暫存並覆寫全域 cfg
                                 _cfg_backup_radec = cfg.target_radec_deg
                                 _cfg_backup_name  = cfg.target_name
+                                _cfg_backup_band  = cfg.phot_band
+                                _vsx_band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
                                 cfg.target_radec_deg = (_vsx_ra, _vsx_dec)
                                 cfg.target_name = _vsx_name
+                                cfg.phot_band = _vsx_band_map.get(_vch.upper(), "V")
 
                                 _vsx_df, _ = run_photometry_on_wcs_dir(
                                     cfg.wcs_dir,
@@ -4324,5 +4444,6 @@ if __name__ == "__main__":
                             finally:
                                 cfg.target_radec_deg = _cfg_backup_radec
                                 cfg.target_name = _cfg_backup_name
+                                cfg.phot_band = _cfg_backup_band
 
                     print(f"\n  [VSX 額外目標] 全部完成")
