@@ -160,11 +160,14 @@ class Cfg:
     robust_regression_max_iter: int = 5
     robust_regression_min_points: int = 3
 
-    # ── Ensemble 正規化（Broeg 2005, §3.9）───────────────────────────────────
-    ensemble_normalize: bool = False       # yaml: ensemble_normalize: true
-    ensemble_min_comp: int = 3             # 啟用 ensemble 所需最少比較星數
-    ensemble_max_iter: int = 10            # Broeg 迭代上限
-    ensemble_convergence_tol: float = 1e-4  # 收斂閾值（mag）
+    # ── ⏸ Ensemble 正規化（Broeg 2005, §3.9）── 已停用，待決定 ──────────────────
+    # 理由：v1.6+ 逐幀自由斜率回歸 (ZP fit) 已消除逐幀大氣。
+    #       ensemble 重複修正同一問題，可能引入額外雜訊。
+    # 設定保留供未來重啟，但 run_photometry_on_wcs_dir() 簡化版本已跳過呼叫。
+    ensemble_normalize: bool = False       # yaml: ensemble_normalize: true（已停用）
+    ensemble_min_comp: int = 3             # 啟用 ensemble 所需最少比較星數（已停用）
+    ensemble_max_iter: int = 10            # Broeg 迭代上限（已停用）
+    ensemble_convergence_tol: float = 1e-4  # 收斂閾值（mag）（已停用）
 
     # ── 幀品質篩選 ────────────────────────────────────────────────────────────
     sharpness_min: float = 0.3        # Sharpness index 下限（0.0 = 停用）
@@ -2403,9 +2406,22 @@ def auto_select_comps(
     return comp_refs, active_df, check_star, aavso_matched, apass_matched, active_source, _vsx
 
 
+# =============================================================================
+# ⏸ 待決定：差分測光 (differential_mag) vs 自由斜率回歸 (ensemble normalization)
+# =============================================================================
+# 背景：v1.6+ 採用逐幀自由斜率回歸 fit(m_cat = a·m_inst + ZP)，已消除大氣漂移。
+#      差分測光 & ensemble 正規化均解決同一問題（逐幀大氣修正），二選一即可。
+#      目前回歸已完全滿足需求（R²≥0.9），故暫停差分測光&正規化。
+# 決議：待驗證 ensemble normalization 的實際貢獻（可能引入雜訊）。
+#      完全消除後需併同此檔案再行決定。
+
 def differential_mag(m_var_inst: float, m_ref_inst: float, m_ref_cat: float) -> float:
     """
+    ⏸ 已停用：differential_mag 為舊式單比較星差分測光。
     m_var = m_var_inst - (m_ref_inst - m_ref_cat)
+
+    應用場景：無 ZP 回歸時的手工差分校正。
+    目前不用，因逐幀自由斜率回歸已足夠。
     """
     if not np.isfinite(m_var_inst) or not np.isfinite(m_ref_inst):
         return np.nan
@@ -2422,7 +2438,13 @@ def ensemble_normalize(
     convergence_tol: float = 1e-4,
 ) -> "tuple[pd.DataFrame, pd.Series]":
     """
-    Broeg (2005) ensemble normalisation.
+    ⏸ 已停用：Broeg (2005) ensemble normalisation.
+
+    理由：逐幀自由斜率回歸 (ZP fit) 已完全消除逐幀大氣漂移，
+         ensemble 正規化解決的是同一問題，二者不應疊加（可能引入雜訊）。
+    待驗：確認移除後 R² 無退化。
+
+    ─── 原始文件 ───
 
     每顆比較星 i 的儀器星等時間序列 m_i(t) 估計共同大氣漂移 Δ(t)，
     然後對目標星星等做修正：m_var_norm(t) = m_var(t) − Δ(t)。
@@ -2766,7 +2788,9 @@ def run_photometry_on_wcs_dir(
     r_in, r_out = compute_annulus_radii(ap_radius, cfg.annulus_r_in, cfg.annulus_r_out)
     margin = int(np.ceil(r_out + 2))
 
-    # ── Ensemble 正規化設定（從 cfg 讀取，cfg_from_yaml 負責從 yaml 注入）────
+    # ── ⏸ Ensemble 正規化設定（已停用，保留供未來重啟）────────────────────────────
+    # 原本邏輯：_ensemble_on=True 時調用 ensemble_normalize() 迭代計算 Δ(t)。
+    # 現況：簡化版本已跳過呼叫，直接使用 ZP 回歸結果（見下文 3659-3700 之簡化版）。
     _ensemble_on = bool(getattr(cfg, "ensemble_normalize", False))
     _ensemble_min_comp = int(getattr(cfg, "ensemble_min_comp", 3))
     _ensemble_max_iter = int(getattr(cfg, "ensemble_max_iter", 10))
@@ -2982,7 +3006,9 @@ def run_photometry_on_wcs_dir(
             comp_m_cat.append(float(m_cat))
             comp_weights.append(weight)
 
-            # ── 累積 comp_lightcurves（ensemble 正規化用）────────────────────
+            # ── ⏸ 累積 comp_lightcurves（ensemble 正規化用，已停用）──────────────
+            # 原本用途：ensemble_normalize() 需要所有比較星的 m_inst 時間序列。
+            # 現況：_ensemble_on 永遠 False，此段無法執行，保留作參考。
             if _ensemble_on:
                 _sid = f"{ra_c:.6f}_{dec_c:.6f}"
                 if _sid not in _comp_lc_buf:
@@ -3637,10 +3663,13 @@ def run_photometry_on_wcs_dir(
             fig2.tight_layout()
             plt.close("all")
 
-    # ── Broeg (2005) ensemble 正規化 ─────────────────────────────────────────
-    # 條件：ensemble_normalize: true 且累積到的比較星數 ≥ ensemble_min_comp。
-    # 結果欄位：m_var_norm（修正後）、delta_ensemble（Δ(t) 漂移量）。
-    # ensemble 停用或條件不足時，m_var_norm = m_var（直通，不影響現有欄位）。
+    # ── ⏸ 待決定：Broeg (2005) ensemble 正規化 ─────────────────────────────────
+    # 理由：逐幀自由斜率回歸 (ZP fit) 已消除逐幀大氣，ensemble 重複修正可能引入雜訊。
+    # 待驗：移除後 R² 是否有變化（預期無）。
+    # 原本邏輯：_ensemble_on=True 時迭代算 Δ(t)，然後 m_var_norm = m_var - Δ(t)。
+    # 簡化版本：關閉 ensemble，m_var_norm 直接 = m_var（ZP 回歸後的校正星等）。
+    """
+    # ── 原始 ensemble 迴圈（已停用，整塊保留作參考）────────────────────────────────
     comp_lightcurves: "dict[str, pd.Series]" = {}
     if _ensemble_on:
         # _comp_lc_buf → pd.Series，index = time 值
@@ -3676,6 +3705,10 @@ def run_photometry_on_wcs_dir(
         # ensemble 停用：m_var_norm 直通 m_var
         df["m_var_norm"] = df["m_var"]
         df["delta_ensemble"] = np.nan
+    """
+    # ── 簡化版本：直接用 ZP 回歸結果 ──────────────────────────────────────────────
+    df["m_var_norm"] = df["m_var"]        # 直通 ZP 回歸的 m_var，不加 ensemble 修正
+    df["delta_ensemble"] = np.nan         # 預留欄位，暫不計算
 
     # ── 光變曲線圖（ensemble 之後重畫，使用 m_var_norm）──────────────────────
     plot_light_curve(df, out_png, channel, cfg, obs_date=_lc_obs_date)
