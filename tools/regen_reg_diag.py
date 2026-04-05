@@ -1,11 +1,11 @@
 """
-regen_zp_diag.py — 從現有 CSV + catalog 重新生成 ZP 診斷圖
+regen_reg_diag.py — 從現有 CSV + catalog 重新生成回歸診斷圖
 只需跑第一幀，不重跑全部測光。
 
 用法：
-  python regen_zp_diag.py --target CCAnd --date 20251122 --out-tag sat65536
-  python regen_zp_diag.py --target CCAnd --date 20251122   # 預設 output 目錄
-  python regen_zp_diag.py --all-targets --date 20251122 --out-tag sat65536
+  python regen_reg_diag.py --target CCAnd --date 20251122 --out-tag sat65536
+  python regen_reg_diag.py --target CCAnd --date 20251122   # 預設 output 目錄
+  python regen_reg_diag.py --all-targets --date 20251122 --out-tag sat65536
 """
 import sys, argparse, glob, warnings
 from pathlib import Path
@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore")
 
 # ── photometry.py 裡的工具函式直接 import ──────────────────
 sys.path.insert(0, str(Path(__file__).parent))
-from photometry import aperture_photometry, robust_zero_point, is_saturated, load_pipeline_config, cfg_from_yaml
+from photometry import aperture_photometry, robust_linear_fit, is_saturated, load_pipeline_config, cfg_from_yaml
 
 DATA_ROOT = Path(r"D:\VarStar\data\targets")
 
@@ -42,12 +42,12 @@ def _inst_mag(flux):
         return np.where(flux > 0, -2.5 * np.log10(flux), np.nan)
 
 def regen_one(target, date, out_tag, channels, cfg_yaml):
-    """重新生成一個目標一個日期的 ZP 診斷圖（所有通道）"""
+    """重新生成一個目標一個日期的回歸診斷圖（所有通道）"""
     out_dir_name = f"output_{out_tag}" if out_tag else "output"
     tgt_dir  = DATA_ROOT / target
     out_dir  = tgt_dir / out_dir_name
     cat_dir  = out_dir / "catalogs"
-    diag_dir = out_dir / "calibration_diag"
+    diag_dir = out_dir / "regression_diag"
     diag_dir.mkdir(parents=True, exist_ok=True)
 
     # 讀 catalog（合併 AAVSO + APASS + Tycho2）
@@ -102,7 +102,7 @@ def regen_one(target, date, out_tag, channels, cfg_yaml):
                         continue
                     ph = aperture_photometry(img, float(px), float(py), r, r_in, r_out)
                     # 飽和剔除已停用（cfg.saturation_threshold = 65536 = 全開）
-                    # V1162Ori 有 4 等亮星；ZP scatter 保留亮端資料，依賴 R² 監控非線性
+                    # V1162Ori 有 4 等亮星；scatter 保留亮端資料，依賴 R² 監控非線性
                     if ph.get("ok") == 1 and ph.get("flux_net", 0) > 0:
                         m_cat_list.append(float(row["vmag"]))
                         m_inst_list.append(_inst_mag(ph["flux_net"]))
@@ -129,8 +129,8 @@ def regen_one(target, date, out_tag, channels, cfg_yaml):
                 else:
                     tgt_minst = np.nan
 
-                # ZP 擬合（只用篩選後的星）
-                fit = robust_zero_point(mi_filt, mc_filt) if len(mc_filt) >= 3 else None
+                # 回歸擬合（只用篩選後的星）
+                fit = robust_linear_fit(mi_filt, mc_filt) if len(mc_filt) >= 3 else None
                 r2_str = f"{fit['r2']:.3f}" if fit else "N/A"
                 first_frame_data = (mc_filt, mi_filt, fit, tgt_vmag, tgt_minst)
                 print(f"  [{ch}] 比較星 n={len(mc_filt)} (篩{MAG_BRIGHT:.1f}–{MAG_FAINT:.1f}等), R²={r2_str}")
@@ -145,10 +145,10 @@ def regen_one(target, date, out_tag, channels, cfg_yaml):
 
         # 左圖：RMS vs time
         ax_ts = axes[0]
-        if "zp_residual_rms" in df_ok.columns and np.isfinite(df_ok["zp_residual_rms"]).any():
-            ax_ts.plot(df_ok[time_key], df_ok["zp_residual_rms"],
+        if "reg_residual_rms" in df_ok.columns and np.isfinite(df_ok["reg_residual_rms"]).any():
+            ax_ts.plot(df_ok[time_key], df_ok["reg_residual_rms"],
                        "o-", ms=3, lw=0.8, color="steelblue", alpha=0.7)
-            med = df_ok["zp_residual_rms"].median()
+            med = df_ok["reg_residual_rms"].median()
             ax_ts.axhline(med, color="red", lw=1, ls="--",
                           label=f"median={med:.4f}")
             ax_ts.set_xlabel(time_key.upper())
@@ -213,7 +213,7 @@ def regen_one(target, date, out_tag, channels, cfg_yaml):
             ax_sc.invert_yaxis()
             ax_sc.set_xlabel("$m_{cat}$ (V)")
             ax_sc.set_ylabel("$m_{inst}$")
-            ax_sc.set_title(f"Frame 1 ZP scatter ({MAG_BRIGHT:.1f}–{MAG_FAINT:.1f} mag)")
+            ax_sc.set_title(f"Frame 1 Regression ({MAG_BRIGHT:.1f}–{MAG_FAINT:.1f} mag)")
             ax_sc.legend(fontsize=7, frameon=False)
             ax_sc.grid(True, alpha=0.3)
         else:
@@ -226,10 +226,10 @@ def regen_one(target, date, out_tag, channels, cfg_yaml):
             fontsize=10)
         fig.tight_layout()
 
-        out_png = diag_dir / f"zp_overview_{ch}_{ch}_{date}.png"
+        out_png = diag_dir / f"reg_overview_{ch}_{ch}_{date}.png"
         fig.savefig(out_png, dpi=150)
         plt.close(fig)
-        print(f"  [{ch}] ZP 圖已輸出: {out_png}")
+        print(f"  [{ch}] 回歸圖已輸出: {out_png}")
 
 
 # ── CLI ───────────────────────────────────────────────────────

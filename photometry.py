@@ -71,7 +71,7 @@ class Cfg:
     out_dir: Path = Path(".")
     phot_out_csv: Path = Path("photometry.csv")
     phot_out_png: Path = Path("light_curve.png")
-    zeropoint_diag_dir: Path = Path("calibration_diag")
+    regression_diag_dir: Path = Path("regression_diag")
     run_root: Path = Path(".")     # output/{date}/{group}/{target}/{timestamp}/
 
     # ── 目標 ──────────────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ class Cfg:
     aavso_seq_csv: Path | None = None
     aavso_use_api: bool = True
     catalog_priority: list = field(default_factory=lambda: ["AAVSO", "APASS"])
-    save_zeropoint_diagnostic: bool = True
+    save_regression_diagnostic: bool = True
 
     # ── 孔徑測光 ──────────────────────────────────────────────────────────────
     aperture_auto: bool = True
@@ -161,7 +161,7 @@ class Cfg:
     robust_regression_min_points: int = 3
 
     # ── ⏸ Ensemble 正規化（Broeg 2005, §3.9）── 已停用，待決定 ──────────────────
-    # 理由：v1.6+ 逐幀自由斜率回歸 (ZP fit) 已消除逐幀大氣。
+    # 理由：v1.6+ 逐幀自由斜率回歸已消除逐幀大氣。
     #       ensemble 重複修正同一問題，可能引入額外雜訊。
     # 設定保留供未來重啟，但 run_photometry_on_wcs_dir() 簡化版本已跳過呼叫。
     ensemble_normalize: bool = False       # yaml: ensemble_normalize: true（已停用）
@@ -171,10 +171,10 @@ class Cfg:
 
     # ── 幀品質篩選 ────────────────────────────────────────────────────────────
     sharpness_min: float = 0.3        # Sharpness index 下限（0.0 = 停用）
-    zp_r2_min: float = 0.0            # ZP 回歸 R² 下限（0.0 = 停用）
+    reg_r2_min: float = 0.0            # 回歸 R² 下限（0.0 = 停用）
     peak_ratio_min: float = 0.0       # [deprecated] 峰值比固定下限（0.0=停用）；建議改用 peak_ratio_k
     peak_ratio_k: float = 0.0         # 自適應門檻倍數（0.0=停用）；peak_ratio < median - k×MAD 時剔除
-    zp_intercept_sigma: float = 0.0   # ZP 截距突變閾值（倍 MAD，0.0 = 停用）；薄雲/透明度驟變偵測
+    reg_intercept_sigma: float = 0.0   # 回歸截距突變閾值（倍 MAD，0.0 = 停用）；薄雲/透明度驟變偵測
     sky_sigma: float = 0.0            # 背景突升閾值（倍 MAD，0.0 = 停用）；起霧/散射光偵測
 
     # ── 舊版相容（ASTAP 板塊解算，保留供 Cell 5 使用）────────────────────────
@@ -342,7 +342,7 @@ def cfg_from_yaml(
     run_root = project_root / "output" / _date_fmt / group / target / _run_ts
     out_dir  = run_root / "1_photometry"
     out_dir.mkdir(parents=True, exist_ok=True)
-    diag_dir = run_root / "2_calibration_diag"
+    diag_dir = run_root / "2_regression_diag"
     diag_dir.mkdir(parents=True, exist_ok=True)
     lc_dir   = run_root / "3_light_curve"
     lc_dir.mkdir(parents=True, exist_ok=True)
@@ -382,7 +382,7 @@ def cfg_from_yaml(
         out_dir=out_dir,
         phot_out_csv=out_dir / f"photometry_{channel}_{session_date}.csv",
         phot_out_png=lc_dir / f"light_curve_{channel}_{session_date}.png",
-        zeropoint_diag_dir=diag_dir,
+        regression_diag_dir=diag_dir,
 
         # 目標
         target_name=display,
@@ -405,7 +405,7 @@ def cfg_from_yaml(
         aavso_maglimit=float(cmp_cfg.get("aavso_maglimit", 15.0)),
         aavso_min_stars=int(cmp_cfg.get("aavso_min_stars", 5)),
         catalog_priority=list(cmp_cfg.get("catalog_priority", ["AAVSO", "APASS"])),
-        save_zeropoint_diagnostic=bool(cmp_cfg.get("save_zeropoint_diagnostic", True)),
+        save_regression_diagnostic=bool(cmp_cfg.get("save_regression_diagnostic", True)),
 
         # 孔徑測光
         aperture_auto=True,
@@ -1005,7 +1005,7 @@ def estimate_aperture_radius(
     return float(np.nanmedian(radii)) if radii else None
 
 
-def robust_zero_point(
+def robust_linear_fit(
     m_inst: np.ndarray,
     m_cat: np.ndarray,
     sigma: float = 3.0,
@@ -1031,7 +1031,7 @@ def robust_zero_point(
     to 1.0.  Significant deviation indicates colour-dependent atmospheric
     extinction or a poorly-matched comparison ensemble; investigate before
     accepting the result.  R² is provided so the caller can flag low-quality
-    zero-point solutions (R² < 0.95 warrants inspection).
+    regression solutions (R² < 0.95 warrants inspection).
     """
     m_inst = np.asarray(m_inst, dtype=float)
     m_cat  = np.asarray(m_cat,  dtype=float)
@@ -1947,7 +1947,7 @@ def _match_catalog_to_detected(
     return matched
 
 
-def _save_zeropoint_diagnostic(
+def _save_regression_diagnostic(
     frame_name: str,
     aavso_matched: "pd.DataFrame | None",
     apass_matched: "pd.DataFrame | None",
@@ -1999,14 +1999,14 @@ def _save_zeropoint_diagnostic(
     ax.set_xlabel("Catalogue magnitude  $m_{cat}$")
     ax.set_ylabel("Instrumental magnitude  $m_{inst}$")
     ax.set_title(
-        f"Calibration Fit Diagnostic  [{frame_name}]\n"
+        f"Regression Fit Diagnostic  [{frame_name}]\n"
         f"Active source: {active_source}",
         fontsize=9,
     )
     ax.legend(fontsize=7, loc="upper left")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    out_path = diag_dir / f"cal_diag_{Path(frame_name).stem}.png"
+    out_path = diag_dir / f"reg_diag_{Path(frame_name).stem}.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -2098,7 +2098,7 @@ def _load_or_build_field_catalog(
                 tycho_raw = fetch_tycho2_cone(
                     ra_t, dec_t,
                     radius_arcmin=cfg.apass_radius_deg * 60.0,
-                    mag_min=cfg.comp_mag_min, mag_max=cfg.comp_mag_max,
+                    mag_min=3.0, mag_max=16.0,  # 寬範圍：快取全視場，實際篩選在 _catalog_direct_phot
                 )
                 if len(tycho_raw) > 0:
                     _keep_tycho = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
@@ -2116,8 +2116,8 @@ def _load_or_build_field_catalog(
                 gaia_raw = fetch_gaia_dr3_cone(
                     ra_t, dec_t,
                     radius_arcmin=cfg.apass_radius_deg * 60.0,
-                    mag_min=cfg.comp_mag_min,
-                    mag_max=cfg.comp_mag_max,
+                    mag_min=3.0,       # 寬範圍：快取全視場，實際篩選在 _catalog_direct_phot
+                    mag_max=16.0,
                     channel=_gaia_channel,
                 )
                 if len(gaia_raw) > 0:
@@ -2261,10 +2261,11 @@ def auto_select_comps(
 
     def _catalog_direct_phot(cat_df, ra_col, dec_col, mag_col, err_col, mag_min, mag_max):
         """從星表座標直接做孔徑測光，回傳通過篩選的 DataFrame。
-        排除條件：(a) 超出影像邊界+孔徑；(b) aperture 內 max_pix >= 飽和閾值。
+        排除條件：(a) mag 範圍外；(b) 選取圓外；(c) 影像邊界外；
+                  (d) 飽和；(e) 測光失敗。
         """
         rows = []
-        n_bounds, n_sat, n_phot = 0, 0, 0
+        n_mag_out, n_circle, n_bounds, n_sat, n_phot = 0, 0, 0, 0, 0
         _diag_bounds_rows = []   # 收集邊界排除的候選星（診斷用）
         for _, row in cat_df.iterrows():
             try:
@@ -2276,12 +2277,14 @@ def auto_select_comps(
             except (KeyError, TypeError, ValueError):
                 continue
             if not (mag_min <= m_c <= mag_max):
+                n_mag_out += 1
                 continue
             xc, yc = radec_to_pixel(wcs_obj, ra_c, dec_c)
             # 選取圓：影像中心為圓心，半徑 = 短邊 / 2
             _cx, _cy = _w / 2.0, _h / 2.0
             _sel_r   = float(min(_h, _w)) / 2.0
             if np.hypot(xc - _cx, yc - _cy) > _sel_r:
+                n_circle += 1
                 continue
             if not in_bounds(img, xc, yc, margin=_margin):
                 n_bounds += 1
@@ -2302,8 +2305,10 @@ def auto_select_comps(
                 "m_cat": m_c, "m_err": m_e,
                 "m_inst": m_inst, "m_inst_matched": m_inst,
             })
-        print(f"  [直接測光] 星表={len(cat_df)}  mag範圍外跳過  "
-              f"邊界排除={n_bounds}  飽和排除={n_sat}  測光失敗={n_phot}  通過={len(rows)}")
+        print(f"  [直接測光] 星表={len(cat_df)}  "
+              f"mag範圍外={n_mag_out}({mag_min:.1f}-{mag_max:.1f})  "
+              f"選取圓外={n_circle}  邊界排除={n_bounds}  "
+              f"飽和={n_sat}  測光失敗={n_phot}  通過={len(rows)}")
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     # ── 3–5. 視場星表快取 / 全天查詢（委派給 _load_or_build_field_catalog）────
@@ -2409,7 +2414,7 @@ def auto_select_comps(
 # =============================================================================
 # ⏸ 待決定：差分測光 (differential_mag) vs 自由斜率回歸 (ensemble normalization)
 # =============================================================================
-# 背景：v1.6+ 採用逐幀自由斜率回歸 fit(m_cat = a·m_inst + ZP)，已消除大氣漂移。
+# 背景：v1.6+ 採用逐幀自由斜率回歸 fit(m_inst = a·m_cat + b)，已消除大氣漂移。
 #      差分測光 & ensemble 正規化均解決同一問題（逐幀大氣修正），二選一即可。
 #      目前回歸已完全滿足需求（R²≥0.9），故暫停差分測光&正規化。
 # 決議：待驗證 ensemble normalization 的實際貢獻（可能引入雜訊）。
@@ -2420,7 +2425,7 @@ def differential_mag(m_var_inst: float, m_ref_inst: float, m_ref_cat: float) -> 
     ⏸ 已停用：differential_mag 為舊式單比較星差分測光。
     m_var = m_var_inst - (m_ref_inst - m_ref_cat)
 
-    應用場景：無 ZP 回歸時的手工差分校正。
+    應用場景：無回歸時的手工差分校正。
     目前不用，因逐幀自由斜率回歸已足夠。
     """
     if not np.isfinite(m_var_inst) or not np.isfinite(m_ref_inst):
@@ -2440,7 +2445,7 @@ def ensemble_normalize(
     """
     ⏸ 已停用：Broeg (2005) ensemble normalisation.
 
-    理由：逐幀自由斜率回歸 (ZP fit) 已完全消除逐幀大氣漂移，
+    理由：逐幀自由斜率回歸已完全消除逐幀大氣漂移，
          ensemble 正規化解決的是同一問題，二者不應疊加（可能引入雜訊）。
     待驗：確認移除後 R² 無退化。
 
@@ -2569,9 +2574,9 @@ def ensemble_normalize(
     )
     # delta_new 是儀器星等空間的漂移量；m_var 是校正星等空間 (m_inst-b)/a。
     # 轉換：delta_catalog = delta_inst / a，才能從 m_var 中正確扣除。
-    _zp_slope = df_out["zp_slope"].values if "zp_slope" in df_out.columns else np.ones(len(df_out))
-    _zp_slope_safe = np.where(np.isfinite(_zp_slope) & (_zp_slope != 0), _zp_slope, 1.0)
-    delta_scaled = delta_new / _zp_slope_safe
+    _reg_slope = df_out["reg_slope"].values if "reg_slope" in df_out.columns else np.ones(len(df_out))
+    _reg_slope_safe = np.where(np.isfinite(_reg_slope) & (_reg_slope != 0), _reg_slope, 1.0)
+    delta_scaled = delta_new / _reg_slope_safe
 
     m_var_norm = np.where(
         np.isfinite(df_out["m_var"].values) & np.isfinite(delta_scaled),
@@ -2771,7 +2776,7 @@ def run_photometry_on_wcs_dir(
     Per-frame aperture differential photometry.
 
     Time system : BJD_TDB (Eastman et al., 2010) at exposure midpoint.
-    Zero point  : robust iterative linear regression (see robust_zero_point).
+    Zero point  : robust iterative linear regression (see robust_linear_fit).
     Airmass     : Young (1994); frames with X > 2.0 are flagged but kept.
 
     Returns
@@ -2790,7 +2795,7 @@ def run_photometry_on_wcs_dir(
 
     # ── ⏸ Ensemble 正規化設定（已停用，保留供未來重啟）────────────────────────────
     # 原本邏輯：_ensemble_on=True 時調用 ensemble_normalize() 迭代計算 Δ(t)。
-    # 現況：簡化版本已跳過呼叫，直接使用 ZP 回歸結果（見下文 3659-3700 之簡化版）。
+    # 現況：簡化版本已跳過呼叫，直接使用回歸結果（見下文 3659-3700 之簡化版）。
     _ensemble_on = bool(getattr(cfg, "ensemble_normalize", False))
     _ensemble_min_comp = int(getattr(cfg, "ensemble_min_comp", 3))
     _ensemble_max_iter = int(getattr(cfg, "ensemble_max_iter", 10))
@@ -2812,7 +2817,7 @@ def run_photometry_on_wcs_dir(
     n_high_fwhm      = 0
     n_low_sharpness  = 0
     n_low_peak_ratio = 0
-    n_low_zp_r2      = 0
+    n_low_reg_r2      = 0
     rows = []
     _first_frame_diag_data = None   # (comp_m_cat, comp_m_inst, fit) for diag plot
 
@@ -3023,7 +3028,7 @@ def run_photometry_on_wcs_dir(
             rows.append(rec)
             continue
 
-        fit = robust_zero_point(
+        fit = robust_linear_fit(
             comp_m_inst, comp_m_cat,
             sigma=cfg.robust_regression_sigma,
             max_iter=cfg.robust_regression_max_iter,
@@ -3031,30 +3036,12 @@ def run_photometry_on_wcs_dir(
             weights=np.asarray(comp_weights, dtype=float),
         )
 
-        # 捕捉第一幀資料供診斷圖使用（含目標星儀器星等；先做星等範圍篩選）
+        # 捕捉第一幀資料供診斷圖使用（全部比較星 + 實際 fit）
         if _first_frame_diag_data is None and len(comp_m_cat) >= 2:
-            _tgt_vmag_diag = float(getattr(cfg, "vmag_approx", np.nan))
-            if np.isfinite(_tgt_vmag_diag):
-                _diag_bright = _tgt_vmag_diag - 1.0
-                _diag_faint  = _tgt_vmag_diag + 1.5
-            else:
-                _diag_bright, _diag_faint = 8.0, 12.0
-            _diag_mag_ok = (
-                (comp_m_cat >= _diag_bright) & (comp_m_cat <= _diag_faint)
-                & np.isfinite(comp_m_cat) & np.isfinite(comp_m_inst)
-            )
-            _mc_diag = comp_m_cat[_diag_mag_ok]
-            _mi_diag = comp_m_inst[_diag_mag_ok]
-            _fit_diag = robust_zero_point(
-                _mi_diag, _mc_diag,
-                sigma=cfg.robust_regression_sigma,
-                max_iter=cfg.robust_regression_max_iter,
-                min_points=cfg.robust_regression_min_points,
-            ) if len(_mc_diag) >= cfg.robust_regression_min_points else None
             _first_frame_diag_data = (
-                _mc_diag, _mi_diag, _fit_diag,
-                _tgt_vmag_diag, float(m_inst_t),
-                _diag_bright, _diag_faint,
+                comp_m_cat.copy(), comp_m_inst.copy(), fit,
+                float(getattr(cfg, "vmag_approx", np.nan)),
+                float(m_inst_t),
             )
 
         # ── 校正擬合：自由斜率回歸（v1.5 邏輯，使用者要求）────────────────
@@ -3089,23 +3076,23 @@ def run_photometry_on_wcs_dir(
             rows.append(rec)
             continue
 
-        # ── [3] ZP R² 幀層級篩選 ─────────────────────────────────────────────
-        # zp_r2_min 預設 0.0（停用）；> 0 時才自動剔除，保留 WARN 輸出。
-        _zp_r2_min = float(getattr(cfg, "zp_r2_min", 0.0))
-        if np.isfinite(r2) and _zp_r2_min > 0 and r2 < _zp_r2_min:
+        # ── [3] 回歸 R² 幀層級篩選 ────────────────────────────────────────────
+        # reg_r2_min 預設 0.0（停用）；> 0 時才自動剔除，保留 WARN 輸出。
+        _reg_r2_min = float(getattr(cfg, "reg_r2_min", 0.0))
+        if np.isfinite(r2) and _reg_r2_min > 0 and r2 < _reg_r2_min:
             _phot_logger.warning(
-                "[WARN] low ZP R2=%.4f < %.4f in %s (channel=%s)",
-                r2, _zp_r2_min, f.name, channel,
+                "[WARN] low reg R2=%.4f < %.4f in %s (channel=%s)",
+                r2, _reg_r2_min, f.name, channel,
             )
-            rec["zp_r2"] = r2
+            rec["reg_r2"] = r2
             rec["ok"] = 0
-            rec["ok_flag"] = "low_zp_r2"
-            n_low_zp_r2 += 1
+            rec["ok_flag"] = "low_reg_r2"
+            n_low_reg_r2 += 1
             rows.append(rec)
             continue
-        elif np.isfinite(r2) and r2 < max(_zp_r2_min, 0.5):
+        elif np.isfinite(r2) and r2 < max(_reg_r2_min, 0.5):
             _phot_logger.warning(
-                "[WARN] low ZP R2=%.4f in %s (channel=%s) — consider raising zp_r2_min",
+                "[WARN] low reg R2=%.4f in %s (channel=%s) — consider raising reg_r2_min",
                 r2, f.name, channel,
             )
 
@@ -3154,12 +3141,12 @@ def run_photometry_on_wcs_dir(
             "ap_radius": ap_radius,
             "annulus_r_in": r_in,
             "annulus_r_out": r_out,
-            "zp_slope": a,           # 自由斜率回歸 slope
-            "zp_intercept": b,       # 自由斜率回歸 intercept
-            "zp_r2": r2,             # regression R²（監控用）
+            "reg_slope": a,           # 自由斜率回歸 slope
+            "reg_intercept": b,       # 自由斜率回歸 intercept
+            "reg_r2": r2,             # regression R²（監控用）
             "comp_used": comp_used,
             "flag_slope_dev": _slope_flag,
-            "zp_slope_fit": _a_fit,  # regression slope（監控用，取代 flag_extrapolated）
+            "reg_slope_fit": _a_fit,  # regression slope（監控用，取代 flag_extrapolated）
             "flag_extrapolated": _flag_extrap,
             "m_var": m_var,
         })
@@ -3169,8 +3156,8 @@ def run_photometry_on_wcs_dir(
         _m_inst_fit = comp_m_inst[mask]
         _m_inst_pred = a * _m_cat_fit + b   # 預測 m_inst（擬合方向：m_inst = a*m_cat + b）
         _residuals   = _m_inst_fit - _m_inst_pred
-        zp_resid_rms = float(np.sqrt(np.mean(_residuals ** 2))) if len(_residuals) > 0 else np.nan
-        rec["zp_residual_rms"] = zp_resid_rms
+        reg_resid_rms = float(np.sqrt(np.mean(_residuals ** 2))) if len(_residuals) > 0 else np.nan
+        rec["reg_residual_rms"] = reg_resid_rms
 
         # ── Check star ───────────────────────────────────────────────────────
         if check_star is not None:
@@ -3252,26 +3239,26 @@ def run_photometry_on_wcs_dir(
             print(f"[extinction] k={_ext_k:.3f} mag/airmass  X_ref={_X_ref:.3f}  "
                   f"median correction={_med_corr:.4f} mag  ({_ok_am.sum()} frames)")
 
-    # ── ZP 截距突變篩選 ────────────────────────────────────────────────────────
+    # ── 回歸截距突變篩選 ───────────────────────────────────────────────────────
     # 薄雲或透明度驟變時所有比較星同步變暗，零點截距 b 會系統性漂移。
-    # 滾動中位數（±5 幀）捕捉短時突變，偏離超過 zp_intercept_sigma × MAD 則剔除。
-    n_zp_jump = 0
-    _zp_intercept_sigma = float(getattr(cfg, "zp_intercept_sigma", 0.0))
-    if _zp_intercept_sigma > 0 and "zp_intercept" in df.columns:
-        _zp_col = df["zp_intercept"].copy()
-        _zp_roll_med = _zp_col.rolling(window=11, center=True, min_periods=3).median()
-        _zp_resid = (_zp_col - _zp_roll_med).abs()
-        _zp_mad = float(np.nanmedian(_zp_resid[df["ok"] == 1]))
-        _zp_thresh = _zp_intercept_sigma * 1.4826 * _zp_mad if _zp_mad > 0 else np.inf
-        _zp_jump_mask = (df["ok"] == 1) & (_zp_resid > _zp_thresh)
-        if _zp_jump_mask.any():
-            df.loc[_zp_jump_mask, "ok"] = 0
+    # 滾動中位數（±5 幀）捕捉短時突變，偏離超過 reg_intercept_sigma × MAD 則剔除。
+    n_reg_jump = 0
+    _reg_intercept_sigma = float(getattr(cfg, "reg_intercept_sigma", 0.0))
+    if _reg_intercept_sigma > 0 and "reg_intercept" in df.columns:
+        _reg_col = df["reg_intercept"].copy()
+        _reg_roll_med = _reg_col.rolling(window=11, center=True, min_periods=3).median()
+        _reg_resid = (_reg_col - _reg_roll_med).abs()
+        _reg_mad = float(np.nanmedian(_reg_resid[df["ok"] == 1]))
+        _reg_thresh = _reg_intercept_sigma * 1.4826 * _reg_mad if _reg_mad > 0 else np.inf
+        _reg_jump_mask = (df["ok"] == 1) & (_reg_resid > _reg_thresh)
+        if _reg_jump_mask.any():
+            df.loc[_reg_jump_mask, "ok"] = 0
             if "ok_flag" not in df.columns:
                 df["ok_flag"] = ""
-            df.loc[_zp_jump_mask, "ok_flag"] = "zp_jump"
-            n_zp_jump = int(_zp_jump_mask.sum())
-            print(f"[zp_jump] MAD={_zp_mad:.4f}  thresh={_zp_thresh:.4f}  "
-                  f"clipped {n_zp_jump} frames")
+            df.loc[_reg_jump_mask, "ok_flag"] = "reg_jump"
+            n_reg_jump = int(_reg_jump_mask.sum())
+            print(f"[reg_jump] MAD={_reg_mad:.4f}  thresh={_reg_thresh:.4f}  "
+                  f"clipped {n_reg_jump} frames")
 
     # ── 天空背景突升篩選 ──────────────────────────────────────────────────────
     # 起霧或散射光使目標孔徑背景環中位數升高，t_b_sky 突升可做為霧的早期指標。
@@ -3327,11 +3314,11 @@ def run_photometry_on_wcs_dir(
     _n_high_fwhm_val     = n_high_fwhm
     _n_low_sharpness_val = n_low_sharpness
     _n_low_peak_ratio_val = n_low_peak_ratio
-    _n_low_zp_r2_val     = n_low_zp_r2
+    _n_low_reg_r2_val     = n_low_reg_r2
     # 重新計算 _n_phot_fail：排除所有已命名篩選計數
     _n_qual_filtered = (_n_high_fwhm_val + _n_low_sharpness_val
-                        + _n_low_peak_ratio_val + _n_low_zp_r2_val
-                        + n_zp_jump + n_high_sky + n_low_peak_ratio_adaptive)
+                        + _n_low_peak_ratio_val + _n_low_reg_r2_val
+                        + n_reg_jump + n_high_sky + n_low_peak_ratio_adaptive)
     _n_phot_fail   = _n_in_df - _n_ok_final - _n_sigma_clip - _n_qual_filtered
 
     _sep = "-" * 68
@@ -3343,10 +3330,10 @@ def run_photometry_on_wcs_dir(
     print(f"  {'高 FWHM 幀剔除':<24} {_n_high_fwhm_val:>6}    frame_fwhm_median > {cfg.comp_fwhm_max:.1f} px")
     print(f"  {'低 Sharpness 剔除':<24} {_n_low_sharpness_val:>6}    S=flux(r=3)/flux(r=8) < {float(getattr(cfg,'sharpness_min',0.3)):.2f}")
     print(f"  {'低 Peak Ratio 剔除':<24} {_n_low_peak_ratio_val:>6}    peak/flux < {float(getattr(cfg,'peak_ratio_min',0.0)):.3f} (0=停用)")
-    print(f"  {'低 ZP R2 剔除':<24} {_n_low_zp_r2_val:>6}    zp_r2 < {float(getattr(cfg,'zp_r2_min',0.0)):.2f} (0=停用)")
+    print(f"  {'低 reg R2 剔除':<24} {_n_low_reg_r2_val:>6}    reg_r2 < {float(getattr(cfg,'reg_r2_min',0.0)):.2f} (0=停用)")
     print(f"  {'孔徑/WCS/邊界失敗':<24} {_n_phot_fail:>6}    flux/位置無效")
     print(f"  {'sigma_clip':<24} {_n_sigma_clip:>6}    |m_var - median| > 3 * 1.4826 * MAD")
-    print(f"  {'ZP 截距突變':<24} {n_zp_jump:>6}    rolling median ± {float(getattr(cfg,'zp_intercept_sigma',0.0)):.1f} MAD (0=停用)")
+    print(f"  {'回歸截距突變':<24} {n_reg_jump:>6}    rolling median ± {float(getattr(cfg,'reg_intercept_sigma',0.0)):.1f} MAD (0=停用)")
     print(f"  {'天空背景突升':<24} {n_high_sky:>6}    rolling median + {float(getattr(cfg,'sky_sigma',0.0)):.1f} MAD (0=停用)")
     print(f"  {'Peak Ratio 自適應':<24} {n_low_peak_ratio_adaptive:>6}    median - {float(getattr(cfg,'peak_ratio_k',0.0)):.1f} MAD (0=停用)")
     print(_sep)
@@ -3359,10 +3346,10 @@ def run_photometry_on_wcs_dir(
         {"reason": "高 FWHM 幀剔除",   "count": _n_high_fwhm_val,       "threshold": f"fwhm > {cfg.comp_fwhm_max:.1f} px",                                "config_key": "max_fwhm_px",         "config_value": cfg.comp_fwhm_max},
         {"reason": "低 Sharpness 剔除", "count": _n_low_sharpness_val,   "threshold": f"S < {float(getattr(cfg,'sharpness_min',0.3)):.2f}",                 "config_key": "sharpness_min",       "config_value": float(getattr(cfg, "sharpness_min", 0.3))},
         {"reason": "低 Peak Ratio 剔除","count": _n_low_peak_ratio_val,  "threshold": f"peak/flux < {float(getattr(cfg,'peak_ratio_min',0.0)):.3f}",        "config_key": "peak_ratio_min",      "config_value": float(getattr(cfg, "peak_ratio_min", 0.0))},
-        {"reason": "低 ZP R2 剔除",    "count": _n_low_zp_r2_val,       "threshold": f"zp_r2 < {float(getattr(cfg,'zp_r2_min',0.0)):.2f}",                 "config_key": "zp_r2_min",           "config_value": float(getattr(cfg, "zp_r2_min", 0.0))},
+        {"reason": "低 reg R2 剔除",    "count": _n_low_reg_r2_val,       "threshold": f"reg_r2 < {float(getattr(cfg,'reg_r2_min',0.0)):.2f}",                 "config_key": "reg_r2_min",           "config_value": float(getattr(cfg, "reg_r2_min", 0.0))},
         {"reason": "孔徑/WCS/邊界失敗", "count": _n_phot_fail,           "threshold": "flux/位置無效",                                                     "config_key": "—",                   "config_value": "—"},
         {"reason": "sigma_clip",        "count": _n_sigma_clip,          "threshold": "|m_var - median| > 3 * 1.4826 * MAD",                               "config_key": "—",                   "config_value": "—"},
-        {"reason": "ZP 截距突變",       "count": n_zp_jump,              "threshold": f"rolling |zp_intercept - med| > {float(getattr(cfg,'zp_intercept_sigma',0.0)):.1f} MAD", "config_key": "zp_intercept_sigma", "config_value": float(getattr(cfg, "zp_intercept_sigma", 0.0))},
+        {"reason": "回歸截距突變",       "count": n_reg_jump,              "threshold": f"rolling |reg_intercept - med| > {float(getattr(cfg,'reg_intercept_sigma',0.0)):.1f} MAD", "config_key": "reg_intercept_sigma", "config_value": float(getattr(cfg, "reg_intercept_sigma", 0.0))},
         {"reason": "天空背景突升",       "count": n_high_sky,                    "threshold": f"rolling (t_b_sky - med) > {float(getattr(cfg,'sky_sigma',0.0)):.1f} MAD",                     "config_key": "sky_sigma",           "config_value": float(getattr(cfg, "sky_sigma", 0.0))},
         {"reason": "Peak Ratio 自適應", "count": n_low_peak_ratio_adaptive,    "threshold": f"peak_ratio < median - {float(getattr(cfg,'peak_ratio_k',0.0)):.1f} * 1.4826 * MAD",           "config_key": "peak_ratio_k",        "config_value": float(getattr(cfg, "peak_ratio_k", 0.0))},
         {"reason": "保留 (ok=1)",       "count": _n_ok_final,                   "threshold": f"/ {_n_total_fits} 幀",                                                                         "config_key": "—",                   "config_value": "—"},
@@ -3382,155 +3369,126 @@ def run_photometry_on_wcs_dir(
           f"[{_n_before_clip - _n_after_clip} sigma-clipped], "
           f"{n_skipped} skipped [airmass > {cfg.alt_min_airmass:.3f}])")
 
-    # ── 零點診斷總覽圖：殘差時序 + 第一幀散佈圖 ─────────────────────────────
-    if cfg.save_zeropoint_diagnostic:
+    # ── 回歸診斷總覽圖：回歸散佈圖（主）+ RMS 時序（輔）──────────────────────
+    if cfg.save_regression_diagnostic:
         try:
-            _zp_diag_path = cfg.zeropoint_diag_dir / (
-                f"cal_overview_{out_csv.stem.split('_')[1]}_{out_csv.stem.split('_', 1)[-1]}.png"
+            _reg_diag_path = cfg.regression_diag_dir / (
+                f"reg_overview_{out_csv.stem.split('_')[1]}_{out_csv.stem.split('_', 1)[-1]}.png"
             )
             _df_ok = df[df["ok"] == 1].copy()
-            fig_diag, axes_diag = plt.subplots(
-                1, 2, figsize=(14, 5),
-                gridspec_kw={"width_ratios": [2, 1]}
-            )
+            import datetime as _dt_reg
+            import matplotlib.ticker as _mticker_reg
+            import matplotlib.gridspec as _mgs
 
-            # 左：殘差時序圖
-            import datetime as _dt_zp
-            import matplotlib.ticker as _mticker_zp
-            ax_ts = axes_diag[0]
-            if "zp_residual_rms" in _df_ok.columns and np.isfinite(_df_ok["zp_residual_rms"]).any():
-                ax_ts.plot(
-                    _df_ok[time_key], _df_ok["zp_residual_rms"],
-                    "o-", ms=3, lw=0.8, color="steelblue", alpha=0.7
-                )
-                ax_ts.axhline(
-                    _df_ok["zp_residual_rms"].median(), color="red",
-                    lw=1, ls="--", label=f"median={_df_ok['zp_residual_rms'].median():.4f}"
-                )
-                ax_ts.set_xlabel(time_key.upper())
-                ax_ts.set_ylabel("Calibration Residual RMS (mag)")
-                ax_ts.set_title("Calibration Residual RMS vs. Time")
-                ax_ts.legend(fontsize=8)
-                ax_ts.grid(True, alpha=0.3)
+            fig_diag = plt.figure(figsize=(8, 11))
+            gs = _mgs.GridSpec(2, 1, height_ratios=[4, 1], hspace=0.30)
+            ax_sc = fig_diag.add_subplot(gs[0])
+            ax_sc.set_box_aspect(1.0)   # 正方形圖框
+            ax_ts = fig_diag.add_subplot(gs[1])
 
-                # ── x 軸：完整 BJD 數值，移除科學記號偏移 ────────────────
-                ax_ts.xaxis.set_major_formatter(
-                    _mticker_zp.FuncFormatter(lambda v, _: f"{v:.2f}")
-                )
-
-                # ── 上方 Local Time 刻度（UTC+8）────────────────────────
-                _tz_zp  = float(getattr(cfg, "tz_offset_hours", 8))
-                _ts_arr = _df_ok[time_key].dropna().values
-                if len(_ts_arr) > 0:
-                    _bjd_lo_zp = float(_ts_arr.min())
-                    _bjd_hi_zp = float(_ts_arr.max())
-                    _tmin_zp   = (ATime(_bjd_lo_zp, format="jd", scale="tdb")
-                                  .to_datetime()
-                                  + _dt_zp.timedelta(hours=_tz_zp))
-                    _tmax_zp   = (ATime(_bjd_hi_zp, format="jd", scale="tdb")
-                                  .to_datetime()
-                                  + _dt_zp.timedelta(hours=_tz_zp))
-                    _tks_30_zp, _tks_60_zp = [], []
-                    _cur_zp = _tmin_zp.replace(second=0, microsecond=0)
-                    _cur_zp = _cur_zp.replace(minute=(_cur_zp.minute // 30) * 30)
-                    while _cur_zp <= _tmax_zp + _dt_zp.timedelta(minutes=1):
-                        _utc_zp = _cur_zp - _dt_zp.timedelta(hours=_tz_zp)
-                        _bv_zp  = ATime(_utc_zp).jd
-                        _tks_30_zp.append(_bv_zp)
-                        if _cur_zp.minute == 0:
-                            _tks_60_zp.append(_bv_zp)
-                        _cur_zp += _dt_zp.timedelta(minutes=30)
-
-                    for _bv in _tks_30_zp:
-                        ax_ts.axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
-                    for _bv in _tks_60_zp:
-                        ax_ts.axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
-
-                    def _bjd_to_hhmm_zp(bjd_val, pos):
-                        try:
-                            _t = (ATime(bjd_val, format="jd", scale="tdb")
-                                  .to_datetime()
-                                  + _dt_zp.timedelta(hours=_tz_zp))
-                            return _t.strftime("%H:%M")
-                        except Exception:
-                            return ""
-
-                    _ax_top_zp = ax_ts.twiny()
-                    _ax_top_zp.set_xlim(ax_ts.get_xlim())
-                    _ax_top_zp.xaxis.set_major_locator(
-                        _mticker_zp.FixedLocator(_tks_30_zp)
-                    )
-                    _ax_top_zp.xaxis.set_major_formatter(
-                        _mticker_zp.FuncFormatter(_bjd_to_hhmm_zp)
-                    )
-                    _ax_top_zp.tick_params(
-                        axis="x", which="major",
-                        direction="out", length=4,
-                        colors="steelblue", labelsize=7, labelcolor="steelblue",
-                    )
-                    # "Local Time" 標籤：刻度列最左端
-                    _ax_top_zp.text(
-                        -0.002, 1.01, "Local Time",
-                        transform=_ax_top_zp.transAxes,
-                        ha="right", va="bottom",
-                        fontsize=7, color="steelblue", clip_on=False,
-                    )
-            else:
-                ax_ts.text(0.5, 0.5, "No residual data", transform=ax_ts.transAxes,
-                           ha="center", va="center")
-
-            # 右：第一幀回歸散佈圖（從 _first_frame_diag_data 取得，若有）
-            ax_sc = axes_diag[1]
+            # ── 上：第一幀回歸散佈圖（全部比較星，正方形）────────────────────
             _ffd = _first_frame_diag_data
             if _ffd is not None:
                 _mc, _mi, _fit = _ffd[:3]
-                _tgt_mcat    = _ffd[3] if len(_ffd) > 3 else np.nan
-                _tgt_minst   = _ffd[4] if len(_ffd) > 4 else np.nan
-                _diag_bright = _ffd[5] if len(_ffd) > 5 else np.nan
-                _diag_faint  = _ffd[6] if len(_ffd) > 6 else np.nan
+                _tgt_vmag_diag = _ffd[3] if len(_ffd) > 3 else np.nan
+                _tgt_minst     = _ffd[4] if len(_ffd) > 4 else np.nan
                 _ok_pts = np.isfinite(_mc) & np.isfinite(_mi)
-                ax_sc.scatter(_mc[_ok_pts], _mi[_ok_pts], s=12, alpha=0.6,
+                ax_sc.scatter(_mc[_ok_pts], _mi[_ok_pts], s=18, alpha=0.6,
                               color="steelblue", label=f"comp (n={_ok_pts.sum()})")
                 if _fit and np.isfinite(_fit.get("a", np.nan)):
                     _a, _b, _r2 = _fit["a"], _fit["b"], _fit.get("r2", np.nan)
                     _xl = np.linspace(_mc[_ok_pts].min(), _mc[_ok_pts].max(), 100)
-                    ax_sc.plot(_xl, _a * _xl + _b, "r-", lw=1.5,
+                    ax_sc.plot(_xl, _a * _xl + _b, "r-", lw=1.8,
                                label=f"$m_{{inst}}={_a:.3f}\\,m_{{cat}}+({_b:.3f})$  $R^2={_r2:.3f}$")
-                # 目標星紅圈：畫在 (m_var, m_inst) — m_var = (m_inst - b) / a
+                # 目標星紅圈
                 if _fit and np.isfinite(_tgt_minst):
                     _a_d, _b_d = _fit["a"], _fit["b"]
                     if np.isfinite(_a_d) and _a_d != 0:
                         _tgt_mvar = (_tgt_minst - _b_d) / _a_d
-                        ax_sc.scatter([_tgt_mvar], [_tgt_minst], s=80, marker="o",
-                                      facecolors="none", edgecolors="red", linewidths=1.8,
+                        ax_sc.scatter([_tgt_mvar], [_tgt_minst], s=100, marker="o",
+                                      facecolors="none", edgecolors="red", linewidths=2.0,
                                       zorder=5, label=f"target  $m_{{var}}$={_tgt_mvar:.1f}")
-                if _ok_pts.any():
-                    _xr = np.array([_mc[_ok_pts].min(), _mc[_ok_pts].max()])
-                    ax_sc.plot(_xr, _xr, "k--", lw=0.8, alpha=0.4, label="ideal")
-                ax_sc.invert_yaxis()
-                ax_sc.set_xlabel(f"$m_{{cat}}$ ({cfg.phot_band})")
-                ax_sc.set_ylabel("$m_{inst}$")
-                if np.isfinite(_diag_bright) and np.isfinite(_diag_faint):
-                    ax_sc.set_title(f"Calibration Fit — Frame 1  ({_diag_bright:.1f}–{_diag_faint:.1f} mag)")
+                # x 軸：左界=比較星+目標星中最亮，右界=comp_mag_max
+                _brightest_comp = float(_mc[_ok_pts].min()) if _ok_pts.any() else float(cfg.comp_mag_min)
+                _x_lo = _brightest_comp
+                if _fit and np.isfinite(_tgt_vmag_diag):
+                    _x_lo = min(_x_lo, float(_tgt_vmag_diag))
+                _x_hi = float(cfg.comp_mag_max)
+                ax_sc.set_xlim(_x_lo - 0.2, _x_hi + 0.1)
+                # 外插區域：回歸線用虛線
+                if _fit and np.isfinite(_fit.get("a", np.nan)) and _ok_pts.any():
+                    _comp_lo = float(_mc[_ok_pts].min())
+                    _comp_hi = float(_mc[_ok_pts].max())
+                    # 亮端外插（比較星最亮 → x 左界）
+                    if _x_lo < _comp_lo - 0.01:
+                        _xl_ext = np.linspace(_x_lo - 0.2, _comp_lo, 50)
+                        ax_sc.plot(_xl_ext, _a * _xl_ext + _b, "r--", lw=1.2, alpha=0.5)
+                    # 暗端外插（比較星最暗 → x 右界）
+                    if _x_hi > _comp_hi + 0.01:
+                        _xl_ext = np.linspace(_comp_hi, _x_hi + 0.1, 50)
+                        ax_sc.plot(_xl_ext, _a * _xl_ext + _b, "r--", lw=1.2, alpha=0.5)
+                # y 軸：緊貼資料 + 目標星 + 回歸線在 x 範圍內的值
+                _all_mi = list(_mi[_ok_pts]) if _ok_pts.any() else []
+                if _fit and np.isfinite(_tgt_minst):
+                    _all_mi.append(float(_tgt_minst))
+                if _fit and np.isfinite(_fit.get("a", np.nan)):
+                    _all_mi.append(float(_fit["a"] * _x_lo + _fit["b"]))
+                    _all_mi.append(float(_fit["a"] * _x_hi + _fit["b"]))
+                if _all_mi:
+                    _mi_lo, _mi_hi = min(_all_mi), max(_all_mi)
+                    _mi_pad = (_mi_hi - _mi_lo) * 0.12
+                    ax_sc.set_ylim(_mi_hi + _mi_pad, _mi_lo - _mi_pad)  # inverted
                 else:
-                    ax_sc.set_title("Calibration Fit — Frame 1")
-                ax_sc.legend(fontsize=7, frameon=False)
+                    ax_sc.invert_yaxis()
+                ax_sc.set_xlabel(f"$m_{{cat}}$ ({cfg.phot_band})", fontsize=11)
+                ax_sc.set_ylabel("$m_{inst}$", fontsize=11)
+                _extrap_note = ""
+                if _ok_pts.any() and np.isfinite(_tgt_vmag_diag):
+                    if _tgt_vmag_diag < float(_mc[_ok_pts].min()):
+                        _extrap_note = "  [EXTRAPOLATION]"
+                ax_sc.set_title(
+                    f"Regression Fit — Frame 1  ({_x_lo:.1f}–{_x_hi:.1f} mag){_extrap_note}",
+                    fontsize=12,
+                )
+                ax_sc.legend(fontsize=8, frameon=False)
                 ax_sc.grid(True, alpha=0.3)
             else:
                 ax_sc.text(0.5, 0.5, "No first-frame data",
                            transform=ax_sc.transAxes, ha="center", va="center")
 
+            # ── 下：RMS 時序圖（參考用）───────────────────────────────────────
+            if "reg_residual_rms" in _df_ok.columns and np.isfinite(_df_ok["reg_residual_rms"]).any():
+                ax_ts.plot(
+                    _df_ok[time_key], _df_ok["reg_residual_rms"],
+                    "o-", ms=2, lw=0.6, color="steelblue", alpha=0.7
+                )
+                ax_ts.axhline(
+                    _df_ok["reg_residual_rms"].median(), color="red",
+                    lw=1, ls="--", label=f"median={_df_ok['reg_residual_rms'].median():.4f}"
+                )
+                ax_ts.set_xlabel(time_key.upper(), fontsize=9)
+                ax_ts.set_ylabel("Residual RMS (mag)", fontsize=9)
+                ax_ts.legend(fontsize=7)
+                ax_ts.grid(True, alpha=0.3)
+                ax_ts.tick_params(labelsize=8)
+                ax_ts.xaxis.set_major_formatter(
+                    _mticker_reg.FuncFormatter(lambda v, _: f"{v:.2f}")
+                )
+            else:
+                ax_ts.text(0.5, 0.5, "No residual data", transform=ax_ts.transAxes,
+                           ha="center", va="center")
+
             fig_diag.suptitle(
-                f"Calibration Diagnostic  |  {cfg.target_name}  "
+                f"Regression Diagnostic  |  {cfg.target_name}  "
                 f"channel={channel}  {out_csv.stem}",
-                fontsize=10
+                fontsize=11
             )
-            fig_diag.tight_layout()
-            fig_diag.savefig(_zp_diag_path, dpi=150)
+            fig_diag.savefig(_reg_diag_path, dpi=150, bbox_inches="tight")
             plt.close(fig_diag)
-            print(f"[cal_diag] saved → {_zp_diag_path}")
+            print(f"[reg_diag] saved → {_reg_diag_path}")
         except Exception as _e:
-            print(f"[WARN] calibration diagnostic failed: {_e}")
+            import traceback; traceback.print_exc()
+            print(f"[WARN] regression diagnostic failed: {_e}")
 
     # ── Rejection timeline 圖 ────────────────────────────────────────────────
     try:
@@ -3539,10 +3497,10 @@ def run_photometry_on_wcs_dir(
             "high_fwhm":     "#e67e22",
             "low_sharpness": "#9b59b6",
             "low_peak_ratio":"#1abc9c",
-            "low_zp_r2":     "#e74c3c",
+            "low_reg_r2":     "#e74c3c",
             "phot_fail":     "#c0392b",
             "sigma_clip":    "#2980b9",
-            "zp_jump":       "#f39c12",
+            "reg_jump":       "#f39c12",
             "high_sky":      "#16a085",
             "ok":            "#cccccc",
         }
@@ -3664,10 +3622,10 @@ def run_photometry_on_wcs_dir(
             plt.close("all")
 
     # ── ⏸ 待決定：Broeg (2005) ensemble 正規化 ─────────────────────────────────
-    # 理由：逐幀自由斜率回歸 (ZP fit) 已消除逐幀大氣，ensemble 重複修正可能引入雜訊。
+    # 理由：逐幀自由斜率回歸已消除逐幀大氣，ensemble 重複修正可能引入雜訊。
     # 待驗：移除後 R² 是否有變化（預期無）。
     # 原本邏輯：_ensemble_on=True 時迭代算 Δ(t)，然後 m_var_norm = m_var - Δ(t)。
-    # 簡化版本：關閉 ensemble，m_var_norm 直接 = m_var（ZP 回歸後的校正星等）。
+    # 簡化版本：關閉 ensemble，m_var_norm 直接 = m_var（回歸後的校正星等）。
     """
     # ── 原始 ensemble 迴圈（已停用，整塊保留作參考）────────────────────────────────
     comp_lightcurves: "dict[str, pd.Series]" = {}
@@ -3706,8 +3664,8 @@ def run_photometry_on_wcs_dir(
         df["m_var_norm"] = df["m_var"]
         df["delta_ensemble"] = np.nan
     """
-    # ── 簡化版本：直接用 ZP 回歸結果 ──────────────────────────────────────────────
-    df["m_var_norm"] = df["m_var"]        # 直通 ZP 回歸的 m_var，不加 ensemble 修正
+    # ── 簡化版本：直接用回歸結果 ────────────────────────────────────────────────
+    df["m_var_norm"] = df["m_var"]        # 直通回歸的 m_var，不加 ensemble 修正
     df["delta_ensemble"] = np.nan         # 預留欄位，暫不計算
 
     # ── 光變曲線圖（ensemble 之後重畫，使用 m_var_norm）──────────────────────
@@ -3737,11 +3695,11 @@ def run_photometry_on_wcs_dir(
                     f"Mag range : {_mvar_ok.min():.3f} – {_mvar_ok.max():.3f}  "
                     f"(median {_mvar_ok.median():.3f}, std {_mvar_ok.std():.4f})"
                 )
-            if "zp_r2" in _ok_df.columns:
-                _r2_ok = _ok_df["zp_r2"][np.isfinite(_ok_df["zp_r2"])]
+            if "reg_r2" in _ok_df.columns:
+                _r2_ok = _ok_df["reg_r2"][np.isfinite(_ok_df["reg_r2"])]
                 if len(_r2_ok) > 0:
                     _summary_lines.append(
-                        f"ZP R²     : median {_r2_ok.median():.4f}  "
+                        f"Reg R²    : median {_r2_ok.median():.4f}  "
                         f"min {_r2_ok.min():.4f}  max {_r2_ok.max():.4f}"
                     )
             if "airmass" in _ok_df.columns:
@@ -3789,7 +3747,7 @@ def run_photometry_on_wcs_dir(
     except Exception as _e_summary:
         print(f"[WARN] 摘要報告輸出失敗：{_e_summary}")
 
-    return df, comp_lightcurves
+    return df, {}  # comp_lightcurves 已隨 ensemble 停用，回傳空 dict
 
 
 # ── 週期分析已移至 period_analysis.py（統一從 YAML 讀取參數）────────────────

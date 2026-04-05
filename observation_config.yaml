@@ -229,7 +229,9 @@ comparison_stars:
   min_separation_arcsec: 10.0
   # comp_mag_bright: 1.5      # 2026-03-22 前：對稱 ±1.5 等
   # comp_mag_faint:  1.5
-  comp_mag_bright: 2.0      # 2026-03-22：亮端放寬（亮星 S/N 高，ZP leverage 強）
+  # comp_mag_bright: 1.5      # 2026-03-22 前：對稱 ±1.5 等
+  # comp_mag_faint:  1.5
+  comp_mag_bright: 2.0      # 2026-03-22：亮端放寬（亮星 S/N 高，回歸 leverage 強）
   comp_mag_faint:  1.5      # 暗端維持（暗星噪聲大，多了拖累回歸）
   comp_mag_min: 6.0         # 固定下限（不飽和）
   comp_mag_max: 13.0        # 固定上限
@@ -243,7 +245,7 @@ comparison_stars:
   check_star_max_sigma: 0.02
   comp_fwhm_min: 2.0
   comp_fwhm_max: 8.0
-  save_zeropoint_diagnostic: true
+  save_regression_diagnostic: true
 
 # -----------------------------------------------------------------------------
 # 10. 孔徑測光 (Aperture Photometry)
@@ -265,10 +267,10 @@ photometry:
   ensemble_convergence_tol: 0.0001
   # 幀品質篩選（三層）
   sharpness_min: 0.3    # S=flux(r=3px)/flux(r=8px) 下限；0.0=停用
-  zp_r2_min: 0.0        # ZP 回歸 R2 下限；0.0=停用（保留 WARN 輸出）
+  reg_r2_min: 0.0        # 回歸 R2 下限；0.0=停用（保留 WARN 輸出）
   peak_ratio_min: 0.0   # [deprecated] 固定絕對值門檻，建議改用 peak_ratio_k
   peak_ratio_k: 3.0     # 自適應門檻倍數；peak_ratio < median - k×MAD 時剔除
-  zp_intercept_sigma: 3.0  # ZP 截距突變閾值（倍 MAD）；薄雲/透明度驟變偵測
+  reg_intercept_sigma: 3.0  # 回歸截距突變閾值（倍 MAD）；薄雲/透明度驟變偵測
   sky_sigma: 3.0           # 背景突升閾值（倍 MAD）；起霧/散射光偵測
   aperture_growth_fraction: 0.97  # 舊值 0.95→0.99（太大）；0.97 在 r_max=12 下約 9-10px
 
