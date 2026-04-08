@@ -76,7 +76,12 @@ def query_local_gaia(ra_deg: float, dec_deg: float, radius_deg: float = 1.0,
       B     → B:  B  = G + 0.0939 + 0.6758c + 0.0743c^2
     其中 c = BP - RP。
     """
-    df = _load_csv("gaia_dr3_G11.csv")
+    # 優先用 G<13 星表，fallback 到 G<14 → G<11
+    df = _load_csv("gaia_dr3_G13.csv")
+    if df.empty:
+        df = _load_csv("gaia_dr3_G14.csv")
+    if df.empty:
+        df = _load_csv("gaia_dr3_G11.csv")
     if df.empty:
         return pd.DataFrame()
 

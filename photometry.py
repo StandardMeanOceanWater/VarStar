@@ -1208,7 +1208,7 @@ def _load_or_build_unified_catalog(
     unified_df 欄位：
         ra_deg, dec_deg,
         V_mag, V_err, source_V,   — Johnson V: AAVSO > APASS > Tycho VT→V
-        B_mag, B_err, source_B,   — Johnson B: APASS B > Tycho BT→B
+        B_mag, B_err, source_B,   — Johnson B: APASS B > Tycho BT→B (B<13 only)
         R_mag, R_err, source_R,   — Cousins Rc: Gaia RP→Rc ONLY
         BT, VT, Gmag, BPmag, RPmag  — 原始診斷欄位
     """
@@ -1319,18 +1319,20 @@ def _load_or_build_unified_catalog(
                         row["source_V"] = "Tycho2"
                         n_v += 1
                     # B from BT→B conversion: B = BT - 0.240*(BT-VT)
+                    # B < 13 mag 的亮星 APASS 已覆蓋且精度更好，
+                    # Tycho-2 BT→B 只填 B >= 13 的暗星（APASS 沒有的）
                     _bt = float(r.get("BT", np.nan))
                     _vt = float(r.get("VT", np.nan))
                     if np.isfinite(_bt) and np.isfinite(_vt):
                         _b_mag = _bt - 0.240 * (_bt - _vt)
-                        # 誤差傳遞（近似）
-                        _e_bt = 0.05  # Tycho-2 typical BT error
-                        _e_vt = 0.05
-                        _e_b = float(np.sqrt(_e_bt**2 * (1 - 0.240)**2 + _e_vt**2 * 0.240**2))
-                        row["B_mag"] = _b_mag
-                        row["B_err"] = _e_b
-                        row["source_B"] = "Tycho2"
-                        n_b += 1
+                        if _b_mag >= 13.0:
+                            _e_bt = 0.05  # Tycho-2 typical BT error
+                            _e_vt = 0.05
+                            _e_b = float(np.sqrt(_e_bt**2 * (1 - 0.240)**2 + _e_vt**2 * 0.240**2))
+                            row["B_mag"] = _b_mag
+                            row["B_err"] = _e_b
+                            row["source_B"] = "Tycho2"
+                            n_b += 1
                     # 保留原始欄位
                     if np.isfinite(_bt):
                         row["BT"] = _bt
@@ -3304,6 +3306,9 @@ if __name__ == "__main__":
 
         # ── 多通道測光迴圈 ────────────────────────────────────────────────────
         channel_results: dict = {}
+        _comp_refs_per_ch: dict = {}   # {channel: comp_refs} for VSX extra targets
+        _check_star_per_ch: dict = {}  # {channel: check_star}
+        _split_dir_per_ch: dict = {}   # {channel: split_dir}
 
         for _ch in CHANNELS:
             print(f"\n{'='*55}")
@@ -3321,6 +3326,7 @@ if __name__ == "__main__":
                 cfg_ch.read_noise_e = cfg.read_noise_e
 
             _split_dir = cfg_ch.wcs_dir
+            _split_dir_per_ch[_ch] = _split_dir
             _fits_ch   = sorted(_split_dir.glob(f"*_{_ch}.fits"))
             if not _fits_ch:
                 print(f"  [SKIP] split/{_ch}/ 找不到 FITS，跳過此通道")
@@ -3339,6 +3345,8 @@ if __name__ == "__main__":
                     _fits_ch[0], cfg_ch.target_radec_deg, band=_band_ch
                 )
                 print(f"  [comp] {_ch} source={_active_source_ch} n={len(_comp_refs_ch)}")
+                _comp_refs_per_ch[_ch] = _comp_refs_ch
+                _check_star_per_ch[_ch] = _check_star_ch
             except RuntimeError as _e_comp_ch:
                 print(f"  [SKIP] {_ch} ????????{_e_comp_ch}")
                 continue
@@ -3667,7 +3675,7 @@ if __name__ == "__main__":
         # 從 VSX 查詢結果中篩選 9.8–11.2 等的已知變星，逐顆跑差分測光。
         # 使用與主目標相同的比較星、孔徑、FITS 檔案。
         # 輸出目錄與 YAML 目標相同層級：output/{date}/{group}/{VSXname}/{timestamp}/
-        _VSX_MAG_MIN, _VSX_MAG_MAX = 9.8, 11.2
+        _VSX_MAG_MIN, _VSX_MAG_MAX = 6.0, 12.0
         if _args.no_vsx:
             print("[VSX 額外目標] --no-vsx 旗標啟用，跳過額外目標測光")
         elif _vsx_field is not None and len(_vsx_field) > 0:
@@ -3746,6 +3754,9 @@ if __name__ == "__main__":
 
                         _vsx_ch_results = {}
                         for _vch in CHANNELS:
+                            if _vch not in _comp_refs_per_ch:
+                                print(f"    {_vch}: 跳過（主目標該通道無比較星）")
+                                continue
                             _vsx_csv = _vsx_out_dir / f"photometry_{_vch}_{ACTIVE_DATE}.csv"
                             _vsx_png = _vsx_lc_dir / f"light_curve_{_vch}_{ACTIVE_DATE}.png"
 
@@ -3754,17 +3765,22 @@ if __name__ == "__main__":
                                 _cfg_backup_radec = cfg.target_radec_deg
                                 _cfg_backup_name  = cfg.target_name
                                 _cfg_backup_band  = cfg.phot_band
+                                _cfg_backup_regdir = cfg.regression_diag_dir
                                 _vsx_band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
                                 cfg.target_radec_deg = (_vsx_ra, _vsx_dec)
                                 cfg.target_name = _vsx_name
                                 cfg.phot_band = _vsx_band_map.get(_vch.upper(), "V")
+                                # 回歸診斷圖存到 VSX 目標自己的目錄，避免覆蓋主目標
+                                _vsx_reg_dir = _vsx_run_root / "2_regression_diag"
+                                _vsx_reg_dir.mkdir(parents=True, exist_ok=True)
+                                cfg.regression_diag_dir = _vsx_reg_dir
 
                                 _vsx_df, _ = run_photometry_on_wcs_dir(
-                                    cfg.wcs_dir,
+                                    _split_dir_per_ch[_vch],
                                     _vsx_csv,
                                     _vsx_png,
-                                    comp_refs=comp_refs,
-                                    check_star=check_star,
+                                    comp_refs=_comp_refs_per_ch[_vch],
+                                    check_star=_check_star_per_ch.get(_vch, check_star),
                                     ap_radius=_shared_aperture_radius,
                                     channel=_vch,
                                     shared_cache=_active_cache,
@@ -3786,5 +3802,6 @@ if __name__ == "__main__":
                                 cfg.target_radec_deg = _cfg_backup_radec
                                 cfg.target_name = _cfg_backup_name
                                 cfg.phot_band = _cfg_backup_band
+                                cfg.regression_diag_dir = _cfg_backup_regdir
 
                     print(f"\n  [VSX 額外目標] 全部完成")
