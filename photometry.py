@@ -1195,239 +1195,352 @@ def _save_regression_diagnostic(
     plt.close(fig)
 
 
-def _load_or_build_field_catalog(
-    channel_name: str,
+def _load_or_build_unified_catalog(
     cfg,
     ra_t: float,
     dec_t: float,
     field_cat_dir: Path,
 ) -> "tuple[pd.DataFrame, list[str]]":
     """
-    Load cached field catalog for a channel, or query catalogs and build it.
+    統一視場星表：查詢所有星表來源一次，合併多波段欄位。
 
-    Returns (combined_raw, sources_used).
-    combined_raw has columns: ra_deg, dec_deg, m_cat, m_err, source.
+    Returns (unified_df, sources_used).
+    unified_df 欄位：
+        ra_deg, dec_deg,
+        V_mag, V_err, source_V,   — Johnson V: AAVSO > APASS > Tycho VT→V
+        B_mag, B_err, source_B,   — Johnson B: APASS B > Tycho BT→B
+        R_mag, R_err, source_R,   — Cousins Rc: Gaia RP→Rc ONLY
+        BT, VT, Gmag, BPmag, RPmag  — 原始診斷欄位
     """
-    field_cat_path = field_cat_dir / f"field_catalog_{channel_name}.csv"
-    _catalog_raws: "list[pd.DataFrame]" = []
+    field_cat_path = field_cat_dir / "field_catalog_unified.csv"
     _sources_used: "list[str]" = []
 
     if field_cat_path.exists():
-        print(f"  [field catalog] read: {field_cat_path.name}")
-        combined_raw = pd.read_csv(field_cat_path)
-        if "source" in combined_raw.columns:
-            _sources_used = sorted(combined_raw["source"].dropna().unique().tolist())
-    else:
-        for _cat_name in cfg.catalog_priority:
-            _cat_name_up = str(_cat_name).upper()
+        print(f"  [unified catalog] read: {field_cat_path.name}")
+        unified_df = pd.read_csv(field_cat_path)
+        for _sc in ("source_V", "source_B", "source_R"):
+            if _sc in unified_df.columns:
+                _sources_used.extend(unified_df[_sc].dropna().unique().tolist())
+        _sources_used = sorted(set(_sources_used))
+        print(f"  [unified catalog] {len(unified_df)} stars, sources: {'+'.join(_sources_used)}")
+        return unified_df, _sources_used
 
-            if _cat_name_up == "AAVSO":
-                seq_df = None
-                if cfg.aavso_seq_csv is not None and Path(cfg.aavso_seq_csv).exists():
-                    seq_df = read_aavso_seq_csv(Path(cfg.aavso_seq_csv))
-                elif cfg.aavso_star_name and cfg.aavso_use_api:
-                    try:
-                        seq_df = fetch_aavso_vsp_api(
-                            cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit,
-                            ra_deg=ra_t, dec_deg=dec_t,
-                        )
-                    except Exception as exc:
-                        print(f"  [WARN] AAVSO API query failed: {exc}")
-                if seq_df is not None and len(seq_df) > 0:
-                    _std = seq_df.rename(columns={"m_cat": "vmag", "m_err": "e_vmag"})
-                    _std = _std[["ra_deg", "dec_deg", "vmag"] +
-                                 (["e_vmag"] if "e_vmag" in _std.columns else [])].copy()
-                    _std["source"] = "AAVSO"
-                    _catalog_raws.append(_std)
-                    _sources_used.append("AAVSO")
+    # ── 查詢各星表（各查一次）─────────────────────────────────────────────────
+    # 每個 source 以統一格式收集：ra_deg, dec_deg + 各波段欄位
+    _source_rows: "list[dict]" = []
 
-            elif _cat_name_up == "APASS":
-                apass_raw = fetch_apass_cone(
-                    ra_t, dec_t, radius_deg=cfg.apass_radius_deg, maxrec=cfg.apass_maxrec,
-                )
-                if len(apass_raw) > 0:
-                    _ra_col  = _pick_col(apass_raw, ["ra", "raj2000", "ra_deg", "ra_icrs"])
-                    _dec_col = _pick_col(apass_raw, ["dec", "dej2000", "dec_deg", "dec_icrs"])
-                    _band = getattr(cfg, "phot_band", "V")
-                    _mag_cands = {
-                        "B": ["mag_b", "bmag", "b", "b_mag"],
-                        "V": ["mag_v", "vmag", "v", "v_mag"],
-                        "r": ["mag_r", "rmag", "r", "r_mag", "r_sloan"],
-                    }
-                    _err_cands = {
-                        "B": ["err_mag_b", "e_bmag", "e_b", "b_err", "bmag_err"],
-                        "V": ["err_mag_v", "e_vmag", "e_v", "v_err", "vmag_err"],
-                        "r": ["err_mag_r", "e_rmag", "e_r", "r_err", "rmag_err"],
-                    }
-                    try:
-                        _mag_col = _pick_col(apass_raw, _mag_cands.get(_band, _mag_cands["V"]))
-                    except KeyError:
-                        print(f"  [WARN] APASS has no {_band} band, skipping")
-                        continue
-                    _err_col = next(
-                        (c for c in _err_cands.get(_band, _err_cands["V"]) if c in apass_raw.columns),
-                        None,
+    _radius_arcmin = cfg.apass_radius_deg * 60.0
+
+    # --- AAVSO: 只有 V ---
+    _has_aavso = False
+    for _cat_name in cfg.catalog_priority:
+        if str(_cat_name).upper() == "AAVSO":
+            seq_df = None
+            if cfg.aavso_seq_csv is not None and Path(cfg.aavso_seq_csv).exists():
+                seq_df = read_aavso_seq_csv(Path(cfg.aavso_seq_csv))
+            elif cfg.aavso_star_name and cfg.aavso_use_api:
+                try:
+                    seq_df = fetch_aavso_vsp_api(
+                        cfg.aavso_star_name, cfg.aavso_fov_arcmin, cfg.aavso_maglimit,
+                        ra_deg=ra_t, dec_deg=dec_t,
                     )
-                    _cols_needed = [_ra_col, _dec_col, _mag_col] + ([_err_col] if _err_col else [])
-                    _std = apass_raw[_cols_needed].copy().rename(columns={
-                        _ra_col: "ra_deg", _dec_col: "dec_deg",
-                        _mag_col: "vmag",
-                        **({_err_col: "e_vmag"} if _err_col else {}),
+                except Exception as exc:
+                    print(f"  [WARN] AAVSO API query failed: {exc}")
+            if seq_df is not None and len(seq_df) > 0:
+                for _, r in seq_df.iterrows():
+                    _source_rows.append({
+                        "ra_deg": float(r["ra_deg"]), "dec_deg": float(r["dec_deg"]),
+                        "V_mag": float(r["m_cat"]),
+                        "V_err": float(r.get("m_err", np.nan)) if "m_err" in r.index else np.nan,
+                        "source_V": "AAVSO",
                     })
-                    _std["source"] = "APASS"
-                    _catalog_raws.append(_std)
-                    _sources_used.append("APASS")
+                _has_aavso = True
+                _sources_used.append("AAVSO")
+                print(f"  [unified] AAVSO: {len(seq_df)} stars (V only)")
+            break
 
-            elif _cat_name_up == "TYCHO2":
-                tycho_raw = fetch_tycho2_cone(
-                    ra_t, dec_t,
-                    radius_arcmin=cfg.apass_radius_deg * 60.0,
-                    mag_min=3.0, mag_max=16.0,  # 寬範圍：快取全視場，實際篩選在 _catalog_direct_phot
-                )
-                if len(tycho_raw) > 0:
-                    _keep_tycho = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
-                    for _extra_tycho in ["BT", "VT"]:
-                        if _extra_tycho in tycho_raw.columns:
-                            _keep_tycho.append(_extra_tycho)
-                    _std = tycho_raw[_keep_tycho].copy()
-                    _catalog_raws.append(_std)
-                    _sources_used.append("Tycho2")
+    # --- APASS: V + B ---
+    _has_apass = False
+    for _cat_name in cfg.catalog_priority:
+        if str(_cat_name).upper() == "APASS":
+            apass_raw = fetch_apass_cone(
+                ra_t, dec_t, radius_deg=cfg.apass_radius_deg, maxrec=cfg.apass_maxrec,
+            )
+            if len(apass_raw) > 0:
+                _ra_col = _pick_col(apass_raw, ["ra", "raj2000", "ra_deg", "ra_icrs"])
+                _dec_col = _pick_col(apass_raw, ["dec", "dej2000", "dec_deg", "dec_icrs"])
+                # V band columns
+                _v_col = next((c for c in ["vmag", "mag_v", "v", "v_mag"] if c in apass_raw.columns), None)
+                _ve_col = next((c for c in ["e_vmag", "err_mag_v", "v_err"] if c in apass_raw.columns), None)
+                # B band columns
+                _b_col = next((c for c in ["bmag", "mag_b", "b", "b_mag"] if c in apass_raw.columns), None)
+                _be_col = next((c for c in ["e_bmag", "err_mag_b", "b_err"] if c in apass_raw.columns), None)
+                n_v, n_b = 0, 0
+                for _, r in apass_raw.iterrows():
+                    row = {"ra_deg": float(r[_ra_col]), "dec_deg": float(r[_dec_col])}
+                    has_any = False
+                    if _v_col and np.isfinite(float(r.get(_v_col, np.nan))):
+                        row["V_mag"] = float(r[_v_col])
+                        row["V_err"] = float(r[_ve_col]) if _ve_col and np.isfinite(float(r.get(_ve_col, np.nan))) else np.nan
+                        row["source_V"] = "APASS"
+                        has_any = True
+                        n_v += 1
+                    if _b_col and np.isfinite(float(r.get(_b_col, np.nan))):
+                        row["B_mag"] = float(r[_b_col])
+                        row["B_err"] = float(r[_be_col]) if _be_col and np.isfinite(float(r.get(_be_col, np.nan))) else np.nan
+                        row["source_B"] = "APASS"
+                        has_any = True
+                        n_b += 1
+                    if has_any:
+                        _source_rows.append(row)
+                _has_apass = True
+                _sources_used.append("APASS")
+                print(f"  [unified] APASS: {len(apass_raw)} stars (V={n_v}, B={n_b})")
+            break
 
-            elif _cat_name_up in ("GAIA", "GAIADR3", "GAIA_DR3"):
-                _gaia_channel = getattr(cfg, "phot_band", "G1")
-                _band_to_ch = {"V": "G1", "B": "B", "r": "R"}
-                _gaia_channel = _band_to_ch.get(_gaia_channel, _gaia_channel)
-                gaia_raw = fetch_gaia_dr3_cone(
-                    ra_t, dec_t,
-                    radius_arcmin=cfg.apass_radius_deg * 60.0,
-                    mag_min=3.0,       # 寬範圍：快取全視場，實際篩選在 _catalog_direct_phot
-                    mag_max=16.0,
-                    channel=_gaia_channel,
-                )
-                if len(gaia_raw) > 0:
-                    _keep_cols = ["ra_deg", "dec_deg", "vmag", "e_vmag", "source"]
-                    for _extra in ["Gmag", "BPmag", "RPmag", "warn_color"]:
-                        if _extra in gaia_raw.columns:
-                            _keep_cols.append(_extra)
-                    _std = gaia_raw[_keep_cols].copy()
-                    _catalog_raws.append(_std)
-                    _sources_used.append("GaiaDR3")
+    # --- Tycho-2: V (VT→V) + B (BT→B) ---
+    _has_tycho = False
+    for _cat_name in cfg.catalog_priority:
+        if str(_cat_name).upper() == "TYCHO2":
+            tycho_raw = fetch_tycho2_cone(
+                ra_t, dec_t,
+                radius_arcmin=_radius_arcmin,
+                mag_min=3.0, mag_max=16.0,
+            )
+            if len(tycho_raw) > 0:
+                n_v, n_b = 0, 0
+                for _, r in tycho_raw.iterrows():
+                    row = {"ra_deg": float(r["ra_deg"]), "dec_deg": float(r["dec_deg"])}
+                    # V from Tycho (already converted VT→V in fetch_tycho2_cone)
+                    _vm = float(r.get("vmag", np.nan))
+                    if np.isfinite(_vm):
+                        row["V_mag"] = _vm
+                        row["V_err"] = float(r.get("e_vmag", np.nan))
+                        row["source_V"] = "Tycho2"
+                        n_v += 1
+                    # B from BT→B conversion: B = BT - 0.240*(BT-VT)
+                    _bt = float(r.get("BT", np.nan))
+                    _vt = float(r.get("VT", np.nan))
+                    if np.isfinite(_bt) and np.isfinite(_vt):
+                        _b_mag = _bt - 0.240 * (_bt - _vt)
+                        # 誤差傳遞（近似）
+                        _e_bt = 0.05  # Tycho-2 typical BT error
+                        _e_vt = 0.05
+                        _e_b = float(np.sqrt(_e_bt**2 * (1 - 0.240)**2 + _e_vt**2 * 0.240**2))
+                        row["B_mag"] = _b_mag
+                        row["B_err"] = _e_b
+                        row["source_B"] = "Tycho2"
+                        n_b += 1
+                    # 保留原始欄位
+                    if np.isfinite(_bt):
+                        row["BT"] = _bt
+                    if np.isfinite(_vt):
+                        row["VT"] = _vt
+                    _source_rows.append(row)
+                _has_tycho = True
+                _sources_used.append("Tycho2")
+                print(f"  [unified] Tycho-2: {len(tycho_raw)} stars (V={n_v}, B={n_b})")
+            break
 
-        # Merge and deduplicate (position < 3 arcsec → keep higher priority)
-        if not _catalog_raws:
-            combined_raw = pd.DataFrame()
-        else:
-            combined_raw = pd.concat(_catalog_raws, ignore_index=True)
-            if len(combined_raw) > 1:
-                from astropy.coordinates import SkyCoord as _SC
-                keep = np.ones(len(combined_raw), dtype=bool)
-                coords = _SC(
-                    combined_raw["ra_deg"].values * u.deg,
-                    combined_raw["dec_deg"].values * u.deg,
-                )
-                for i in range(len(combined_raw)):
-                    if not keep[i]:
+    # --- Gaia DR3: R (RP→Rc) ONLY ---
+    _has_gaia = False
+    for _cat_name in cfg.catalog_priority:
+        if str(_cat_name).upper() in ("GAIA", "GAIADR3", "GAIA_DR3"):
+            gaia_raw = fetch_gaia_dr3_cone(
+                ra_t, dec_t,
+                radius_arcmin=_radius_arcmin,
+                mag_min=3.0, mag_max=16.0,
+                channel="R",   # 只取 RP→Rc
+            )
+            if len(gaia_raw) > 0:
+                for _, r in gaia_raw.iterrows():
+                    _rc = float(r.get("vmag", np.nan))  # fetch_gaia_dr3_cone 回傳 vmag=Rc
+                    if not np.isfinite(_rc):
                         continue
-                    seps = coords[i].separation(coords).arcsec
-                    dups = np.where((seps < 3.0) & (np.arange(len(combined_raw)) > i))[0]
-                    keep[dups] = False
-                combined_raw = combined_raw[keep].reset_index(drop=True)
+                    row = {
+                        "ra_deg": float(r["ra_deg"]), "dec_deg": float(r["dec_deg"]),
+                        "R_mag": _rc,
+                        "R_err": float(r.get("e_vmag", np.nan)),
+                        "source_R": "GaiaDR3",
+                    }
+                    for _extra in ("Gmag", "BPmag", "RPmag"):
+                        if _extra in r.index and np.isfinite(float(r.get(_extra, np.nan))):
+                            row[_extra] = float(r[_extra])
+                    _source_rows.append(row)
+                _has_gaia = True
+                _sources_used.append("GaiaDR3")
+                print(f"  [unified] Gaia DR3: {len(gaia_raw)} stars (R=Rc only)")
+            break
 
-        # Save cache
-        if len(combined_raw) > 0:
-            field_cat_dir.mkdir(parents=True, exist_ok=True)
-            combined_raw.to_csv(field_cat_path, index=False, encoding="utf-8-sig")
-            print(f"  [field catalog] saved: {field_cat_path.name} ({len(combined_raw)} rows)")
+    _sources_used = sorted(set(_sources_used))
 
-    # Standardize column names
-    if len(combined_raw) > 0:
-        combined_raw = combined_raw.rename(columns={"vmag": "m_cat", "e_vmag": "m_err"})
-        if "m_err" not in combined_raw.columns:
-            combined_raw["m_err"] = np.nan
-        print(f"  [catalog] {'+'.join(_sources_used)}: {len(combined_raw)} stars total")
+    if not _source_rows:
+        print("  [unified catalog] 所有星表查詢無結果")
+        return pd.DataFrame(), _sources_used
 
-    return combined_raw, _sources_used
-
-
-def _remap_comp_refs_to_band(
-    comp_refs: list,
-    channel_name: str,
-    cfg_ch,
-    field_cat_dir: Path,
-    ra_t: float,
-    dec_t: float,
-) -> list:
-    """
-    Replace m_cat in comp_refs with values from the correct band catalog.
-
-    comp_refs from auto_select_comps may have m_cat from the first channel's
-    band.  This function loads the correct field catalog for *this* channel
-    and cross-matches by position (< 3 arcsec) to get the right m_cat.
-    """
-    combined_raw, sources_used = _load_or_build_field_catalog(
-        channel_name, cfg_ch, ra_t, dec_t, field_cat_dir,
-    )
-    if len(combined_raw) == 0:
-        print(f"  [band remap] {channel_name}: no catalog, keeping original m_cat")
-        return comp_refs
+    # ── 合併：同位置 (<3") 的不同源合併多波段欄位 ──────────────────────────────
+    all_df = pd.DataFrame(_source_rows)
+    # 確保所有欄位存在
+    for _col in ("V_mag", "V_err", "source_V", "B_mag", "B_err", "source_B",
+                 "R_mag", "R_err", "source_R", "BT", "VT", "Gmag", "BPmag", "RPmag"):
+        if _col not in all_df.columns:
+            all_df[_col] = np.nan if not _col.startswith("source") else None
 
     from astropy.coordinates import SkyCoord as _SC
-    cat_coords = _SC(
-        combined_raw["ra_deg"].values * u.deg,
-        combined_raw["dec_deg"].values * u.deg,
-    )
+    coords = _SC(all_df["ra_deg"].values * u.deg, all_df["dec_deg"].values * u.deg)
 
-    new_refs = []
-    n_matched = 0
-    n_dropped = 0
-    for ref in comp_refs:
-        ra_c, dec_c, _old_mcat, _old_merr, weight = ref[0], ref[1], ref[2], ref[3], ref[4]
-        ref_coord = _SC(ra_c * u.deg, dec_c * u.deg)
-        seps = ref_coord.separation(cat_coords).arcsec
-        idx = int(seps.argmin())
-        if seps[idx] < 3.0:
-            m_cat = float(combined_raw.iloc[idx]["m_cat"])
-            m_err = float(combined_raw.iloc[idx].get("m_err", np.nan))
-            if np.isfinite(m_cat):
-                new_refs.append((ra_c, dec_c, m_cat, m_err, weight))
-                n_matched += 1
-                continue
-        n_dropped += 1
+    # 用 union-find 聚類 <3" 的星
+    n = len(all_df)
+    parent = list(range(n))
 
-    print(f"  [band remap] {channel_name} ({cfg_ch.phot_band}): "
-          f"{n_matched} matched, {n_dropped} dropped "
-          f"(sources: {'+'.join(sources_used)})")
-    return new_refs
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # 建立鄰近關係（O(n²) 但 n 通常 <2000）
+    for i in range(n):
+        seps = coords[i].separation(coords[i+1:]).arcsec
+        for j_off, sep in enumerate(seps):
+            if sep < 3.0:
+                _union(i, i + 1 + j_off)
+
+    # 按群組合併
+    from collections import defaultdict as _defaultdict
+    groups = _defaultdict(list)
+    for i in range(n):
+        groups[_find(i)].append(i)
+
+    # V 優先級：AAVSO > APASS > Tycho2（照 catalog_priority 順序）
+    _v_priority = {"AAVSO": 0, "APASS": 1, "Tycho2": 2}
+    _b_priority = {"APASS": 0, "Tycho2": 1}
+
+    unified_rows = []
+    for _root, indices in groups.items():
+        # 取群組的平均位置（以第一個為主）
+        _ra = float(all_df.iloc[indices[0]]["ra_deg"])
+        _dec = float(all_df.iloc[indices[0]]["dec_deg"])
+        row = {"ra_deg": _ra, "dec_deg": _dec}
+
+        # 從群組中挑最佳 V, B, R
+        best_v, best_b, best_r = None, None, None
+        best_v_pri, best_b_pri = 999, 999
+
+        for idx in indices:
+            r = all_df.iloc[idx]
+
+            # V
+            _sv = r.get("source_V")
+            _vm = r.get("V_mag")
+            if _sv and isinstance(_sv, str) and np.isfinite(float(_vm if _vm is not None else np.nan)):
+                pri = _v_priority.get(_sv, 99)
+                if pri < best_v_pri:
+                    best_v_pri = pri
+                    best_v = (float(_vm), float(r.get("V_err", np.nan)), _sv)
+
+            # B
+            _sb = r.get("source_B")
+            _bm = r.get("B_mag")
+            if _sb and isinstance(_sb, str) and np.isfinite(float(_bm if _bm is not None else np.nan)):
+                pri = _b_priority.get(_sb, 99)
+                if pri < best_b_pri:
+                    best_b_pri = pri
+                    best_b = (float(_bm), float(r.get("B_err", np.nan)), _sb)
+
+            # R (only GaiaDR3)
+            _sr = r.get("source_R")
+            _rm = r.get("R_mag")
+            if _sr and isinstance(_sr, str) and _sr == "GaiaDR3" and np.isfinite(float(_rm if _rm is not None else np.nan)):
+                best_r = (float(_rm), float(r.get("R_err", np.nan)), "GaiaDR3")
+
+            # 保留原始診斷欄位
+            for _diag in ("BT", "VT", "Gmag", "BPmag", "RPmag"):
+                _dv = r.get(_diag)
+                if _dv is not None and np.isfinite(float(_dv)):
+                    row.setdefault(_diag, float(_dv))
+
+        if best_v:
+            row["V_mag"], row["V_err"], row["source_V"] = best_v
+        if best_b:
+            row["B_mag"], row["B_err"], row["source_B"] = best_b
+        if best_r:
+            row["R_mag"], row["R_err"], row["source_R"] = best_r
+
+        # 至少有一個波段才保留
+        if best_v or best_b or best_r:
+            unified_rows.append(row)
+
+    unified_df = pd.DataFrame(unified_rows)
+
+    # 確保欄位順序與完整性
+    _all_cols = ["ra_deg", "dec_deg",
+                 "V_mag", "V_err", "source_V",
+                 "B_mag", "B_err", "source_B",
+                 "R_mag", "R_err", "source_R",
+                 "BT", "VT", "Gmag", "BPmag", "RPmag"]
+    for _c in _all_cols:
+        if _c not in unified_df.columns:
+            unified_df[_c] = np.nan if not _c.startswith("source") else None
+    unified_df = unified_df[_all_cols]
+
+    # 儲存快取
+    field_cat_dir.mkdir(parents=True, exist_ok=True)
+    unified_df.to_csv(field_cat_path, index=False, encoding="utf-8-sig")
+    print(f"  [unified catalog] saved: {field_cat_path.name} ({len(unified_df)} rows)")
+    print(f"  [unified catalog] V={int(unified_df['V_mag'].notna().sum())}  "
+          f"B={int(unified_df['B_mag'].notna().sum())}  "
+          f"R={int(unified_df['R_mag'].notna().sum())}  "
+          f"sources: {'+'.join(_sources_used)}")
+
+    return unified_df, _sources_used
+
+
+## _remap_comp_refs_to_band — REMOVED by unified catalog refactor (v1.7)
+## 每通道現在直接從 unified catalog 獨立選取比較星，不再需要 remap。
 
 
 def auto_select_comps(
     wcs_fits_path: Path,
     target_radec_deg: tuple,
+    band: str = "V",
     max_detect: int = 500,
     psf_box: int = 25,
     threshold_sigma: float = 5.0,
 ):
     """
-    比較星自動選取主函式。
+    比較星自動選取主函式（unified catalog 版）。
 
-    選取邏輯
-    --------
-    1. 偵測視場內所有星（DAOStarFinder）
-    2. 取短邊一半半徑圓內的未飽和星
-    3. AAVSO ≥ aavso_min_stars 顆 → 用 AAVSO 做正式回歸
-       否則 → 用 APASS
-    4. 同時查詢 AAVSO 和 APASS 以輸出診斷散佈圖
+    每個通道獨立呼叫此函式，band 指定使用 unified catalog 的哪個波段欄位。
+
+    Parameters
+    ----------
+    band : str
+        "V" (G1/G2 通道), "B" (B 通道), "R" (R 通道)
 
     Returns
     -------
-    comp_refs       : list of (ra, dec, m_cat, m_err | None)
+    comp_refs       : list of (ra, dec, m_cat, m_err, weight)
     comp_df_matched : 選入回歸的比較星 DataFrame
     check_star      : (ra, dec, m_cat | None) 或 None
-    aavso_matched   : AAVSO 匹配結果（診斷用）
-    apass_matched   : APASS 匹配結果（診斷用）
-    active_source   : "AAVSO" 或 "APASS"
+    aavso_matched   : 匹配結果（診斷用）
+    apass_matched   : 匹配結果（診斷用）
+    active_source   : 使用的星表來源
     vsx_field       : VSX 查詢結果 DataFrame（供額外目標星測光用）
     """
+    # Band → unified catalog column mapping
+    _band_mag_col = {"V": "V_mag", "B": "B_mag", "R": "R_mag"}
+    _band_err_col = {"V": "V_err", "B": "B_err", "R": "R_err"}
+    _band_src_col = {"V": "source_V", "B": "source_B", "R": "source_R"}
+    mag_col = _band_mag_col.get(band, "V_mag")
+    err_col = _band_err_col.get(band, "V_err")
+    src_col = _band_src_col.get(band, "source_V")
+
     with fits.open(wcs_fits_path) as hdul:
         img = hdul[0].data.astype(np.float32)
         hdr = hdul[0].header
@@ -1443,21 +1556,20 @@ def auto_select_comps(
     _r_in, _r_out = compute_annulus_radii(_ap_r, cfg.annulus_r_in, cfg.annulus_r_out)
     _margin = int(np.ceil(_r_out + 2))
 
-    def _catalog_direct_phot(cat_df, ra_col, dec_col, mag_col, err_col, mag_min, mag_max):
+    def _catalog_direct_phot(cat_df, ra_col, dec_col, mag_col_, err_col_, mag_min, mag_max):
         """從星表座標直接做孔徑測光，回傳通過篩選的 DataFrame。
         排除條件：(a) mag 範圍外；(b) 選取圓外；(c) 影像邊界外；
                   (d) 飽和；(e) 測光失敗。
         """
         rows = []
         n_mag_out, n_circle, n_bounds, n_sat, n_phot = 0, 0, 0, 0, 0
-        _diag_bounds_rows = []   # 收集邊界排除的候選星（診斷用）
         for _, row in cat_df.iterrows():
             try:
                 ra_c  = float(row[ra_col])
                 dec_c = float(row[dec_col])
-                m_c   = float(row[mag_col])
-                m_e   = float(row[err_col]) if (err_col and err_col in row.index
-                                                and np.isfinite(row[err_col])) else np.nan
+                m_c   = float(row[mag_col_])
+                m_e   = float(row[err_col_]) if (err_col_ and err_col_ in row.index
+                                                and np.isfinite(row[err_col_])) else np.nan
             except (KeyError, TypeError, ValueError):
                 continue
             if not (mag_min <= m_c <= mag_max):
@@ -1472,7 +1584,6 @@ def auto_select_comps(
                 continue
             if not in_bounds(img, xc, yc, margin=_margin):
                 n_bounds += 1
-                _diag_bounds_rows.append((ra_c, dec_c, m_c, xc, yc))
                 continue
             phot = aperture_photometry(img, xc, yc, _ap_r, _r_in, _r_out)
             if phot.get("ok") != 1 or not np.isfinite(phot.get("flux_net", np.nan)):
@@ -1489,52 +1600,99 @@ def auto_select_comps(
                 "m_cat": m_c, "m_err": m_e,
                 "m_inst": m_inst, "m_inst_matched": m_inst,
             })
-        print(f"  [直接測光] 星表={len(cat_df)}  "
+        print(f"  [直接測光] band={band}  星表={len(cat_df)}  "
               f"mag範圍外={n_mag_out}({mag_min:.1f}-{mag_max:.1f})  "
               f"選取圓外={n_circle}  邊界排除={n_bounds}  "
               f"飽和={n_sat}  測光失敗={n_phot}  通過={len(rows)}")
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # ── 3–5. 視場星表快取 / 全天查詢（委派給 _load_or_build_field_catalog）────
-    _channel_name   = cfg.wcs_dir.name                        # G1 / G2 / R / B
-    _field_cat_dir  = cfg.out_dir.parent.parent / "catalogs"
+    # ── 3–5. 統一視場星表（所有波段共用一份快取）────────────────────────────
+    # catalogs 放在 group（星場）層級，同星場多目標共用
+    _field_cat_dir  = cfg.out_dir.parent.parent.parent / "catalogs"
 
-    combined_raw, _sources_used = _load_or_build_field_catalog(
-        _channel_name, cfg, ra_t, dec_t, _field_cat_dir,
+    unified_df, _sources_used = _load_or_build_unified_catalog(
+        cfg, ra_t, dec_t, _field_cat_dir,
     )
 
+    # 篩選此波段有值的星
+    if len(unified_df) == 0 or mag_col not in unified_df.columns:
+        raise RuntimeError(
+            f"統一星表中無 {band} 波段資料。\n"
+            "建議：(1) 刪除 field_catalog_unified.csv 重建；"
+            "(2) 確認 catalog_priority 設定。"
+        )
+
+    band_df = unified_df[unified_df[mag_col].notna()].copy()
+    # 建立 m_cat / m_err 欄位供 _catalog_direct_phot 使用
+    band_df = band_df.rename(columns={mag_col: "m_cat", err_col: "m_err"})
+    if "m_err" not in band_df.columns:
+        band_df["m_err"] = np.nan
+
+    # 來源統計
+    _band_sources = []
+    if src_col in unified_df.columns:
+        _band_sources = sorted(unified_df.loc[unified_df[mag_col].notna(), src_col].dropna().unique().tolist())
+    active_source = "+".join(_band_sources) if _band_sources else "+".join(_sources_used)
+
+    print(f"  [unified] band={band}: {len(band_df)} stars with {mag_col} "
+          f"(sources: {active_source})")
+
     # 強制孔徑測光篩選
-    aavso_matched = None   # 保留給 check_star 選取用（診斷）
+    aavso_matched = None
     apass_matched = None
     active_df     = None
-    active_source = "NONE"
 
-    # ── 5b. VSX 已知變星排除（比較星不能是變星）──────────────────────────────
-    _vsx = pd.DataFrame()  # 預設空，供回傳給呼叫端做額外目標用
-    if len(combined_raw) > 0:
+    # ── 以目標星在該 band 的實際星等重算 comp mag range ──────────────────
+    #   cfg.comp_mag_min/max 是用 vmag_approx(V) 算的，B/R 波段需要修正。
+    #   從 unified catalog 查目標星在此 band 的星等，用相同 bright/faint offset 重算。
+    #   注意：必須在 VSX 排除之前查，因為目標星本身是變星會被 VSX 踢掉。
+    _comp_mag_min_band = cfg.comp_mag_min
+    _comp_mag_max_band = cfg.comp_mag_max
+    if band != "V" and len(band_df) > 0:
+        _tgt_cat = SkyCoord(band_df["ra_deg"].values * u.deg,
+                            band_df["dec_deg"].values * u.deg)
+        _sep = tgt_sc.separation(_tgt_cat).arcsec
+        _nearest_idx = int(np.argmin(_sep))
+        if _sep[_nearest_idx] < 10.0:  # 10" 以內才信
+            _tgt_band_mag = float(band_df.iloc[_nearest_idx]["m_cat"])
+            # 用 cfg 裡的 bright/faint offset（從 vmag 反推）
+            _bright_offset = cfg.vmag_approx - cfg.comp_mag_min
+            _faint_offset  = cfg.comp_mag_max - cfg.vmag_approx
+            _comp_mag_min_band = _tgt_band_mag - _bright_offset
+            _comp_mag_max_band = _tgt_band_mag + _faint_offset
+            # 再套 yaml 夾鉗
+            _yaml_floor = 6.0    # comp_mag_min 硬下限
+            _yaml_ceil  = 13.0   # comp_mag_max 硬上限
+            _comp_mag_min_band = max(_comp_mag_min_band, _yaml_floor)
+            _comp_mag_max_band = min(_comp_mag_max_band, _yaml_ceil)
+            print(f"  [mag range] band={band}: 目標星 {band}_mag={_tgt_band_mag:.2f} "
+                  f"→ comp range [{_comp_mag_min_band:.1f}, {_comp_mag_max_band:.1f}] "
+                  f"(V 基準 [{cfg.comp_mag_min:.1f}, {cfg.comp_mag_max:.1f}])")
+
+    # ── VSX 已知變星排除（比較星不能是變星）──────────────────────────────
+    _vsx = pd.DataFrame()
+    if len(band_df) > 0:
         try:
             from tools.local_catalog import query_vsx_cone, filter_known_variables
             _vsx = query_vsx_cone(ra_t, dec_t, radius_deg=cfg.apass_radius_deg)
             if len(_vsx) > 0:
-                _n_before_vsx = len(combined_raw)
-                combined_raw = filter_known_variables(combined_raw, _vsx, match_arcsec=10.0)
-                print(f"  [VSX] 比較星候選：{_n_before_vsx} → {len(combined_raw)}（排除已知變星）")
+                _n_before_vsx = len(band_df)
+                band_df = filter_known_variables(band_df, _vsx, match_arcsec=10.0)
+                print(f"  [VSX] 比較星候選：{_n_before_vsx} → {len(band_df)}（排除已知變星）")
         except Exception as _e_vsx:
             print(f"  [VSX] 變星排除跳過：{_e_vsx}")
 
-    if len(combined_raw) > 0:
+    if len(band_df) > 0:
         active_df = _catalog_direct_phot(
-            combined_raw, "ra_deg", "dec_deg", "m_cat", "m_err",
-            cfg.comp_mag_min, cfg.comp_mag_max,
+            band_df, "ra_deg", "dec_deg", "m_cat", "m_err",
+            _comp_mag_min_band, _comp_mag_max_band,
         )
-        active_source = "+".join(_sources_used) if _sources_used else "NONE"
-        # 供 check_star 診斷用
         apass_matched = active_df
         aavso_matched = active_df
 
     if active_df is None or len(active_df) == 0:
         raise RuntimeError(
-            f"所有星表（{cfg.catalog_priority}）都找不到足夠的比較星。\n"
+            f"band={band} 在星表中找不到足夠的比較星。\n"
             "建議：(1) 放寬 comp_mag_range；(2) 增大 apass_radius_deg；"
             "(3) 確認 catalog_priority 設定。"
         )
@@ -1552,45 +1710,31 @@ def auto_select_comps(
         weight    = 1.0 / (d_arcsec + epsilon) ** 2    # w_i = 1 / (d_i + ε)²
         comp_refs.append((ra_c, dec_c, m_cat, m_err, weight))
 
-    # ── 6b. comp_max 截斷（安全上限，防止極端密集場計算過慢）─────────────────
-    # 按 m_cat 與目標星的差距排序（星等越接近越優先），保留最佳 comp_max 顆。
-    # comp_max=0 表示不截斷（全部使用，由 Broeg 加權自行處理品質）。
+    # ── 6b. comp_max 截斷 ──────────────────────────────────────────────────────
     if cfg.comp_max > 0 and len(comp_refs) > cfg.comp_max:
         _vmag_t = float(getattr(cfg, "vmag_approx", np.nan))
         if np.isfinite(_vmag_t):
-            # 按 |m_cat - vmag_target| 排序，星等最接近的優先
             comp_refs.sort(key=lambda x: abs(x[2] - _vmag_t))
         else:
-            # fallback：按距離加權（近的優先）
             comp_refs.sort(key=lambda x: x[4], reverse=True)
         _n_before = len(comp_refs)
         comp_refs = comp_refs[:cfg.comp_max]
         print(f"[比較星] comp_max={cfg.comp_max}：{_n_before} → {len(comp_refs)} 顆"
               f"（按星等接近度排序）")
-        # 同步更新 active_df
         _kept_coords = {(r[0], r[1]) for r in comp_refs}
         active_df = active_df[
             active_df.apply(lambda row: (row["ra_deg"], row["dec_deg"]) in _kept_coords, axis=1)
         ].reset_index(drop=True)
 
     # ── 7. 檢查星 ──────────────────────────────────────────────────────────────
-    catalog_for_check = aavso_matched if aavso_matched is not None and len(aavso_matched) > 0 else apass_matched
+    # band_df 含該波段所有候選星（含 mag range 外），比 active_df 寬得多，
+    # 確保扣除 comp 後仍有 check star 候選。
     check_star = select_check_star(
-        cfg.target_radec_deg, comp_refs, catalog_for_check
+        cfg.target_radec_deg, comp_refs, band_df
     )
 
-    print(f"[比較星] 使用 {active_source}：{len(comp_refs)} 顆")
+    print(f"[比較星] band={band} 使用 {active_source}：{len(comp_refs)} 顆")
     print(f"[比較星] epsilon = {epsilon:.4f} arcsec")
-
-    # ── 儲存各星表 CSV ────────────────────────────────────────────────────────
-    if hasattr(cfg, "out_dir") and cfg.out_dir is not None:
-        _cat_dir = cfg.run_root / "1_photometry" / "catalogs"
-        _cat_dir.mkdir(parents=True, exist_ok=True)
-        if len(combined_raw) > 0 and "source" in combined_raw.columns:
-            for _src_name, _raw_df in combined_raw.groupby("source"):
-                _cat_csv = _cat_dir / f"catalog_{_src_name}.csv"
-                _raw_df.to_csv(_cat_csv, index=False)
-                print(f"  [星表] 已儲存 → {_cat_csv}  ({len(_raw_df)} 筆)")
 
     return comp_refs, active_df, check_star, aavso_matched, apass_matched, active_source, _vsx
 
@@ -1811,9 +1955,12 @@ def plot_light_curve(
     channel: str,
     cfg,
     obs_date: "str | None" = None,
+    ylim: "tuple[float, float] | None" = None,
 ):
     """
     Generate the light curve plot from a photometry result DataFrame.
+
+    ylim : (ymin, ymax) in mag — 若提供則鎖定 Y 軸範圍（已含 invert）。
     """
     from astropy.time import Time as ATime
     import matplotlib.pyplot as plt
@@ -1876,6 +2023,13 @@ def plot_light_curve(
         ax.plot(bjd_arr, _y_vals, "o-", ms=4, lw=0.8, label="± σ", zorder=3)
 
     ax.invert_yaxis()
+    if ylim is not None:
+        ax.set_ylim(ylim[0], ylim[1])   # ylim 應已考慮 invert（大值在下）
+        # 強制統一 Y 軸 tick 間距（0.05 mag），避免 matplotlib 自動選不同間距
+        _y_lo = min(ylim)   # 亮端（小數值）
+        _y_hi = max(ylim)   # 暗端（大數值）
+        _yticks = np.arange(np.ceil(_y_lo * 20) / 20, _y_hi + 0.001, 0.05)
+        ax.set_yticks(_yticks)
     ax.set_xlim(bjd_min - 0.002, bjd_max + 0.002)
 
     # Ticks & Label (Navy)
@@ -3100,25 +3254,34 @@ if __name__ == "__main__":
             continue
         print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
 
-        # ── 比較星選取（天球座標，通道無關，只做一次）────────────────────────
+        # ── 統一視場星表預建（所有通道共用一次 cone search）──────────────────
+        _field_cat_dir_pre = cfg.out_dir.parent.parent.parent / "catalogs"
+        _field_cat_path_pre = _field_cat_dir_pre / "field_catalog_unified.csv"
+        if not _field_cat_path_pre.exists():
+            print(f"[catalog] 預建統一視場星表...")
+            _load_or_build_unified_catalog(
+                cfg, cfg.target_radec_deg[0], cfg.target_radec_deg[1], _field_cat_dir_pre,
+            )
+
+        # ── 孔徑估計用比較星（首通道 V band，僅供 estimate_aperture_radius 使用）─
         # 注意：此時用 YAML 預設孔徑（8px）做初選測光。
         # 孔徑估計在之後用比較星做，正式測光用估計後的孔徑。
         # 初選與正式孔徑的微小差異（~1-2px）不影響比較星篩選結果。
         try:
-            (comp_refs, comp_df_matched, check_star,
+            (_comp_ap, comp_df_matched, check_star,
              aavso_matched, apass_matched, active_source,
              _vsx_field) = auto_select_comps(
-                wcs_files[0], cfg.target_radec_deg
+                wcs_files[0], cfg.target_radec_deg, band="V"
             )
         except RuntimeError as _e:
-            print(f"[SKIP] {ACTIVE_TARGET} 比較星選取失敗，跳過此目標：{_e}")
+            print(f"[SKIP] {ACTIVE_TARGET} 孔徑估算比較星選取失敗，跳過此目標：{_e}")
             continue
         print(f"check_star：{check_star}")
 
         # ── 孔徑估計（用比較星，亮度接近目標星）──────────────────────────────
         if cfg.aperture_auto:
             ap_r = estimate_aperture_radius(
-                wcs_files[0], comp_df_matched,
+                wcs_files[0], comp_df_matched,   # comp_df_matched from V-band initial selection
                 cfg.aperture_min_radius, cfg.aperture_max_radius,
                 cfg.aperture_growth_fraction,
                 max_stars=(
@@ -3138,20 +3301,6 @@ if __name__ == "__main__":
         )
         print(f"孔徑 r={cfg.aperture_radius:.2f}  r_in={ap_r_in:.2f}  r_out={ap_r_out:.2f}")
         _shared_aperture_radius = cfg.aperture_radius
-
-        # ── 預建所有通道的視場星表快取（避免重複 cone search）──────────────
-        _field_cat_dir_pre = cfg.out_dir.parent.parent / "catalogs"
-        _ra_t_pre, _dec_t_pre = cfg.target_radec_deg
-        for _ch_pre in CHANNELS:
-            _fc_path = _field_cat_dir_pre / f"field_catalog_{_ch_pre}.csv"
-            if _fc_path.exists():
-                continue
-            _cfg_pre = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=_ch_pre,
-                                     split_subdir=_args.split_subdir, out_tag=_args.out_tag,
-                                     run_ts=_log_ts)
-            _load_or_build_field_catalog(
-                _ch_pre, _cfg_pre, _ra_t_pre, _dec_t_pre, _field_cat_dir_pre,
-            )
 
         # ── 多通道測光迴圈 ────────────────────────────────────────────────────
         channel_results: dict = {}
@@ -3181,11 +3330,18 @@ if __name__ == "__main__":
             print(f"  輸出 CSV ：{cfg_ch.phot_out_csv}")
 
             # ── 比較星 m_cat 波段重映射（每通道用正確星表）──
-            _field_cat_dir_ch = cfg_ch.out_dir.parent.parent / "catalogs"
-            _ra_t_ch, _dec_t_ch = cfg_ch.target_radec_deg
-            _comp_refs_ch = _remap_comp_refs_to_band(
-                comp_refs, _ch, cfg_ch, _field_cat_dir_ch, _ra_t_ch, _dec_t_ch,
-            )
+            _band_map_ch = {"R": "R", "G1": "V", "G2": "V", "B": "B"}
+            _band_ch = _band_map_ch.get(str(_ch).upper(), "V")
+            try:
+                (_comp_refs_ch, _comp_df_ch, _check_star_ch,
+                 _aavso_ch, _apass_ch, _active_source_ch,
+                 _vsx_ch) = auto_select_comps(
+                    _fits_ch[0], cfg_ch.target_radec_deg, band=_band_ch
+                )
+                print(f"  [comp] {_ch} source={_active_source_ch} n={len(_comp_refs_ch)}")
+            except RuntimeError as _e_comp_ch:
+                print(f"  [SKIP] {_ch} ????????{_e_comp_ch}")
+                continue
 
             # 同視野多目標：傳入共用比較星快取
             _active_field_key = _get_field_key(ACTIVE_TARGET, ACTIVE_DATE)
@@ -3195,7 +3351,7 @@ if __name__ == "__main__":
                 cfg_ch.phot_out_csv,
                 cfg_ch.phot_out_png,
                 comp_refs=_comp_refs_ch,
-                check_star=check_star,
+                check_star=_check_star_ch,
                 ap_radius=cfg_ch.aperture_radius,
                 channel=_ch,
                 shared_cache=_active_cache,
@@ -3228,6 +3384,26 @@ if __name__ == "__main__":
                     print(f"  [WARN] R_GAIA 失敗：{_e_gaia_r}")
 
         print(f"\n所有通道完成：{list(channel_results.keys())}")
+
+        # ── G1/G2 共享 Y 軸重繪 ───────────────────────────────────────────
+        _shared_chs = [c for c in ("G1", "G2") if c in channel_results]
+        if len(_shared_chs) == 2:
+            _all_ok_mag = []
+            for _sc in _shared_chs:
+                _sdf = channel_results[_sc]
+                _sdf_ok = _sdf[(_sdf["ok"] == 1) & np.isfinite(_sdf["m_var"])]
+                _all_ok_mag.extend(_sdf_ok["m_var"].tolist())
+            if _all_ok_mag:
+                _margin = 0.02
+                _ymin = min(_all_ok_mag) - _margin   # 亮端（小數值）
+                _ymax = max(_all_ok_mag) + _margin   # 暗端（大數值）
+                _shared_ylim = (_ymax, _ymin)         # invert: 大值在下(bottom)
+                for _sc in _shared_chs:
+                    # 直接寫回原 run_root，不重建 cfg（避免產生新時間戳目錄）
+                    _sc_png = cfg.run_root / "3_light_curve" / f"light_curve_{_sc}_{ACTIVE_DATE}.png"
+                    plot_light_curve(channel_results[_sc], _sc_png, _sc,
+                                    cfg, obs_date=ACTIVE_DATE, ylim=_shared_ylim)
+                print(f"[PLOT] G1/G2 Y 軸已鎖定：{_ymin:.3f} – {_ymax:.3f} mag")
 
         # ── 週期分析（統一使用 period_analysis.py）─────────────────────────
         from period_analysis import run_period_analysis
