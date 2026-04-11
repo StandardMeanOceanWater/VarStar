@@ -3017,6 +3017,9 @@ def run_photometry_on_wcs_dir(
             f"Aperture  : {ap_radius:.1f} px  "
             f"(annulus {r_in:.1f}–{r_out:.1f})",
         ]
+        _summary_lines.append(
+            f"GrowthFr  : {getattr(cfg, 'aperture_growth_fraction', float('nan')):.3f}"
+        )
         if _n_ok > 0:
             _mvar = _ok_df["m_var_norm"] if "m_var_norm" in _ok_df.columns else _ok_df["m_var"]
             _mvar_ok = _mvar[np.isfinite(_mvar)]
@@ -3190,6 +3193,8 @@ if __name__ == "__main__":
     # ── 同視野偵測：以 split/{ch}/ 前三個 FITS 檔名為 field_key ────────────────
     # 相同視野的目標（hardlink 或同一 session 同一視野）共用 _FrameCompCache，
     # 避免重複做比較星孔徑測光。
+    _logger.info(f"[photometry] targets={_targets_list} channels={CHANNELS}")
+
     def _get_field_key(tgt, dt):
         try:
             _cfg_tmp = cfg_from_yaml(_yaml, tgt, dt, channel=CHANNELS[0],
@@ -3214,10 +3219,12 @@ if __name__ == "__main__":
     }
     _multi_fields = sum(1 for v in _field_groups.values() if len(v) > 1)
     if _multi_fields:
+        _logger.info(f"[photometry] shared_field_groups={_multi_fields}")
         print(f"[photometry] 偵測到 {_multi_fields} 個多目標視野，啟用共用比較星快取")
 
     # ── 各目標迴圈 ────────────────────────────────────────────────────────────
     for (ACTIVE_TARGET, ACTIVE_DATE) in _targets_list:
+        _logger.info(f"[target] start target={ACTIVE_TARGET} date={ACTIVE_DATE} channels={CHANNELS}")
         print(f"\n{'#'*60}")
         print(f"# 目標：{ACTIVE_TARGET}  日期：{ACTIVE_DATE}  通道：{CHANNELS}")
         print(f"{'#'*60}")
@@ -3234,6 +3241,7 @@ if __name__ == "__main__":
                                 split_subdir=_args.split_subdir, out_tag=_args.out_tag,
                                 run_ts=_log_ts)
         except Exception as _e_cfg:
+            _logger.warning(f"[SKIP] {ACTIVE_TARGET}/{ACTIVE_DATE} cfg error: {_e_cfg}")
             print(f"[SKIP] {ACTIVE_TARGET}/{ACTIVE_DATE} cfg 建立失敗：{_e_cfg}")
             continue
 
@@ -3247,11 +3255,17 @@ if __name__ == "__main__":
                               datefmt="%Y-%m-%d %H:%M:%S")
         )
         _logger.addHandler(_file_hdl)
+        _logger.info(f"[LOG] {_log_path}")
         print(f"[LOG] {_log_path}")
+        _logger.info(
+            f"[runtime] target={ACTIVE_TARGET} date={ACTIVE_DATE} "
+            f"aperture_growth_fraction={cfg.aperture_growth_fraction:.3f}"
+        )
 
         _ch0 = CHANNELS[0]
         wcs_files = sorted(cfg.wcs_dir.glob(f"*_{_ch0}.fits"))
         if not wcs_files:
+            _logger.warning(f"[SKIP] no split FITS for channel={_ch0} dir={cfg.wcs_dir}")
             print(f"[SKIP] 找不到 split/{_ch0} FITS：{cfg.wcs_dir}，跳過此目標")
             continue
         print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
@@ -3276,12 +3290,19 @@ if __name__ == "__main__":
                 wcs_files[0], cfg.target_radec_deg, band="V"
             )
         except RuntimeError as _e:
+            _logger.warning(f"[SKIP] {ACTIVE_TARGET} aperture preselect failed: {_e}")
             print(f"[SKIP] {ACTIVE_TARGET} 孔徑估算比較星選取失敗，跳過此目標：{_e}")
             continue
         print(f"check_star：{check_star}")
 
         # ── 孔徑估計（用比較星，亮度接近目標星）──────────────────────────────
+        _logger.info(f"[check_star] {check_star}")
+        ap_r = None
         if cfg.aperture_auto:
+            _logger.info(
+                f"[aperture_auto] growth_fraction={cfg.aperture_growth_fraction:.3f} "
+                f"r_min={cfg.aperture_min_radius} r_max={cfg.aperture_max_radius}"
+            )
             ap_r = estimate_aperture_radius(
                 wcs_files[0], comp_df_matched,   # comp_df_matched from V-band initial selection
                 cfg.aperture_min_radius, cfg.aperture_max_radius,
@@ -3292,16 +3313,30 @@ if __name__ == "__main__":
                 ),
             )
             if ap_r is not None:
+                _logger.info(
+                    f"[aperture_auto] selected_radius={ap_r:.2f} "
+                    f"growth_fraction={cfg.aperture_growth_fraction:.3f}"
+                )
                 cfg.aperture_radius = ap_r
                 print(
                     f"[生長曲線] 自動孔徑半徑 = {cfg.aperture_radius:.2f} px"
                     "（所有通道共用）"
                 )
 
+        if cfg.aperture_auto and ap_r is None:
+            _logger.warning(
+                f"[aperture_auto] estimate failed; keep fixed aperture={cfg.aperture_radius:.2f} "
+                f"growth_fraction={cfg.aperture_growth_fraction:.3f}"
+            )
+
         ap_r_in, ap_r_out = compute_annulus_radii(
             cfg.aperture_radius, cfg.annulus_r_in, cfg.annulus_r_out
         )
         print(f"孔徑 r={cfg.aperture_radius:.2f}  r_in={ap_r_in:.2f}  r_out={ap_r_out:.2f}")
+        _logger.info(
+            f"[aperture] radius={cfg.aperture_radius:.2f} r_in={ap_r_in:.2f} "
+            f"r_out={ap_r_out:.2f} growth_fraction={cfg.aperture_growth_fraction:.3f}"
+        )
         _shared_aperture_radius = cfg.aperture_radius
 
         # ── 多通道測光迴圈 ────────────────────────────────────────────────────
@@ -3311,6 +3346,7 @@ if __name__ == "__main__":
         _split_dir_per_ch: dict = {}   # {channel: split_dir}
 
         for _ch in CHANNELS:
+            _logger.info(f"[channel] start channel={_ch} shared_aperture={_shared_aperture_radius:.2f}")
             print(f"\n{'='*55}")
             print(f"  通道 {_ch}  ({CHANNELS.index(_ch) + 1}/{len(CHANNELS)})")
             print(f"{'='*55}")
@@ -3329,6 +3365,7 @@ if __name__ == "__main__":
             _split_dir_per_ch[_ch] = _split_dir
             _fits_ch   = sorted(_split_dir.glob(f"*_{_ch}.fits"))
             if not _fits_ch:
+                _logger.warning(f"[SKIP] channel={_ch} no split FITS in dir={_split_dir}")
                 print(f"  [SKIP] split/{_ch}/ 找不到 FITS，跳過此通道")
                 continue
 
@@ -3344,10 +3381,12 @@ if __name__ == "__main__":
                  _vsx_ch) = auto_select_comps(
                     _fits_ch[0], cfg_ch.target_radec_deg, band=_band_ch
                 )
+                _logger.info(f"[comp] channel={_ch} source={_active_source_ch} n={len(_comp_refs_ch)}")
                 print(f"  [comp] {_ch} source={_active_source_ch} n={len(_comp_refs_ch)}")
                 _comp_refs_per_ch[_ch] = _comp_refs_ch
                 _check_star_per_ch[_ch] = _check_star_ch
             except RuntimeError as _e_comp_ch:
+                _logger.warning(f"[SKIP] channel={_ch} comp selection failed: {_e_comp_ch}")
                 print(f"  [SKIP] {_ch} 比較星讀取失敗：{_e_comp_ch}")
                 continue
 
@@ -3368,6 +3407,7 @@ if __name__ == "__main__":
                 print(f"  [快取] 比較星快取 {len(_active_cache)} 筆")
             channel_results[_ch] = df_ch
             _ok_cnt = int(df_ch['ok'].sum()) if 'ok' in df_ch.columns else 0
+            _logger.info(f"[channel] done channel={_ch} ok={_ok_cnt}/{len(df_ch)}")
             print(f"  [完成] {_ch}：ok={_ok_cnt} / {len(df_ch)} 幀")
 
             # R 通道：額外跑 Gaia RP→Rc 輸出獨立 R_GAIA 結果
@@ -3675,8 +3715,10 @@ if __name__ == "__main__":
         # 從 VSX 查詢結果中篩選 9.8–11.2 等的已知變星，逐顆跑差分測光。
         # 使用與主目標相同的比較星、孔徑、FITS 檔案。
         # 輸出目錄與 YAML 目標相同層級：output/{date}/{group}/{VSXname}/{timestamp}/
+        _logger.info(f"[target] base target complete target={ACTIVE_TARGET} date={ACTIVE_DATE}")
         _VSX_MAG_MIN, _VSX_MAG_MAX = 6.0, 12.0
         if _args.no_vsx:
+            _emit("info", "[VSX] disabled by --no-vsx")
             print("[VSX 額外目標] --no-vsx 旗標啟用，跳過額外目標測光")
         elif _vsx_field is not None and len(_vsx_field) > 0:
             _vsx_mag_col = None
@@ -3693,6 +3735,7 @@ if __name__ == "__main__":
 
                 # 排除主目標自身（10" 以內）
                 if len(_vsx_cand) > 0:
+                    _logger.info(f"[vsx] candidates={len(_vsx_cand)} mag_window={_VSX_MAG_MIN}-{_VSX_MAG_MAX}")
                     _tgt_sc = SkyCoord(ra=cfg.target_radec_deg[0] * u.deg,
                                        dec=cfg.target_radec_deg[1] * u.deg)
                     _vsx_sc = SkyCoord(ra=_vsx_cand["ra_deg"].values * u.deg,
@@ -3739,6 +3782,20 @@ if __name__ == "__main__":
                         _vsx_type = str(_vr.get("Type", "?"))
                         _vsx_per  = _vr.get("Period", "?")
                         _vsx_mag  = float(_vr["_mag"])
+                        _vsx_ready_channels = [
+                            _vch for _vch in CHANNELS
+                            if _vch in _comp_refs_per_ch
+                            and _vch in _split_dir_per_ch
+                            and any(_split_dir_per_ch[_vch].glob(f"*_{_vch}.fits"))
+                        ]
+                        if not _vsx_ready_channels:
+                            _logger.warning(
+                                f"[VSX SKIP] name={_vsx_name} no ready channel before target tree creation"
+                            )
+                            continue
+                        _logger.info(
+                            f"[vsx] target={_vsx_name} mag={_vsx_mag:.2f} ready_channels={_vsx_ready_channels}"
+                        )
                         print(f"\n  ── {_vsx_name_raw}  ({_vsx_type})  "
                               f"mag={_vsx_mag:.2f}  P={_vsx_per}d  "
                               f"RA={_vsx_ra:.4f}  Dec={_vsx_dec:.4f}")
@@ -3755,6 +3812,7 @@ if __name__ == "__main__":
                         _vsx_ch_results = {}
                         for _vch in CHANNELS:
                             if _vch not in _comp_refs_per_ch:
+                                _logger.warning(f"[VSX SKIP] target={_vsx_name} channel={_vch} missing comp refs")
                                 print(f"    {_vch}: 跳過（主目標該通道無比較星）")
                                 continue
                             _vsx_csv = _vsx_out_dir / f"photometry_{_vch}_{ACTIVE_DATE}.csv"
@@ -3792,11 +3850,21 @@ if __name__ == "__main__":
                                     _ok_rows = _vsx_df[_vsx_df["ok"] == 1]
                                     _med = float(_ok_rows["m_var"].median())
                                     _amp = float(_ok_rows["m_var"].max() - _ok_rows["m_var"].min())
+                                    _logger.info(
+                                        f"[vsx] target={_vsx_name} channel={_vch} ok={_n_ok}/{len(_vsx_df)} "
+                                        f"median={_med:.3f} amp={_amp:.3f}"
+                                    )
                                     print(f"    {_vch}: ok={_n_ok}/{len(_vsx_df)}  "
                                           f"median={_med:.3f}  amp={_amp:.3f}")
                                 else:
+                                    _logger.info(
+                                        f"[vsx] target={_vsx_name} channel={_vch} ok={_n_ok}/{len(_vsx_df)}"
+                                    )
                                     print(f"    {_vch}: ok={_n_ok}/{len(_vsx_df)}")
                             except Exception as _e_vsx_phot:
+                                _logger.warning(
+                                    f"[vsx] target={_vsx_name} channel={_vch} error: {_e_vsx_phot}"
+                                )
                                 print(f"    {_vch}: 測光失敗 — {_e_vsx_phot}")
                             finally:
                                 cfg.target_radec_deg = _cfg_backup_radec
