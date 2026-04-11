@@ -3348,7 +3348,7 @@ if __name__ == "__main__":
                 _comp_refs_per_ch[_ch] = _comp_refs_ch
                 _check_star_per_ch[_ch] = _check_star_ch
             except RuntimeError as _e_comp_ch:
-                print(f"  [SKIP] {_ch} ????????{_e_comp_ch}")
+                print(f"  [SKIP] {_ch} 比較星讀取失敗：{_e_comp_ch}")
                 continue
 
             # 同視野多目標：傳入共用比較星快取
