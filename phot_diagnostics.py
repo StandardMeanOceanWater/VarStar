@@ -43,7 +43,7 @@ def _save_regression_diagnostic(
         if fit is not None and np.isfinite(fit.get("a", np.nan)):
             x_line = np.linspace(m_cat[ok].min(), m_cat[ok].max(), 100)
             y_line = fit["a"] * x_line + fit["b"]
-            r2_str = f"R簡={fit['r2']:.3f}" if np.isfinite(fit.get("r2", np.nan)) else ""
+            r2_str = f"R2={fit['r2']:.3f}" if np.isfinite(fit.get("r2", np.nan)) else ""
             ax.plot(x_line, y_line, color=color, lw=1.5,
                     label=f"{label} fit  a={fit['a']:.3f}  b={fit['b']:.3f}  {r2_str}")
 

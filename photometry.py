@@ -74,6 +74,9 @@ from phot_regression import (                    # noqa: E402
     robust_linear_fit, mag_error_from_flux,
     differential_mag,
 )
+from phot_diagnostics import _save_regression_diagnostic as _shared_save_regression_diagnostic  # noqa: E402
+from phot_ensemble import ensemble_normalize as _shared_ensemble_normalize  # noqa: E402
+from phot_timing import time_from_header as _shared_time_from_header  # noqa: E402
 from phot_catalog import (                       # noqa: E402
     _pick_col, _parse_ra_dec,
     read_aavso_seq_csv, fetch_aavso_vsp_api,
@@ -987,117 +990,8 @@ def time_from_header(
     ra_deg: float,
     dec_deg: float,
 ) -> "tuple[float, float, float]":
-    """
-    Extract timing and airmass from a FITS header.
-
-    Time system
-    -----------
-    Returns BJD_TDB (Barycentric Julian Date, TDB timescale), which is
-    the current AAVSO standard for variable star photometry (Eastman et al.,
-    2010).  HJD is no longer returned; BJD_TDB replaces it throughout.
-
-    Exposure mid-point correction
-    ------------------------------
-    For periodic variables with periods < 1 h (e.g. delta Scuti), using the
-    exposure start time (DATE-OBS) instead of the midpoint introduces a phase
-    error of EXPTIME / (2 * P).  For EXPTIME = 60 s and P = 3800 s this is
-    ~0.008 phase units — detectable on a well-sampled light curve.
-    MID-OBS = DATE-OBS + EXPTIME/2 is therefore preferred when available.
-
-    Returns
-    -------
-    (mjd, bjd_tdb, airmass)
-        mjd      : Modified Julian Date (UTC) at exposure midpoint
-        bjd_tdb  : Barycentric Julian Date (TDB) at exposure midpoint
-        airmass  : Young (1994) airmass; np.nan if location unavailable
-    """
-    # ── 1. Resolve observation time (prefer MID-OBS, fall back to DATE-OBS) ──
-    mid_obs  = header.get("MID-OBS")
-    date_obs = header.get("DATE-OBS") or header.get("DATEOBS")
-
-    time_str  = mid_obs if mid_obs else date_obs
-    used_midobs = mid_obs is not None
-
-    if not time_str:
-        return np.nan, np.nan, np.nan
-
-    try:
-        t = Time(time_str, format="isot", scale="utc")
-    except Exception:
-        try:
-            t = Time(time_str, format="iso", scale="utc")
-        except Exception:
-            return np.nan, np.nan, np.nan
-
-    # ── 2. If only DATE-OBS available, add EXPTIME/2 to get midpoint ─────────
-    if not used_midobs:
-        exptime = header.get("EXPTIME") or header.get("EXPOSURE")
-        if exptime is not None:
-            try:
-                t = t + float(exptime) / 2.0 * u.second
-            except Exception:
-                pass
-        else:
-            print("[WARN] EXPTIME missing; DATE-OBS used as-is (not midpoint). "
-                  "Add EXPTIME to FITS header for accurate phase computation.")
-
-    mjd = float(t.mjd)
-
-    # ── 3. BJD_TDB conversion ─────────────────────────────────────────────────
-    lat    = cfg.obs_lat_deg
-    lon    = cfg.obs_lon_deg
-    height = cfg.obs_height_m
-
-    if lat is None or lon is None:
-        lat    = _float_or_none(header.get("SITELAT") or header.get("OBS-LAT")
-                                or header.get("OBSLAT"))
-        lon    = _float_or_none(header.get("SITELONG") or header.get("SITELON")
-                                or header.get("OBS-LON") or header.get("OBSLON"))
-        height = _float_or_none(
-            header.get("SITEALT") or header.get("SITEELEV") or header.get("OBSALT")
-            or header.get("OBSHGT") or header.get("OBSGEO-H")
-        ) or cfg.obs_height_m
-
-    bjd_tdb = np.nan
-    airmass = np.nan
-
-    if lat is None or lon is None:
-        print("[WARN] Observatory location not set. "
-              "Set cfg.obs_lat_deg / cfg.obs_lon_deg for BJD_TDB and airmass.")
-        return mjd, bjd_tdb, airmass
-
-    lat, lon, height = float(lat), float(lon), float(height) if height else 0.0
-
-    try:
-        location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg, height=height * u.m)
-        sc       = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
-        ltt      = t.light_travel_time(sc, "barycentric", location=location)
-        bjd_tdb  = float((t.tdb + ltt).jd)
-    except Exception as exc:
-        print(f"[WARN] BJD_TDB calculation failed: {exc}")
-
-    # ── 4. Airmass (Young 1994) + warning ─────────────────────────────────────
-    try:
-        airmass = compute_airmass(t, ra_deg, dec_deg, lat, lon, height)
-        if np.isfinite(airmass) and airmass > AIRMASS_WARN_THRESHOLD:
-            alt_deg = float(
-                SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
-                .transform_to(AltAz(
-                    obstime=t,
-                    location=EarthLocation(lat=lat * u.deg, lon=lon * u.deg,
-                                           height=height * u.m),
-                ))
-                .alt.deg
-            )
-            _phot_logger.debug(
-                "[WARN] High airmass X=%.2f (altitude=%.1f°) in %s. "
-                "Differential photometry accuracy may be reduced.",
-                airmass, alt_deg, header.get("FILENAME", "unknown"),
-            )
-    except Exception as exc:
-        print(f"[WARN] Airmass calculation failed: {exc}")
-
-    return mjd, bjd_tdb, airmass
+    """Compatibility wrapper for the shared timing implementation."""
+    return _shared_time_from_header(header, ra_deg, dec_deg, cfg)
 
 
 
@@ -1140,59 +1034,16 @@ def _save_regression_diagnostic(
     active_source: str,
     diag_dir: Path,
 ) -> None:
-    """
-    輸出每張影像的零點診斷散佈圖。
-
-    x 軸：星表星等 m_cat
-    y 軸：儀器星等 m_inst
-    紅色：AAVSO 比較星 + 回歸線（若有）
-    藍色：APASS 比較星 + 回歸線（若有）
-    灰色虛線：理想斜率 = 1 的參考線
-    """
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    x_all = []
-    for label, df_m, fit, color, marker in [
-        ("AAVSO", aavso_matched, fit_aavso, "red", "o"),
-        ("APASS", apass_matched, fit_apass, "steelblue", "s"),
-    ]:
-        if df_m is None or len(df_m) == 0:
-            continue
-        m_cat  = df_m["m_cat"].values
-        m_inst = df_m["m_inst_matched"].values if "m_inst_matched" in df_m.columns else np.full(len(df_m), np.nan)
-        ok = np.isfinite(m_cat) & np.isfinite(m_inst)
-        if not ok.any():
-            continue
-        ax.scatter(m_cat[ok], m_inst[ok], s=18, alpha=0.7,
-                   color=color, marker=marker,
-                   label=f"{label} (n={ok.sum()})")
-        x_all.extend(m_cat[ok].tolist())
-
-        if fit is not None and np.isfinite(fit.get("a", np.nan)):
-            x_line = np.linspace(m_cat[ok].min(), m_cat[ok].max(), 100)
-            y_line = fit["a"] * x_line + fit["b"]
-            r2_str = f"R²={fit['r2']:.3f}" if np.isfinite(fit.get("r2", np.nan)) else ""
-            ax.plot(x_line, y_line, color=color, lw=1.5,
-                    label=f"{label} fit  a={fit['a']:.3f}  b={fit['b']:.3f}  {r2_str}")
-
-    if x_all:
-        x_range = np.array([min(x_all), max(x_all)])
-        ax.plot(x_range, x_range, "k--", lw=0.8, alpha=0.4, label="ideal (slope=1)")
-
-    ax.invert_yaxis()
-    ax.set_xlabel("Catalogue magnitude  $m_{cat}$")
-    ax.set_ylabel("Instrumental magnitude  $m_{inst}$")
-    ax.set_title(
-        f"Regression Fit Diagnostic  [{frame_name}]\n"
-        f"Active source: {active_source}",
-        fontsize=9,
+    """Compatibility wrapper for the shared diagnostics implementation."""
+    return _shared_save_regression_diagnostic(
+        frame_name,
+        aavso_matched,
+        apass_matched,
+        fit_aavso,
+        fit_apass,
+        active_source,
+        diag_dir,
     )
-    ax.legend(fontsize=7, loc="upper left")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    out_path = diag_dir / f"reg_diag_{Path(frame_name).stem}.png"
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
 
 
 def _load_or_build_unified_catalog(
@@ -1762,171 +1613,16 @@ def ensemble_normalize(
     max_iter: int = 10,
     convergence_tol: float = 1e-4,
 ) -> "tuple[pd.DataFrame, pd.Series]":
-    """
-    ⏸ 已停用：Broeg (2005) ensemble normalisation.
-
-    理由：逐幀自由斜率回歸已完全消除逐幀大氣漂移，
-         ensemble 正規化解決的是同一問題，二者不應疊加（可能引入雜訊）。
-    待驗：確認移除後 R² 無退化。
-
-    ─── 原始文件 ───
-
-    每顆比較星 i 的儀器星等時間序列 m_i(t) 估計共同大氣漂移 Δ(t)，
-    然後對目標星星等做修正：m_var_norm(t) = m_var(t) − Δ(t)。
-
-    演算法
-    ------
-    1. 初始權重：以 initial_weights（距離 + 測光誤差複合）為種子。
-    2. 迭代：
-       a. 計算各比較星偏差 δ_i(t) = m_i(t) − median(m_i)
-       b. 計算漂移 Δ(t) = Σ w_i δ_i(t) / Σ w_i（僅對各幀中有效的比較星加總）
-       c. 扣除漂移後計算每顆比較星殘差 RMS
-       d. 更新權重 w_i = 1 / RMS_i²（Broeg 2005 eq. 4）
-       e. 收斂判斷：max |Δ_new(t) − Δ_old(t)| < convergence_tol
-    3. 將最終 Δ(t) 寫回 df["delta_ensemble"]，修正值寫入 df["m_var_norm"]。
-
-    Parameters
-    ----------
-    df               : run_photometry_on_wcs_dir 回傳的 DataFrame。
-    comp_lightcurves : {star_id: Series(time_key → m_inst)}，每顆比較星的
-                       儀器星等時間序列。NaN 表示該幀該星不可用。
-    initial_weights  : {star_id: float}，初始權重種子。
-    time_key         : 時間欄位名稱（"bjd_tdb" 或 "mjd"）。
-    min_comp_stars   : 計算 Δ(t) 所需的最少可用比較星數；不足時 Δ(t) = NaN。
-    max_iter         : Broeg 迭代上限。
-    convergence_tol  : 連續兩次迭代 Δ(t) 最大差值的收斂閾值（mag）。
-
-    Returns
-    -------
-    df_out  : 含 m_var_norm、delta_ensemble 欄位的 DataFrame（原始 df 的副本）。
-    delta_t : Δ(t) 時間序列（pd.Series，index = time_key 的值）。
-
-    References
-    ----------
-    Broeg, C., Fernández, M., & Neuhäuser, R. (2005). A new algorithm for
-    differential photometry: Computing an optimum artificial comparison star.
-    Astronomische Nachrichten, 326(2), 134–142.
-    https://doi.org/10.1002/asna.200410350
-    """
-    if len(comp_lightcurves) < min_comp_stars:
-        _phot_logger.warning(
-            "[ensemble] 比較星數量 %d < min_comp_stars %d，跳過 ensemble 正規化。",
-            len(comp_lightcurves), min_comp_stars,
-        )
-        df_out = df.copy()
-        df_out["m_var_norm"] = df_out.get("m_var", np.nan)
-        df_out["delta_ensemble"] = np.nan
-        return df_out, pd.Series(dtype=float)
-
-    star_ids = list(comp_lightcurves.keys())
-
-    # ── 建立比較星矩陣 M：index = time_key 值，columns = star_id ─────────────
-    # 對齊到 df 的時間軸；缺測幀填 NaN
-    t_index = df[time_key].values
-    m_matrix = pd.DataFrame(index=range(len(t_index)), columns=star_ids, dtype=float)
-    for sid in star_ids:
-        series = comp_lightcurves[sid]
-        for row_i, t_val in enumerate(t_index):
-            if np.isfinite(t_val) and t_val in series.index:
-                m_matrix.loc[row_i, sid] = series[t_val]
-            else:
-                m_matrix.loc[row_i, sid] = np.nan
-    m_arr = m_matrix.values.astype(float)   # shape: (n_frames, n_comp)
-
-    # ── 各比較星時間序列中位數（作為基準，扣除後得到殘差）────────────────────
-    med_i = np.nanmedian(m_arr, axis=0)     # shape: (n_comp,)
-
-    # ── 初始權重向量 ──────────────────────────────────────────────────────────
-    w = np.array(
-        [float(initial_weights.get(sid, 1.0)) for sid in star_ids],
-        dtype=float,
+    """Compatibility wrapper for the shared ensemble implementation."""
+    return _shared_ensemble_normalize(
+        df,
+        comp_lightcurves,
+        initial_weights,
+        time_key=time_key,
+        min_comp_stars=min_comp_stars,
+        max_iter=max_iter,
+        convergence_tol=convergence_tol,
     )
-    # 無效（非正、NaN）的初始權重設為中位數，避免被單顆壞星主導
-    _w_valid = w[np.isfinite(w) & (w > 0)]
-    _w_fallback = float(np.median(_w_valid)) if len(_w_valid) > 0 else 1.0
-    w = np.where(np.isfinite(w) & (w > 0), w, _w_fallback)
-
-    delta_old = np.full(len(t_index), np.nan)
-
-    for iteration in range(int(max_iter)):
-        # ── 計算各幀漂移 Δ(t) ────────────────────────────────────────────────
-        delta_new = np.full(len(t_index), np.nan)
-        for row_i in range(len(t_index)):
-            row = m_arr[row_i, :]                  # 各比較星在此幀的 m_inst
-            valid = np.isfinite(row) & np.isfinite(med_i)
-            if int(valid.sum()) < min_comp_stars:
-                continue
-            delta_i = row[valid] - med_i[valid]    # δ_i(t) = m_i(t) − m̄_i
-            w_v = w[valid]
-            delta_new[row_i] = float(np.sum(w_v * delta_i) / np.sum(w_v))
-
-        # ── 收斂判斷 ──────────────────────────────────────────────────────────
-        both_finite = np.isfinite(delta_old) & np.isfinite(delta_new)
-        if both_finite.any():
-            max_diff = float(np.max(np.abs(delta_new[both_finite]
-                                           - delta_old[both_finite])))
-            if max_diff < convergence_tol:
-                _phot_logger.debug(
-                    "[ensemble] 第 %d 次迭代收斂（max|ΔΔ|=%.2e < tol=%.2e）。",
-                    iteration + 1, max_diff, convergence_tol,
-                )
-                break
-
-        delta_old = delta_new.copy()
-
-        # ── 更新比較星權重：w_i = 1 / RMS_i²（Broeg 2005 eq. 4）───────────
-        for ci, sid in enumerate(star_ids):
-            col = m_arr[:, ci]
-            finite_rows = np.isfinite(col) & np.isfinite(delta_new)
-            if int(finite_rows.sum()) < 2:
-                continue
-            resid = col[finite_rows] - med_i[ci] - delta_new[finite_rows]
-            rms_i = float(np.sqrt(np.mean(resid ** 2)))
-            if rms_i > 0:
-                w[ci] = 1.0 / rms_i ** 2
-
-    # ── 修正目標星星等 ────────────────────────────────────────────────────────
-    df_out = df.copy()
-    df_out["delta_ensemble"] = delta_new
-
-    m_var_col = df_out.get("m_var") if "m_var" in df_out.columns else pd.Series(
-        np.nan, index=df_out.index
-    )
-    # delta_new 是儀器星等空間的漂移量；m_var 是校正星等空間 (m_inst-b)/a。
-    # 轉換：delta_catalog = delta_inst / a，才能從 m_var 中正確扣除。
-    _reg_slope = df_out["reg_slope"].values if "reg_slope" in df_out.columns else np.ones(len(df_out))
-    _reg_slope_safe = np.where(np.isfinite(_reg_slope) & (_reg_slope != 0), _reg_slope, 1.0)
-    delta_scaled = delta_new / _reg_slope_safe
-
-    m_var_norm = np.where(
-        np.isfinite(df_out["m_var"].values) & np.isfinite(delta_scaled),
-        df_out["m_var"].values - delta_scaled,
-        np.nan,
-    )
-    df_out["m_var_norm"] = m_var_norm
-
-    # ── 最終 Δ(t) 統計摘要 ───────────────────────────────────────────────────
-    finite_delta = delta_new[np.isfinite(delta_new)]
-    if len(finite_delta) > 0:
-        _phot_logger.info(
-            "[ensemble] 完成。Δ(t) median=%.4f  rms=%.4f  "
-            "有效幀數=%d/%d  比較星數=%d",
-            float(np.median(finite_delta)),
-            float(np.std(finite_delta)),
-            int(np.isfinite(delta_new).sum()),
-            len(delta_new),
-            len(star_ids),
-        )
-        print(
-            f"[ensemble] Δ(t) median={float(np.median(finite_delta)):.4f}  "
-            f"rms={float(np.std(finite_delta)):.4f}  "
-            f"有效幀={int(np.isfinite(delta_new).sum())}/{len(delta_new)}"
-        )
-    else:
-        _phot_logger.warning("[ensemble] 無有效 Δ(t)，m_var_norm 全為 NaN。")
-
-    delta_series = pd.Series(delta_new, index=t_index, name="delta_ensemble")
-    return df_out, delta_series
 
 
 class _FrameCompCache:
@@ -3718,7 +3414,7 @@ if __name__ == "__main__":
         _logger.info(f"[target] base target complete target={ACTIVE_TARGET} date={ACTIVE_DATE}")
         _VSX_MAG_MIN, _VSX_MAG_MAX = 6.0, 12.0
         if _args.no_vsx:
-            _emit("info", "[VSX] disabled by --no-vsx")
+            _logger.info("[VSX] disabled by --no-vsx")
             print("[VSX 額外目標] --no-vsx 旗標啟用，跳過額外目標測光")
         elif _vsx_field is not None and len(_vsx_field) > 0:
             _vsx_mag_col = None

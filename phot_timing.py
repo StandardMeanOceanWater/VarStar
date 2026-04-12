@@ -6,13 +6,20 @@ Header/time utilities and sensor gain handling for photometry.
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 import astropy.units as u
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from astropy.time import Time
+from astropy.utils import iers
 
 _phot_logger = logging.getLogger("photometry")
+
+# Offline-first timing config:
+# Default to bundled IERS data only. Network download is allowed only when the
+# operator explicitly sets VARSTAR_ALLOW_IERS_DOWNLOAD=1 in the environment.
+iers.conf.auto_download = os.environ.get("VARSTAR_ALLOW_IERS_DOWNLOAD", "0") == "1"
 
 # Camera sensor database (PTC method; Canon 6D2 values from photonstophotos.net)
 CAMERA_SENSOR_DB = {
