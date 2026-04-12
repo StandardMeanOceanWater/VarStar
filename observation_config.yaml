@@ -272,7 +272,7 @@ photometry:
   peak_ratio_k: 3.0     # 自適應門檻倍數；peak_ratio < median - k×MAD 時剔除
   reg_intercept_sigma: 3.0  # 回歸截距突變閾值（倍 MAD）；薄雲/透明度驟變偵測
   sky_sigma: 3.0           # 背景突升閾值（倍 MAD）；起霧/散射光偵測
-  aperture_growth_fraction: 0.97  # 舊值 0.95→0.99（太大）；0.97 在 r_max=12 下約 9-10px
+  aperture_growth_fraction: 0.95  # 保守回調；避免 0.97 在 r_max=12 下把孔徑推到約 9-10px
 
 
 # -----------------------------------------------------------------------------
