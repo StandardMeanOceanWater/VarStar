@@ -34,6 +34,7 @@ period_analysis.py — 進階週期分析模組（使用者選用）
                                   config_path=Path("observation_config.yaml"))
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -474,6 +475,100 @@ def run_ls_and_dft(
         "fap_status": fap_status,
         "period_max_days": period_max_days,
     }
+
+
+def _safe_stem(text: str) -> str:
+    return str(text).replace(" ", "")
+
+
+def _write_ls_spectrum_csv(
+    out_dir: Path,
+    target_name: str,
+    channel: str,
+    ls_result: Dict,
+) -> Path:
+    freqs = np.asarray(ls_result["freqs"], dtype=float)
+    df = pd.DataFrame(
+        {
+            "channel": channel,
+            "frequency_d_inv": freqs,
+            "period_d": 1.0 / freqs,
+            "period_hr": 24.0 / freqs,
+            "ls_power": np.asarray(ls_result["ls_power"], dtype=float),
+        }
+    )
+    out_path = out_dir / f"period_ls_spectrum_{_safe_stem(target_name)}_{channel}.csv"
+    df.to_csv(out_path, index=False, float_format="%.10f")
+    return out_path
+
+
+def _write_dft_spectrum_csv(
+    out_dir: Path,
+    target_name: str,
+    channel: str,
+    ls_result: Dict,
+) -> Path:
+    freqs = np.asarray(ls_result["freqs"], dtype=float)
+    df = pd.DataFrame(
+        {
+            "channel": channel,
+            "frequency_d_inv": freqs,
+            "period_d": 1.0 / freqs,
+            "period_hr": 24.0 / freqs,
+            "dft_amplitude": np.asarray(ls_result["dft_amp"], dtype=float),
+        }
+    )
+    out_path = out_dir / f"period_dft_spectrum_{_safe_stem(target_name)}_{channel}.csv"
+    df.to_csv(out_path, index=False, float_format="%.10f")
+    return out_path
+
+
+def _write_fourier_fit_json(
+    out_dir: Path,
+    target_name: str,
+    channel: str,
+    fit_result: Dict,
+    ls_result: Dict,
+) -> Path:
+    payload = {
+        "channel": channel,
+        "best_period_d": float(fit_result["period"]),
+        "best_frequency_d_inv": float(ls_result["best_freq"]),
+        "peak_power": float(ls_result["peak_power"]),
+        "fap": float(ls_result["fap"]),
+        "fap_n_iter": int(ls_result["fap_n_iter"]),
+        "fap_status": ls_result["fap_status"],
+        "t0": float(fit_result["t0"]),
+        "period_err": float(fit_result["period_err"]),
+        "n_harmonics": int(fit_result["n_harmonics"]),
+        "amplitude": float(fit_result["amplitude"]),
+        "rms_residuals": float(fit_result["rms_residuals"]),
+        "coefficients": [float(v) for v in np.asarray(fit_result["popt"], dtype=float)],
+    }
+    out_path = out_dir / f"period_fourier_fit_{_safe_stem(target_name)}_{channel}.json"
+    out_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    return out_path
+
+
+def _write_fourier_model_csv(
+    out_dir: Path,
+    target_name: str,
+    channel: str,
+    fit_result: Dict,
+) -> Path:
+    df = pd.DataFrame(
+        {
+            "channel": channel,
+            "phase": np.asarray(fit_result["phi_dense"], dtype=float),
+            "model_mag": np.asarray(fit_result["mag_dense"], dtype=float),
+        }
+    )
+    out_path = out_dir / f"period_fourier_model_{_safe_stem(target_name)}_{channel}.csv"
+    df.to_csv(out_path, index=False, float_format="%.10f")
+    return out_path
 
 
 # =============================================================================
@@ -1198,6 +1293,14 @@ def run_period_analysis(
 
     # 輸出主圖
     out_dir.mkdir(parents=True, exist_ok=True)
+    ls_csv_path = _write_ls_spectrum_csv(out_dir, target_name, channel, ls_result)
+    dft_csv_path = _write_dft_spectrum_csv(out_dir, target_name, channel, ls_result)
+    fit_json_path = _write_fourier_fit_json(
+        out_dir, target_name, channel, fit_result, ls_result
+    )
+    model_csv_path = _write_fourier_model_csv(
+        out_dir, target_name, channel, fit_result
+    )
     out_png = out_dir / (
         f"period_analysis_{target_name.replace(' ', '')}_{channel}.png"
     )
@@ -1207,6 +1310,13 @@ def run_period_analysis(
     )
 
     results: Dict = {"ls_result": ls_result, "fit_result": fit_result}
+    results["output_files"] = {
+        "ls_spectrum_csv": str(ls_csv_path),
+        "dft_spectrum_csv": str(dft_csv_path),
+        "fourier_fit_json": str(fit_json_path),
+        "fourier_model_csv": str(model_csv_path),
+        "period_analysis_png": str(out_png),
+    }
 
     # 預白化
     if run_prewhitening and pw_enabled:
