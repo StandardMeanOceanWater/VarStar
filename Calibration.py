@@ -31,6 +31,7 @@ RAM 用量從全載的 O(N) 降至 O(chunk_size)。
 from __future__ import annotations
 
 import gc
+import math
 import os
 import re
 import shutil
@@ -38,7 +39,7 @@ import tempfile
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import yaml
@@ -59,6 +60,7 @@ warnings.simplefilter("ignore", category=AstropyWarning)
 
 # ── 型別別名 ─────────────────────────────────────────────────────────────────
 Header = fits.Header
+Array = np.ndarray
 
 
 # =============================================================================
@@ -80,6 +82,12 @@ def _detect_project_root(cfg: dict, config_path: Path) -> Path:
     p = Path(root)
     if not p.is_absolute():
         p = (config_path.parent / p).resolve()
+    if p.exists():
+        return p
+
+    fallback = config_path.parent.parent.resolve()
+    if (fallback / "data").exists():
+        return fallback
     return p
 
 
@@ -711,511 +719,628 @@ def determine_cal_mode(
 # 主校正管線
 # =============================================================================
 
+Array = np.ndarray
+
+
+def _session_date_to_dir(date_text: str) -> str:
+    return f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:8]}"
+
+
+def _first_target_name(session: dict) -> str:
+    raw_targets = session.get("targets", session.get("target", "UNKNOWN"))
+    if isinstance(raw_targets, list):
+        return str(raw_targets[0])
+    return str(raw_targets)
+
+
+def _target_group(cfg: dict, target: str) -> str:
+    return str(cfg.get("targets", {}).get(target, {}).get("group", target))
+
+
+def _legacy_output_dir(cfg: dict, session: dict, target: str) -> Path:
+    date_text = str(session["date"])
+    group = _target_group(cfg, target)
+    return cfg["_project_root"] / "output" / _session_date_to_dir(date_text) / group / "calibrate"
+
+
+def _frame_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".cr2":
+        return "cr2"
+    if suffix in (".fit", ".fits"):
+        return "fits"
+    raise ValueError(f"unsupported frame type: {path}")
+
+
+def _extract_fractional_exposure(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        pass
+    text = str(value).strip()
+    if "/" in text:
+        left, right = text.split("/", 1)
+        try:
+            numerator = float(left)
+            denominator = float(right)
+        except ValueError:
+            return None
+        if denominator == 0:
+            return None
+        return numerator / denominator
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _read_cr2_tags(path: Path) -> Dict[str, object]:
+    with path.open("rb") as handle:
+        return exifread.process_file(handle, details=False)
+
+
+def _metadata_override_for_fits(session_date: str, path: Path) -> Dict[str, object]:
+    if session_date == "20251122" and _frame_type(path) == "fits":
+        return {
+            "iso": 100,
+            "iso_source": "override:nina_known_bad_header",
+            "exposure_s": 30.0,
+            "exposure_source": "override:nina_known_bad_header",
+        }
+    return {}
+
+
+def read_frame_metadata(path: Path, session_date: str) -> Dict[str, object]:
+    path = Path(path)
+    frame_type = _frame_type(path)
+    meta: Dict[str, object] = {
+        "path": path,
+        "frame_type": frame_type,
+        "iso": None,
+        "iso_source": None,
+        "exposure_s": None,
+        "exposure_source": None,
+        "black_level": None,
+        "black_level_source": None,
+    }
+    if frame_type == "cr2":
+        tags = _read_cr2_tags(path)
+        iso_tag = tags.get("EXIF ISOSpeedRatings") or tags.get("Image ISOSpeedRatings")
+        exp_tag = tags.get("EXIF ExposureTime") or tags.get("Image ExposureTime")
+        if iso_tag is not None:
+            try:
+                meta["iso"] = int(str(iso_tag).strip())
+                meta["iso_source"] = "exif"
+            except ValueError:
+                pass
+        exposure_s = _extract_fractional_exposure(exp_tag)
+        if exposure_s is not None:
+            meta["exposure_s"] = exposure_s
+            meta["exposure_source"] = "exif"
+    else:
+        header = fits.getheader(path)
+        for key in ("ISO", "ISOSPEED", "ISOSPEEDR"):
+            value = header.get(key)
+            if value not in (None, ""):
+                try:
+                    meta["iso"] = int(float(value))
+                    meta["iso_source"] = f"header:{key}"
+                    break
+                except (TypeError, ValueError):
+                    pass
+        for key in ("EXPTIME", "EXPOSURE", "EXP_TIME"):
+            exposure_s = _extract_fractional_exposure(header.get(key))
+            if exposure_s is not None and exposure_s > 0:
+                meta["exposure_s"] = exposure_s
+                meta["exposure_source"] = f"header:{key}"
+                break
+        for key in ("BLACKLVL", "BLACKLEVEL"):
+            value = header.get(key)
+            if value not in (None, ""):
+                try:
+                    meta["black_level"] = float(value)
+                    meta["black_level_source"] = f"header:{key}"
+                    break
+                except (TypeError, ValueError):
+                    pass
+    meta.update({k: v for k, v in _metadata_override_for_fits(session_date, path).items() if v is not None})
+    return meta
+
+
+def _infer_calibration_iso(paths: Sequence[Path], session_date: str) -> Optional[int]:
+    values: List[int] = []
+    for path in paths:
+        meta = read_frame_metadata(path, session_date)
+        if meta.get("iso") is not None:
+            values.append(int(meta["iso"]))
+    if not values:
+        return None
+    counts: Dict[int, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _infer_common_exposure(paths: Sequence[Path], session_date: str) -> Optional[float]:
+    values: List[float] = []
+    for path in paths:
+        meta = read_frame_metadata(path, session_date)
+        exposure_s = meta.get("exposure_s")
+        if exposure_s is not None:
+            values.append(float(exposure_s))
+    if not values:
+        return None
+    return float(values[0])
+
+
+def _build_master_header(kind: str, session_date: str, frame_type: str, iso_value: Optional[int], exposure_s: Optional[float], extra: Optional[Dict[str, object]] = None) -> fits.Header:
+    header = fits.Header()
+    header["MASTERK"] = (kind, "master kind")
+    header["FRMTYPE"] = (frame_type, "source frame type")
+    header["SESSDATE"] = (session_date, "session date")
+    if iso_value is not None:
+        header["ISOSPEED"] = (int(iso_value), "source iso")
+    if exposure_s is not None:
+        header["EXPTIME"] = (float(exposure_s), "[s] source exposure")
+    if extra:
+        for key, value in extra.items():
+            if value is None:
+                continue
+            header[key] = value
+    return header
+
+
+def _master_root(cfg: dict) -> Path:
+    return cfg["_data_root"] / "share" / "master"
+
+
+def _ensure_master_root(cfg: dict) -> Path:
+    root = _master_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _format_temp_tag(temp_c: Optional[float]) -> str:
+    if temp_c is None:
+        return "unk"
+    return f"{temp_c:.1f}c".replace("+", "")
+
+
+def _master_bias_paths(master_root: Path, session_date: str, frame_type: str, iso_value: Optional[int]) -> List[Path]:
+    iso_tag = f"_iso{iso_value}" if iso_value is not None else ""
+    return [
+        master_root / f"master_bias_raw_{session_date}_{frame_type}{iso_tag}.fits",
+        master_root / f"master_bias_{session_date}_{frame_type}{iso_tag}.fits",
+        master_root / f"master_bias_{session_date}_{frame_type}.fits",
+        master_root / f"master_bias_{session_date}_cr2.fits",
+    ]
+
+
+def _master_dark_paths(master_root: Path, session_date: str, frame_type: str, iso_value: Optional[int], dark_temp_c: Optional[float]) -> List[Path]:
+    iso_tag = f"_iso{iso_value}" if iso_value is not None else ""
+    temp_tag = f"_{_format_temp_tag(dark_temp_c)}"
+    return [
+        master_root / f"master_dark_raw_{session_date}_{frame_type}{iso_tag}{temp_tag}.fits",
+        master_root / f"master_dark_{session_date}_{frame_type}{iso_tag}{temp_tag}.fits",
+        master_root / f"master_dark_{session_date}{temp_tag}_{frame_type}.fits",
+        master_root / f"master_dark_{session_date}{temp_tag}_cr2.fits",
+    ]
+
+
+def _dark_rate_paths(master_root: Path, session_date: str, frame_type: str, iso_value: Optional[int], dark_temp_c: Optional[float]) -> List[Path]:
+    iso_tag = f"_iso{iso_value}" if iso_value is not None else ""
+    temp_tag = f"_{_format_temp_tag(dark_temp_c)}"
+    return [
+        master_root / f"dark_rate_{session_date}_{frame_type}{iso_tag}{temp_tag}.fits",
+    ]
+
+
+def _master_flat_product_paths(master_root: Path, flat_date: str, frame_type: str, use_median_normalization: bool) -> List[Path]:
+    if use_median_normalization:
+        return [
+            master_root / f"master_flatnorm_{flat_date}_{frame_type}.fits",
+            master_root / f"master_flat_{flat_date}_{frame_type}.fits",
+        ]
+    return [
+        master_root / f"master_flatdirect_{flat_date}_{frame_type}.fits",
+    ]
+
+
+def _load_first_existing(paths: Sequence[Path]) -> Optional[Tuple[Array, fits.Header, Path]]:
+    for path in paths:
+        if path.exists():
+            with fits.open(path, ignore_missing_end=True) as hdul:
+                hdu = next((item for item in hdul if item.data is not None), None)
+                if hdu is None:
+                    continue
+                return hdu.data.astype(np.float32), hdu.header.copy(), path
+    return None
+
+
+def _write_master(path: Path, data: Array, header: fits.Header) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fits.writeto(path, data.astype(np.float32), header=header, overwrite=True)
+
+
+def _warn(message: str) -> None:
+    print(f"  [WARN] {message}")
+
+
+def _info(message: str) -> None:
+    print(f"  [INFO] {message}")
+
+
+def compute_dark_rate(master_dark_signal: Array, t_dark: Optional[float]) -> Optional[Array]:
+    if t_dark is None or t_dark <= 0:
+        return None
+    return (master_dark_signal.astype(np.float32) / float(t_dark)).astype(np.float32)
+
+
+def compute_flat_pure(master_flat_raw: Array, master_bias: Optional[Array], dark_rate: Optional[Array], t_flat: Optional[float]) -> Array:
+    flat_pure = master_flat_raw.astype(np.float64).copy()
+    if master_bias is not None:
+        flat_pure -= master_bias.astype(np.float64)
+    if dark_rate is not None and t_flat is not None and t_flat > 0:
+        flat_pure -= dark_rate.astype(np.float64) * float(t_flat)
+    return flat_pure.astype(np.float32)
+
+
+def normalize_flat_pure(flat_pure: Array, bad_pixel_floor: float, use_median_normalization: bool = True) -> Array:
+    if use_median_normalization:
+        median_value = float(np.nanmedian(flat_pure))
+        if not math.isfinite(median_value) or median_value == 0.0:
+            raise ValueError("flat median is zero or non-finite")
+        master_flatnorm = (flat_pure.astype(np.float64) / median_value).astype(np.float32)
+        master_flatnorm = np.where(np.isfinite(master_flatnorm), master_flatnorm, bad_pixel_floor)
+        master_flatnorm = np.clip(master_flatnorm, bad_pixel_floor, None)
+        return master_flatnorm.astype(np.float32)
+
+    fallback = float(np.nanmedian(flat_pure))
+    if not math.isfinite(fallback) or fallback <= 0.0:
+        fallback = 1.0
+    flat_direct = np.where(np.isfinite(flat_pure), flat_pure, fallback).astype(np.float32)
+    flat_direct = np.where(flat_direct > 0.0, flat_direct, fallback).astype(np.float32)
+    return flat_direct
+
+
+def compute_dark_scaled(dark_rate: Optional[Array], t_light: Optional[float]) -> Optional[Array]:
+    if dark_rate is None or t_light is None or t_light <= 0:
+        return None
+    return (dark_rate.astype(np.float32) * float(t_light)).astype(np.float32)
+
+
+def calibrate_image(light_linear: Array, master_bias: Optional[Array], dark_scaled: Optional[Array], master_flatnorm: Array) -> Array:
+    calibrated = light_linear.astype(np.float64).copy()
+    if master_bias is not None:
+        calibrated -= master_bias.astype(np.float64)
+    if dark_scaled is not None:
+        calibrated -= dark_scaled.astype(np.float64)
+    calibrated /= master_flatnorm.astype(np.float64)
+    return calibrated.astype(np.float32)
+
+
+def _select_matching_flat(light_type: str, flat_map: Dict[str, Array]) -> Array:
+    if light_type not in flat_map:
+        available = ", ".join(sorted(flat_map))
+        raise ValueError(f"flat type mismatch: light={light_type}, available={available}")
+    return flat_map[light_type]
+
+
+def _sensor_db_for_session(cfg: dict, session: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    camera_id = session.get("camera", "")
+    camera_cfg = cfg.get("cameras", {}).get(camera_id, {})
+    session_iso = session.get("iso")
+    gain_e = None
+    read_noise_e = None
+    if session_iso is not None:
+        sensor_entry = camera_cfg.get("sensor_db", {}).get(int(session_iso))
+        if isinstance(sensor_entry, (list, tuple)) and len(sensor_entry) >= 2:
+            gain_e = float(sensor_entry[0])
+            read_noise_e = float(sensor_entry[1])
+    saturation_adu = camera_cfg.get("saturation_adu")
+    if saturation_adu is not None:
+        saturation_adu = float(saturation_adu)
+    return gain_e, read_noise_e, saturation_adu
+
+
+def _light_iso_for_read(session: dict, light_path: Path) -> Optional[int]:
+    date_text = str(session["date"])
+    if date_text == "20251122" and _frame_type(light_path) == "fits":
+        return 100
+    session_iso = session.get("iso")
+    if session_iso is None:
+        return None
+    return int(session_iso)
+
+
+def _read_frame_data(path: Path, session: dict, tz_offset: int, gain_e: Optional[float], read_noise_e: Optional[float], saturation_adu: Optional[float]) -> Tuple[Array, fits.Header]:
+    return read_raw_image(
+        path,
+        tz_offset_hours=tz_offset,
+        gain_e_per_adu=gain_e,
+        read_noise_e=read_noise_e,
+        saturation_adu=saturation_adu,
+        iso=_light_iso_for_read(session, path),
+    )
+
+
+def _build_master_bias(cfg: dict, session: dict, paths_ref: dict, tz_offset: int) -> Tuple[Optional[Array], Optional[fits.Header], Optional[int]]:
+    bias_files = _list_image_files(paths_ref["bias_dir"])
+    if not bias_files:
+        return None, None, None
+    master_root = _ensure_master_root(cfg)
+    frame_type = _frame_type(bias_files[0])
+    iso_value = _infer_calibration_iso(bias_files, str(session["date"]))
+    existing = _load_first_existing(_master_bias_paths(master_root, str(session["date"]), frame_type, iso_value))
+    if existing is not None:
+        data, header, path = existing
+        _info(f"loaded master bias: {path.name}")
+        return data.astype(np.float32), header, int(header["ISOSPEED"]) if "ISOSPEED" in header else iso_value
+    master_bias = create_master(bias_files, "Master Bias Raw", tz_offset_hours=tz_offset).astype(np.float32)
+    header = _build_master_header("bias_raw", str(session["date"]), frame_type, iso_value, None)
+    out_path = _master_bias_paths(master_root, str(session["date"]), frame_type, iso_value)[0]
+    _write_master(out_path, master_bias, header)
+    _info(f"saved master bias: {out_path.name}")
+    return master_bias, header, iso_value
+
+
+def _build_master_dark_signal(cfg: dict, session: dict, paths_ref: dict, tz_offset: int, master_bias: Optional[Array]) -> Tuple[Optional[Array], Optional[fits.Header], Optional[float], Optional[int]]:
+    dark_files = _list_image_files(paths_ref["dark_dir"])
+    if not dark_files:
+        return None, None, None, None
+    master_root = _ensure_master_root(cfg)
+    frame_type = _frame_type(dark_files[0])
+    iso_value = _infer_calibration_iso(dark_files, str(session["date"]))
+    dark_temp_c = paths_ref.get("dark_temp_c")
+    existing = _load_first_existing(_master_dark_paths(master_root, str(session["date"]), frame_type, iso_value, dark_temp_c))
+    if existing is not None:
+        data, header, path = existing
+        _info(f"loaded master dark signal: {path.name}")
+        exposure_s = _extract_fractional_exposure(header.get("EXPTIME"))
+        return data.astype(np.float32), header, exposure_s, int(header["ISOSPEED"]) if "ISOSPEED" in header else iso_value
+    dark_raw = create_master(dark_files, "Master Dark Raw", tz_offset_hours=tz_offset).astype(np.float32)
+    t_dark = _infer_common_exposure(dark_files, str(session["date"]))
+    master_dark_signal = dark_raw.copy()
+    if master_bias is not None:
+        master_dark_signal -= master_bias.astype(np.float32)
+    header = _build_master_header(
+        "dark_signal",
+        str(session["date"]),
+        frame_type,
+        iso_value,
+        t_dark,
+        extra={"DARKTEMP": float(dark_temp_c) if dark_temp_c is not None else "UNKNOWN"},
+    )
+    out_path = _master_dark_paths(master_root, str(session["date"]), frame_type, iso_value, dark_temp_c)[0]
+    _write_master(out_path, master_dark_signal, header)
+    _info(f"saved master dark signal: {out_path.name}")
+    return master_dark_signal, header, t_dark, iso_value
+
+
+def _build_dark_rate(cfg: dict, session: dict, dark_signal: Optional[Array], dark_header: Optional[fits.Header], t_dark: Optional[float], dark_iso: Optional[int], dark_temp_c: Optional[float]) -> Optional[Array]:
+    if dark_signal is None:
+        return None
+    master_root = _ensure_master_root(cfg)
+    frame_type = "cr2"
+    if dark_header is not None and "FRMTYPE" in dark_header:
+        frame_type = str(dark_header["FRMTYPE"]).strip().lower()
+    existing = _load_first_existing(_dark_rate_paths(master_root, str(session["date"]), frame_type, dark_iso, dark_temp_c))
+    if existing is not None:
+        data, _, path = existing
+        _info(f"loaded dark rate: {path.name}")
+        return data.astype(np.float32)
+    dark_rate = compute_dark_rate(dark_signal, t_dark)
+    if dark_rate is None:
+        return None
+    header = _build_master_header("dark_rate", str(session["date"]), frame_type, dark_iso, t_dark, extra={"DARKTEMP": float(dark_temp_c) if dark_temp_c is not None else "UNKNOWN"})
+    out_path = _dark_rate_paths(master_root, str(session["date"]), frame_type, dark_iso, dark_temp_c)[0]
+    _write_master(out_path, dark_rate, header)
+    _info(f"saved dark rate: {out_path.name}")
+    return dark_rate
+
+
+def _build_flatnorm_map(cfg: dict, session: dict, paths_ref: dict, tz_offset: int, master_bias: Optional[Array], dark_rate: Optional[Array], bad_pixel_floor: float, use_median_normalization: bool) -> Dict[str, Array]:
+    flat_map: Dict[str, Array] = {}
+    flat_dirs_by_format = dict(paths_ref.get("flat_dirs_by_format", {}))
+    master_root = _ensure_master_root(cfg)
+    for frame_type, flat_dir in sorted(flat_dirs_by_format.items()):
+        existing = _load_first_existing(_master_flat_product_paths(master_root, str(paths_ref["flat_date"]), frame_type, use_median_normalization))
+        if existing is not None:
+            data, _, path = existing
+            _info(f"loaded master flatnorm: {path.name}")
+            flat_map[frame_type] = data.astype(np.float32)
+            continue
+        flat_files = _list_image_files(flat_dir)
+        if not flat_files:
+            continue
+        master_flat_raw = create_master(flat_files, f"Master Flat Raw ({frame_type.upper()})", tz_offset_hours=tz_offset).astype(np.float32)
+        t_flat = _infer_common_exposure(flat_files, str(session["date"]))
+        flat_pure = compute_flat_pure(master_flat_raw, master_bias, dark_rate, t_flat)
+        master_flatnorm = normalize_flat_pure(flat_pure, bad_pixel_floor, use_median_normalization=use_median_normalization)
+        header = _build_master_header(
+            "flatnorm" if use_median_normalization else "flatdirect",
+            str(paths_ref["flat_date"]),
+            frame_type,
+            None,
+            t_flat,
+        )
+        out_path = _master_flat_product_paths(master_root, str(paths_ref["flat_date"]), frame_type, use_median_normalization)[0]
+        _write_master(out_path, master_flatnorm, header)
+        _info(f"saved master flatnorm: {out_path.name}")
+        flat_map[frame_type] = master_flatnorm.astype(np.float32)
+    return flat_map
+
+
+def _check_iso_warning(light_meta: Dict[str, object], bias_iso: Optional[int], dark_iso: Optional[int]) -> List[str]:
+    warnings: List[str] = []
+    light_iso = light_meta.get("iso")
+    if light_iso is None:
+        warnings.append("light iso unknown")
+        return warnings
+    if bias_iso is not None and int(light_iso) != int(bias_iso):
+        warnings.append(f"bias iso mismatch: light={light_iso}, bias={bias_iso}")
+    if dark_iso is not None and int(light_iso) != int(dark_iso):
+        warnings.append(f"dark iso mismatch: light={light_iso}, dark={dark_iso}")
+    return warnings
+
+
+def _apply_light_overrides(header: fits.Header, light_meta: Dict[str, object]) -> None:
+    if light_meta.get("iso") is not None:
+        header["ISOSPEED"] = (int(light_meta["iso"]), "light iso")
+    exposure_s = light_meta.get("exposure_s")
+    if exposure_s is not None:
+        header["EXPTIME"] = (float(exposure_s), "[s] light exposure")
+
+
+def _prepare_reference_paths(cfg: dict, session: dict) -> dict:
+    ref_session = dict(session)
+    ref_session["target"] = _first_target_name(session)
+    return resolve_session_paths(cfg, ref_session)
+
+
+def _validate_shapes(light_shape: Tuple[int, int], master_bias: Optional[Array], dark_rate: Optional[Array], master_flatnorm: Array) -> None:
+    if master_bias is not None and master_bias.shape != light_shape:
+        raise ValueError(f"bias shape mismatch: light={light_shape}, bias={master_bias.shape}")
+    if dark_rate is not None and dark_rate.shape != light_shape:
+        raise ValueError(f"dark shape mismatch: light={light_shape}, dark_rate={dark_rate.shape}")
+    if master_flatnorm.shape != light_shape:
+        raise ValueError(f"flat shape mismatch: light={light_shape}, flat={master_flatnorm.shape}")
+
+
+def _calibrate_target(
+    cfg: dict,
+    session: dict,
+    target: str,
+    no_flat: bool,
+    master_bias: Optional[Array],
+    bias_iso: Optional[int],
+    dark_rate: Optional[Array],
+    dark_iso: Optional[int],
+    flat_map: Dict[str, Array],
+    output_subdir: str,
+    use_bias: bool,
+    use_dark: bool,
+    use_median_normalization: bool,
+) -> None:
+    paths = resolve_session_paths(cfg, {**session, "target": target})
+    output_dir = _legacy_output_dir(cfg, session, target).parent / output_subdir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    light_files = _list_image_files(paths["light_dir"])
+    if not light_files:
+        _warn(f"no light frames: {paths['light_dir']}")
+        return
+    tz_offset = int(cfg.get("calibration", {}).get("tz_offset_hours", 8))
+    gain_e, read_noise_e, saturation_adu = _sensor_db_for_session(cfg, session)
+    success = 0
+    failed = 0
+    print(f"\n[Target] {target}")
+    print(f"  [INFO] output dir: {output_dir}")
+    for index, light_path in enumerate(tqdm(light_files, desc=f"{target} calibrate")):
+        try:
+            light_data, header = _read_frame_data(light_path, session, tz_offset, gain_e, read_noise_e, saturation_adu)
+            light_meta = read_frame_metadata(light_path, str(session["date"]))
+            _apply_light_overrides(header, light_meta)
+            light_type = _frame_type(light_path)
+            if no_flat:
+                raise ValueError("no_flat mode is not supported by calibration_rewrite")
+            master_flatnorm = _select_matching_flat(light_type, flat_map)
+            _validate_shapes(light_data.shape, master_bias, dark_rate, master_flatnorm)
+            effective_bias = master_bias if use_bias else None
+            effective_dark_rate = dark_rate if use_dark else None
+            dark_scaled = compute_dark_scaled(effective_dark_rate, light_meta.get("exposure_s"))
+            calibrated = calibrate_image(light_data, effective_bias, dark_scaled, master_flatnorm)
+            warnings = _check_iso_warning(light_meta, bias_iso if use_bias else None, dark_iso if use_dark else None)
+            header["BITPIX"] = -32
+            header["CALVER"] = ("rewrite_v1", "calibration rewrite version")
+            header["CALFMT"] = (light_type, "light frame type")
+            header["BLPOLICY"] = ("fits_zero" if light_type == "fits" else "cr2_reader", "black level policy")
+            header["USEBIAS"] = (1 if use_bias else 0, "bias subtraction enabled")
+            header["USEDARK"] = (1 if use_dark else 0, "dark subtraction enabled")
+            header["FLATNORM"] = ("median" if use_median_normalization else "off", "flat median normalization mode")
+            if light_type == "fits":
+                header["BLASSUME"] = (0.0, "assumed fits black level")
+            if dark_scaled is not None:
+                header["DARKSCAL"] = (float(light_meta["exposure_s"]), "[s] scaled dark exposure")
+            if warnings:
+                for warning in warnings:
+                    _warn(f"{light_path.name}: {warning}")
+                    header["HISTORY"] = f"WARNING: {warning}"
+            out_name = f"Cal_{light_path.stem}_{index + 1:04d}.fits"
+            out_path = output_dir / out_name
+            fits.writeto(out_path, calibrated.astype(np.float32), header=header, overwrite=True)
+            success += 1
+        except Exception as exc:
+            failed += 1
+            _warn(f"{light_path.name}: {exc}")
+    print(f"  [INFO] calibrated: success={success}, failed={failed}")
+
+
 def run_calibration(config_path: str | Path, *, no_flat: bool = False) -> None:
-    """
-    主校正管線入口。
-
-    讀取 observation_config.yaml，對每個 obs_session 執行：
-        1. 路徑解析
-        2. Master Bias / Dark / Flat 合成
-        3. 逐幀校正
-        4. 輸出 float32 Bayer FITS
-
-    Parameters
-    ----------
-    config_path : observation_config.yaml 的路徑。
-    """
     cfg = load_config(config_path)
-
-    cal_cfg = cfg.get("calibration", {})
-    chunk_size = int(cal_cfg.get("median_chunk_size", 10))
-    bad_pixel_thr = float(cal_cfg.get("flat_bad_pixel_threshold", 0.3))
-
     sessions = cfg.get("obs_sessions", [])
     if not sessions:
-        raise ValueError("observation_config.yaml 裡沒有 obs_sessions。")
-
-    _mode_tag = " [NO-FLAT: Bias+Dark only]" if no_flat else ""
-    print("\n" + "=" * 60)
-    print(f"  變星測光管線 — 影像校正模組  Calibration.py{_mode_tag}")
+        raise ValueError("no obs_sessions in config")
+    cal_cfg = cfg.get("calibration", {})
+    bad_pixel_floor = float(cal_cfg.get("flat_bad_pixel_threshold", 0.3))
+    tz_offset = int(cal_cfg.get("tz_offset_hours", 8))
+    use_bias = bool(cal_cfg.get("use_bias", True))
+    use_dark = bool(cal_cfg.get("use_dark", True))
+    use_median_normalization = bool(cal_cfg.get("flat_normalize_median", True))
+    output_subdir = str(cal_cfg.get("output_subdir", "calibrate"))
     print("=" * 60)
-
+    print("Calibration rewrite start")
+    print("=" * 60)
     for session in sessions:
-        # targets / target 雙格式相容
+        session_date = str(session["date"])
+        print(f"\n[Session] {session_date}")
+        paths_ref = _prepare_reference_paths(cfg, session)
+        master_bias = None
+        bias_iso = None
+        if use_bias:
+            master_bias, _, bias_iso = _build_master_bias(cfg, session, paths_ref, tz_offset)
+        dark_signal = None
+        dark_header = None
+        t_dark = None
+        dark_iso = None
+        if use_dark:
+            dark_signal, dark_header, t_dark, dark_iso = _build_master_dark_signal(cfg, session, paths_ref, tz_offset, master_bias)
+        dark_rate = _build_dark_rate(cfg, session, dark_signal, dark_header, t_dark, dark_iso, paths_ref.get("dark_temp_c")) if use_dark else None
+        flat_map = _build_flatnorm_map(
+            cfg,
+            session,
+            paths_ref,
+            tz_offset,
+            master_bias if use_bias else None,
+            dark_rate if use_dark else None,
+            bad_pixel_floor,
+            use_median_normalization,
+        )
+        if not no_flat and not flat_map:
+            raise ValueError(f"no matching flats available for session {session_date}")
         raw_targets = session.get("targets", session.get("target", "UNKNOWN"))
-        targets_list: List[str] = (
-            [str(raw_targets)]
-            if isinstance(raw_targets, str)
-            else [str(t) for t in raw_targets]
-        )
-        date = str(session["date"])
-        telescope_id = session.get("telescope", "")
-        camera_id = session.get("camera", "")
-        iso = int(session.get("iso", 0))
-
-        # ── 取得儀器參數（session 共用，在 target 迴圈外取一次）────────────
-        cam_cfg = cfg.get("cameras", {}).get(camera_id, {})
-        tz_offset = int(
-            cfg.get("calibration", {}).get("tz_offset_hours", 8)
-        )
-
-        # ── Master 幀：同一 session 所有 target 共用，只合成一次 ────────────
-        # 路徑解析用 targets_list[0] 代表該 session（calibration 幀共用）
-        _ref_session = dict(session)
-        _ref_session["target"] = targets_list[0]
-        paths_ref = resolve_session_paths(cfg, _ref_session)
-
-        # ── ISO fallback：yaml → 第一張 light 檔 EXIF/標頭 → 0（[WARN]）──
-        # yaml 填 iso > 0：直接使用，最優先
-        # yaml 未填或填 0：從第一張 light 檔讀取
-        #   CR2  → exifread EXIF ISOSpeedRatings
-        #   FITS → astropy FITS 標頭 ISOSPEED
-        # 兩者都失敗：iso = 0，發出 [WARN]
-        if iso == 0:
-            _light_dir = paths_ref["light_dir"]
-            _first_light: Optional[Path] = None
-            if _light_dir.exists():
-                for _ext in ("*.CR2", "*.cr2", "*.fits", "*.FITS", "*.fit", "*.FIT"):
-                    _found = next(_light_dir.glob(_ext), None)
-                    if _found:
-                        _first_light = _found
-                        break
-
-            if _first_light is None:
-                print(
-                    f"  [WARN] yaml 未填 iso，且找不到 light 幀"
-                    f"（搜尋路徑：{_light_dir}），"
-                    "GAIN/RDNOISE 標頭將空白。"
-                )
-            elif _first_light.suffix.lower() == ".cr2":
-                try:
-                    with open(_first_light, "rb") as _fh:
-                        _tags = exifread.process_file(_fh, details=False)
-                    _iso_tag = _tags.get("EXIF ISOSpeedRatings")
-                    if _iso_tag:
-                        iso = int(str(_iso_tag))
-                        print(
-                            f"  [INFO] yaml 未填 iso，"
-                            f"從 CR2 EXIF 讀取：ISO {iso}"
-                        )
-                    else:
-                        print(
-                            "  [WARN] yaml 未填 iso，"
-                            "CR2 EXIF 無 ISOSpeedRatings，"
-                            "GAIN/RDNOISE 標頭將空白。"
-                        )
-                except Exception as _exc:
-                    print(
-                        f"  [WARN] yaml 未填 iso，"
-                        f"CR2 EXIF 讀取失敗（{_exc}），"
-                        "GAIN/RDNOISE 標頭將空白。"
-                    )
-            else:
-                # FITS：讀 ISOSPEED 標頭
-                try:
-                    _hdr = fits.getheader(_first_light)
-                    _iso_val = _hdr.get("ISOSPEED", 0)
-                    if _iso_val and int(_iso_val) > 0:
-                        iso = int(_iso_val)
-                        print(
-                            f"  [INFO] yaml 未填 iso，"
-                            f"從 FITS 標頭 ISOSPEED 讀取：ISO {iso}"
-                        )
-                    else:
-                        print(
-                            "  [WARN] yaml 未填 iso，"
-                            "FITS 標頭無 ISOSPEED，"
-                            "GAIN/RDNOISE 標頭將空白。"
-                        )
-                except Exception as _exc:
-                    print(
-                        f"  [WARN] yaml 未填 iso，"
-                        f"FITS 標頭讀取失敗（{_exc}），"
-                        "GAIN/RDNOISE 標頭將空白。"
-                    )
-
-        # ── sensor_db 查詢（iso 確定後）──────────────────────────────────────
-        sensor_db = cam_cfg.get("sensor_db", {})
-        iso_entry = sensor_db.get(iso, {})
-        # sensor_db 值為 [gain, read_noise] 列表或 dict 兩種格式均相容
-        if isinstance(iso_entry, (list, tuple)):
-            gain_e: Optional[float] = float(iso_entry[0]) if len(iso_entry) > 0 else None
-            rn_e: Optional[float] = float(iso_entry[1]) if len(iso_entry) > 1 else None
-        else:
-            gain_e = iso_entry.get("gain")
-            rn_e = iso_entry.get("read_noise")
-        sat_adu = cam_cfg.get("saturation_adu")
-
-        if gain_e is None:
-            print(f"  [WARN] sensor_db 缺少 ISO {iso} 的 gain，FITS GAIN 標頭將空白。")
-        if rn_e is None:
-            print(f"  [WARN] sensor_db 缺少 ISO {iso} 的 read_noise，FITS RDNOISE 標頭將空白。")
-
-        dark_temp_c: Optional[float] = paths_ref.get("dark_temp_c")
-        light_temp_c_val: Optional[float] = paths_ref.get("light_temp_c")
-
-        dark_tmp_str = (
-            f"{dark_temp_c:.1f} °C" if dark_temp_c is not None else "未知"
-        )
-        light_tmp_str = (
-            f"{light_temp_c_val:.1f} °C"
-            if light_temp_c_val is not None
-            else "未知"
-        )
-        print(
-            f"\n[Session] 日期：{date}  "
-            f"儀器：{telescope_id} + {camera_id}  ISO：{iso}"
-        )
-        print(f"  暗場溫度：{dark_tmp_str}  / 觀測溫度：{light_tmp_str}")
-
-        if dark_temp_c is not None and light_temp_c_val is not None:
-            temp_diff = abs(light_temp_c_val - dark_temp_c)
-            if temp_diff > 10.0:
-                print(
-                    f"  [WARN] 暗場與觀測溫差 {temp_diff:.1f} °C > 10 °C，"
-                    f"暗電流縮放殘差可能顯著。建議補拍接近觀測溫度的暗場。"
-                )
-
-        dark_files = _list_image_files(paths_ref["dark_dir"])
-        bias_files = _list_image_files(paths_ref["bias_dir"])
-
-        # ── Flat：依格式分別建 Master ──────────────────────────────────────
-        flat_dirs_by_fmt = paths_ref.get("flat_dirs_by_format", {})
-        # 舊的 flat_dir 做 fallback（向後相容）
-        if not flat_dirs_by_fmt and paths_ref.get("flat_dir"):
-            flat_files_old = _list_image_files(paths_ref["flat_dir"])
-            if flat_files_old:
-                # 偵測格式
-                _ext0 = flat_files_old[0].suffix.lower()
-                _key = "cr2" if _ext0 == ".cr2" else "fits"
-                flat_dirs_by_fmt = {_key: paths_ref["flat_dir"]}
-
-        # 為每種格式收集 flat 檔案
-        flat_files_by_fmt: Dict[str, List[Path]] = {}
-        for fmt, fdir in flat_dirs_by_fmt.items():
-            flist = _list_image_files(fdir)
-            if flist:
-                flat_files_by_fmt[fmt] = flist
-                print(f"  Flat ({fmt.upper()}) : {len(flist)} 幀  →  {fdir}")
-
-        has_any_flat = len(flat_files_by_fmt) > 0
-
-        cal_mode = determine_cal_mode(
-            has_dark=len(dark_files) > 0,
-            has_bias=len(bias_files) > 0,
-            has_flat=has_any_flat,
-        )
-        print(f"  校正模式（CAL_MODE）：{cal_mode}")
-
-        # 合成 Master 幀（有快取就直接載入，否則從 raw 重建）
-        save_masters = cfg.get("calibration", {}).get("save_masters", True)
-        _masters_dir = paths_ref["masters_dir"]
-        _calib_date  = paths_ref.get("calib_date", date)
-        _flat_date   = paths_ref.get("flat_date", date)
-
-        def _glob_master(pattern: str) -> Optional[np.ndarray]:
-            """在 masters_dir 以 glob 搜尋，找到則載入最新的一個，否則回傳 None。"""
-            if not _masters_dir.exists():
-                return None
-            matches = sorted(_masters_dir.glob(pattern))
-            if not matches:
-                return None
-            chosen = matches[-1]
-            print(f"  [載入] {chosen.name}")
-            return fits.getdata(str(chosen)).astype(np.float32)
-
-        master_bias: Optional[np.ndarray] = None
-        _bias_cached = _glob_master("master_bias_*_cr2.fits")
-        if _bias_cached is not None:
-            master_bias = _bias_cached
-        elif bias_files:
-            master_bias = create_master(
-                bias_files, "Master Bias", chunk_size, tz_offset
+        targets = [str(raw_targets)] if isinstance(raw_targets, str) else [str(item) for item in raw_targets]
+        for target in targets:
+            _calibrate_target(
+                cfg,
+                session,
+                target,
+                no_flat,
+                master_bias,
+                bias_iso,
+                dark_rate,
+                dark_iso,
+                flat_map,
+                output_subdir,
+                use_bias,
+                use_dark,
+                use_median_normalization,
             )
-            if save_masters:
-                _masters_dir.mkdir(parents=True, exist_ok=True)
-                bias_out = _masters_dir / f"master_bias_{_calib_date}_cr2.fits"
-                fits.writeto(bias_out, master_bias, overwrite=True)
-                print(f"  [儲存] Master Bias → {bias_out}")
-
-        master_dark: Optional[np.ndarray] = None
-        t_dark: Optional[float] = None          # 暗場曝光時間（秒），用於 dark_rate 縮放
-        _dark_temp_c = paths_ref.get("dark_temp_c")
-        _dark_temp_tag = f"{_dark_temp_c:.1f}c" if _dark_temp_c is not None else None
-
-        # 從 master 目錄載入（需同時讀 EXPTIME header 以計算 dark_rate）
-        _dark_master_pattern = (
-            f"master_dark_*_{_dark_temp_tag}_cr2.fits"
-            if _dark_temp_tag else "master_dark_*_cr2.fits"
-        )
-        _dark_candidates = sorted(_masters_dir.glob(_dark_master_pattern)) \
-                           if _masters_dir.exists() else []
-        if _dark_candidates:
-            _dark_path = _dark_candidates[-1]
-            print(f"  [載入] {_dark_path.name}")
-            master_dark = fits.getdata(str(_dark_path)).astype(np.float32)
-            try:
-                t_dark = float(fits.getheader(str(_dark_path)).get("EXPTIME") or 0) or None
-            except Exception:
-                t_dark = None
-        elif dark_files:
-            # 從 raw 重建
-            t_dark_raw = None
-            try:
-                _dk0, _dk0_hdr = read_raw_image(dark_files[0], tz_offset_hours=tz_offset)
-                t_dark_raw = float(_dk0_hdr.get("EXPTIME") or 0) or None
-            except Exception:
-                pass
-            t_dark = t_dark_raw
-            dark_raw = create_master(dark_files, "Master Dark", chunk_size, tz_offset)
-            master_dark = (
-                dark_raw - master_bias if master_bias is not None else dark_raw
-            )
-            if save_masters:
-                _masters_dir.mkdir(parents=True, exist_ok=True)
-                _temp_tag = f"_{_dark_temp_tag}" if _dark_temp_tag else ""
-                dark_out = _masters_dir / f"master_dark_{_calib_date}{_temp_tag}_cr2.fits"
-                _dk_hdr = fits.Header()
-                if t_dark is not None:
-                    _dk_hdr["EXPTIME"] = (t_dark, "[s] Dark frame exposure time")
-                fits.writeto(dark_out, master_dark, header=_dk_hdr, overwrite=True)
-                print(f"  [儲存] Master Dark → {dark_out}  (t_dark={t_dark}s)")
-
-        # dark_rate：bias 已扣除的暗場 ÷ 曝光時間 = 每秒暗電流（DN/s）
-        dark_rate: Optional[np.ndarray] = None
-        if master_dark is not None and t_dark and t_dark > 0:
-            dark_rate = master_dark.astype(np.float32) / t_dark
-            print(f"  dark_rate 計算完成（t_dark={t_dark}s）")
-        elif master_dark is not None:
-            print("  [WARN] t_dark 未知，dark 不縮放（假設 t_dark = t_light）")
-
-        # 為每種格式載入 Master Flat
-        # 主路徑：直接從 master 目錄 glob master_flat_*_{fmt}.fits，選最近日期
-        # fallback：master 不存在時從 raw 重建
-        master_flat_by_fmt: Dict[str, np.ndarray] = {}
-        _session_date_int = int(date)
-
-        if no_flat:
-            print("  [NO-FLAT] 跳過 Flat 載入，僅做 Bias+Dark 校正")
-            master_flat_by_fmt = {}
-
-        def _parse_master_flat_date(p: Path) -> int:
-            """從 master_flat_{date}_{fmt}.fits 解析日期整數，解析失敗回傳 0。"""
-            try:
-                return int(p.stem.split("_")[2])
-            except (IndexError, ValueError):
-                return 0
-
-        for fmt in ([] if no_flat else ["cr2", "fits"]):
-            # 從 master 目錄選最近日期的 master flat
-            candidates = sorted(_masters_dir.glob(f"master_flat_*_{fmt}.fits")) \
-                         if _masters_dir.exists() else []
-            if candidates:
-                chosen = min(candidates,
-                             key=lambda p: abs(_parse_master_flat_date(p) - _session_date_int))
-                print(f"  [載入 Flat/{fmt.upper()}] {chosen.name}")
-                master_flat_by_fmt[fmt] = fits.getdata(str(chosen)).astype(np.float32)
-            elif fmt in flat_files_by_fmt:
-                # master 不存在 → 從 raw 重建並儲存
-                # 讀 t_flat（公式 4 需要）
-                _t_flat: Optional[float] = None
-                try:
-                    _, _fhdr = read_raw_image(
-                        flat_files_by_fmt[fmt][0], tz_offset_hours=tz_offset
-                    )
-                    _t_flat = float(_fhdr.get("EXPTIME") or 0) or None
-                except Exception:
-                    pass
-                flat_raw = create_master(
-                    flat_files_by_fmt[fmt],
-                    f"Master Flat ({fmt.upper()})", chunk_size, tz_offset
-                )
-                mf = normalize_flat(flat_raw, master_bias, bad_pixel_thr,
-                                    dark_rate=dark_rate, t_flat=_t_flat)
-                master_flat_by_fmt[fmt] = mf
-                del flat_raw
-                gc.collect()
-                if save_masters:
-                    _masters_dir.mkdir(parents=True, exist_ok=True)
-                    _raw_flat_date = flat_dirs_by_fmt.get(fmt, Path(_flat_date)).name
-                    flat_out = _masters_dir / f"master_flat_{_raw_flat_date}_{fmt}.fits"
-                    fits.writeto(flat_out, mf, overwrite=True)
-                    print(f"  [儲存] Master Flat ({fmt.upper()}) → {flat_out}")
-
-        # ── 逐 target 校正 ───────────────────────────────────────────────────
-        for target in targets_list:
-            print(f"\n[Target] {target}")
-            _t_session = dict(session)
-            _t_session["target"] = target
-            paths = resolve_session_paths(cfg, _t_session)
-
-            light_files = _list_image_files(paths["light_dir"])
-            if not light_files:
-                print(f"  [SKIP] 找不到 Light 幀：{paths['light_dir']}")
-                continue
-
-            # 統計 light 的格式分佈
-            _light_cr2 = [f for f in light_files if f.suffix.lower() == ".cr2"]
-            _light_fits = [f for f in light_files
-                           if f.suffix.lower() in (".fits", ".fit")]
-            print(f"  Light  : {len(light_files)} 幀  →  {paths['light_dir']}")
-            if _light_cr2 and _light_fits:
-                print(f"           [WARN] 混合格式："
-                      f"{len(_light_fits)} FITS + {len(_light_cr2)} CR2")
-            print(f"  Dark   : {len(dark_files)} 幀  →  {paths_ref['dark_dir']}")
-            print(f"  Bias   : {len(bias_files)} 幀  →  {paths_ref['bias_dir']}")
-
-            if no_flat:
-                _cal_dir = paths["calibrated_dir"].parent / "wcs_darkonly"
-            else:
-                _cal_dir = paths["calibrated_dir"]
-            _cal_dir.mkdir(parents=True, exist_ok=True)
-            out_dir = _cal_dir
-
-            print(f"\n[校正] 開始逐幀校正 {len(light_files)} 張 Light 幀…")
-            success = 0
-            failed = 0
-
-            for idx, light_path in enumerate(
-                tqdm(light_files, desc=f"{target} 校正進度")
-            ):
-                try:
-                    light, header = read_raw_image(
-                        light_path,
-                        tz_offset_hours=tz_offset,
-                        gain_e_per_adu=gain_e,
-                        read_noise_e=rn_e,
-                        saturation_adu=sat_adu,
-                        iso=iso if iso > 0 else None,
-                    )
-
-                    # ── 選擇格式匹配的 Master Flat ─────────────────────────
-                    _l_ext = light_path.suffix.lower()
-                    _l_fmt = "cr2" if _l_ext == ".cr2" else "fits"
-                    master_flat_norm: Optional[np.ndarray] = None
-                    _flat_match = "none"
-
-                    if _l_fmt in master_flat_by_fmt:
-                        # 格式完全匹配
-                        master_flat_norm = master_flat_by_fmt[_l_fmt]
-                        _flat_match = "match"
-                    elif master_flat_by_fmt:
-                        # 格式不匹配，用可用的（並警告）
-                        _alt_fmt = next(iter(master_flat_by_fmt))
-                        master_flat_norm = master_flat_by_fmt[_alt_fmt]
-                        _flat_match = "mismatch"
-                        if idx == 0:
-                            print(
-                                f"\n  [WARN] [格式不匹配] Light 為 "
-                                f"{_l_fmt.upper()}，"
-                                f"但 Flat 為 {_alt_fmt.upper()}。\n"
-                                f"     暗角校正可能不準確（不同讀出路徑的"
-                                f"漸暈模式不同）。\n"
-                                f"     建議：補拍與 Light 相同格式的 Flat。"
-                            )
-
-                    # ── 天文校正公式（公式 7）────────────────────────────────
-                    # Calibrated = (Light_linear − Bias − dark_rate × t_light)
-                    #              / master_Flat_norm
-                    # Light_linear = Light − BL（已由 rawpy 完成）
-                    cal = light.copy()
-
-                    _t_light = float(header.get("EXPTIME") or 0)
-                    if dark_rate is not None and _t_light > 0:
-                        # 公式 3：Dark_scaled = dark_rate × t_light
-                        cal -= master_bias.astype(np.float32) \
-                               if master_bias is not None else 0
-                        cal -= dark_rate * _t_light
-                    elif master_dark is not None:
-                        # t_dark 未知：直接扣整幀暗場（假設 t_dark = t_light）
-                        cal -= master_dark
-                    elif master_bias is not None:
-                        cal -= master_bias
-
-                    if master_flat_norm is not None:
-                        cal /= master_flat_norm
-
-                    cal = cal.astype(np.float32)
-
-                    # ── 更新標頭 ────────────────────────────────────────────
-                    header["BITPIX"] = -32
-                    header["CAL_MODE"] = (cal_mode, "Calibration frames used")
-
-                    header["DARKTMP"] = (
-                        float(dark_temp_c)
-                        if dark_temp_c is not None
-                        else "UNKNOWN",
-                        "[degC] Dark frame sensor temperature",
-                    )
-                    header["LIGHTTMP"] = (
-                        float(light_temp_c_val)
-                        if light_temp_c_val is not None
-                        else "UNKNOWN",
-                        "[degC] Light frame sensor temperature",
-                    )
-                    if dark_temp_c is not None and light_temp_c_val is not None:
-                        header["DTMPDIFF"] = (
-                            round(light_temp_c_val - dark_temp_c, 2),
-                            "[degC] Light minus Dark temperature",
-                        )
-                    else:
-                        header["DTMPDIFF"] = (
-                            "N/A", "[degC] Light minus Dark temperature"
-                        )
-
-                    header["TELESCOP"] = (
-                        cfg.get("telescopes", {})
-                        .get(telescope_id, {})
-                        .get("name", telescope_id),
-                        "Telescope",
-                    )
-                    header["FOCALLEN"] = (
-                        cfg.get("telescopes", {})
-                        .get(telescope_id, {})
-                        .get("focal_length_mm", ""),
-                        "[mm] Focal length",
-                    )
-                    header["FLATFMT"] = (
-                        _flat_match,
-                        "Flat format: match/mismatch/none",
-                    )
-                    header["HISTORY"] = (
-                        "Calibrated by Calibration.py (variable star pipeline)"
-                    )
-                    header["HISTORY"] = f"CAL_MODE={cal_mode}  ISO={iso}"
-                    if _flat_match == "mismatch":
-                        header["HISTORY"] = (
-                            f"WARNING: Flat format mismatch "
-                            f"(Light={_l_fmt}, Flat={_alt_fmt})"
-                        )
-
-                    out_name = f"Cal_{light_path.stem}_{idx + 1:04d}.fits"
-                    out_path = out_dir / out_name
-
-                    hdu = fits.PrimaryHDU(data=cal, header=header)
-                    hdu.verify("silentfix")
-                    hdu.writeto(out_path, overwrite=True)
-                    success += 1
-
-                except Exception as exc:
-                    print(f"\n  [失敗] {light_path.name}：{exc}")
-                    failed += 1
-
-            print(f"\n[完成] {target} / {date}：成功 {success} 幀，失敗 {failed} 幀")
-            print(f"       輸出目錄：{out_dir}")
-
-        # 釋放 Master 幀記憶體供下一個 session 使用
-        del master_bias, master_dark, master_flat_by_fmt
-        gc.collect()
-
-    print("\n" + "=" * 60)
-    print("所有 Session 校正完成。輸出為保留 Bayer 排列的 float32 線性 FITS。")
-    print("下一步：plate_solve.py → DeBayer_RGGB.py → Photometry.ipynb")
+    print("=" * 60)
+    print("Calibration rewrite finished")
     print("=" * 60)
 
-
-# =============================================================================
-# 入口
 # =============================================================================
 
 if __name__ == "__main__":
