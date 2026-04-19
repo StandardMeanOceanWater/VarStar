@@ -30,6 +30,7 @@ import shutil
 import sys
 import os
 import logging
+import time
 
 import warnings
 warnings.filterwarnings("ignore", message=".*datfix.*")
@@ -51,14 +52,28 @@ from astropy.wcs import WCS
 from astropy.stats import sigma_clipped_stats
 from astropy.time import Time
 ATime = Time   # 別名，供函式內部使用（避免 local import 遮蔽）
-import matplotlib.pyplot as plt
 import matplotlib
+if not os.environ.get("MPLBACKEND"):
+    # Keep CLI runs on a non-interactive backend so batch jobs return to shell cleanly.
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 from photutils.detection import DAOStarFinder, IRAFStarFinder
 
 # ── Module-level logger（__main__ 會加 handler；函數直接用此 logger）──────────
 _phot_logger = logging.getLogger("photometry")
+
+
+def _emit_progress(logger, message):
+    _msg = f"[progress] {message}"
+    print(_msg)
+    if logger is not None:
+        logger.info(_msg)
+
+
+def _emit_progress_done(logger, stage_label, started_at):
+    _emit_progress(logger, f"{stage_label} done in {time.perf_counter() - started_at:.1f}s")
 
 # ── 共用設定讀取（統一由 pipeline_config.py 提供）─────────────────────────────
 from pipeline_config import load_pipeline_config  # noqa: E402
@@ -74,9 +89,11 @@ from phot_regression import (                    # noqa: E402
     robust_linear_fit, mag_error_from_flux,
     differential_mag,
 )
-from phot_diagnostics import _save_regression_diagnostic as _shared_save_regression_diagnostic  # noqa: E402
-from phot_ensemble import ensemble_normalize as _shared_ensemble_normalize  # noqa: E402
-from phot_timing import time_from_header as _shared_time_from_header  # noqa: E402
+from phot_config import _resolve_extinction_k as _shared_resolve_extinction_k  # noqa: E402
+from phot_diagnostics import _save_regression_diagnostic  # noqa: E402
+from phot_ensemble import ensemble_normalize  # noqa: E402
+from phot_timing import time_from_header  # noqa: E402
+from polt_light_curve import plot_light_curve  # noqa: E402
 from phot_catalog import (                       # noqa: E402
     _pick_col, _parse_ra_dec,
     read_aavso_seq_csv, fetch_aavso_vsp_api,
@@ -200,6 +217,8 @@ class Cfg:
     peak_ratio_min: float = 0.0       # [deprecated] 峰值比固定下限（0.0=停用）；建議改用 peak_ratio_k
     peak_ratio_k: float = 0.0         # 自適應門檻倍數（0.0=停用）；peak_ratio < median - k×MAD 時剔除
     reg_intercept_sigma: float = 0.0   # 回歸截距突變閾值（倍 MAD，0.0 = 停用）；薄雲/透明度驟變偵測
+    reg_residual_rms_sigma: float = 0.0  # 比較星回歸 residual RMS 閾值（倍 MAD，0.0 = 停用）
+    reg_residual_p90_sigma: float = 0.0  # 比較星 |residual| P90 閾值（倍 MAD，0.0 = 停用）
     sky_sigma: float = 0.0            # 背景突升閾值（倍 MAD，0.0 = 停用）；起霧/散射光偵測
 
     # ── 舊版相容（ASTAP 板塊解算，保留供 Cell 5 使用）────────────────────────
@@ -215,16 +234,6 @@ class Cfg:
     max_fwhm_px: float = 8.0
     wcs_out_dir: Path = Path(".")
     stars_csv: Path = Path("stars.csv")
-
-
-def _resolve_extinction_k(yaml_dict: dict, channel: str, phot_cfg: dict) -> float:
-    """從 extinction.coefficients 取 per-channel 值，fallback 到 photometry.extinction_k。"""
-    ext_coeffs = yaml_dict.get("extinction", {}).get("coefficients", {})
-    # channel 映射：G1/G2 → G
-    ch_key = channel[0] if channel in ("G1", "G2") else channel
-    if ch_key in ext_coeffs:
-        return float(ext_coeffs[ch_key])
-    return float(phot_cfg.get("extinction_k", 0.0))
 
 
 def cfg_from_yaml(
@@ -470,7 +479,7 @@ def cfg_from_yaml(
         ),
 
         # 消光
-        extinction_k=_resolve_extinction_k(yaml_dict, channel, phot_cfg),
+        extinction_k=_shared_resolve_extinction_k(yaml_dict, channel, phot_cfg),
 
         # 舊版相容
         fits_dir=wcs_dir,
@@ -800,14 +809,15 @@ def _growth_radius_for_star(
     r_min: int,
     r_max: int,
     growth_fraction: float,
+    cfg_obj=None,
     annulus_r_in=None,
     annulus_r_out=None,
 ) -> "float | None":
     radii  = np.arange(r_min, r_max + 0.5, 0.5)
     fluxes = []
     # 顯式傳入 annulus 參數，避免依賴全域 cfg
-    _ann_in  = annulus_r_in if annulus_r_in is not None else getattr(cfg, 'annulus_r_in', None)
-    _ann_out = annulus_r_out if annulus_r_out is not None else getattr(cfg, 'annulus_r_out', None)
+    _ann_in = annulus_r_in if annulus_r_in is not None else getattr(cfg_obj, "annulus_r_in", None)
+    _ann_out = annulus_r_out if annulus_r_out is not None else getattr(cfg_obj, "annulus_r_out", None)
     for r in radii:
         r_in, r_out = compute_annulus_radii(r, _ann_in, _ann_out)
         phot = aperture_photometry(image, x, y, r, r_in, r_out)
@@ -829,6 +839,7 @@ def estimate_aperture_radius(
     r_min: int,
     r_max: int,
     growth_fraction: float,
+    cfg_obj=None,
     max_stars: int = 20,
 ) -> "float | None":
     with fits.open(wcs_fits_path) as hdul:
@@ -839,7 +850,7 @@ def estimate_aperture_radius(
     if comp_df is not None and len(comp_df) > 0:
         # 按星等接近目標星排序（而非取最亮），避免亮星 PSF 過集中導致孔徑偏小
         if "m_cat" in comp_df.columns:
-            _vmag_t = float(getattr(cfg, "vmag_approx", np.nan)) if 'cfg' in globals() else np.nan
+            _vmag_t = float(getattr(cfg_obj, "vmag_approx", np.nan))
             if np.isfinite(_vmag_t):
                 sub = comp_df.iloc[(comp_df["m_cat"] - _vmag_t).abs().argsort()].head(max_stars)
             else:
@@ -862,14 +873,16 @@ def estimate_aperture_radius(
                 stars_xy.append((x, y))
 
     # 從全域 cfg 取 annulus 和 saturation 參數（暫保 fallback，逐步消除全域依賴）
-    _ann_in  = getattr(cfg, 'annulus_r_in', None) if 'cfg' in dir() or 'cfg' in globals() else None
-    _ann_out = getattr(cfg, 'annulus_r_out', None) if 'cfg' in dir() or 'cfg' in globals() else None
-    _sat_th  = getattr(cfg, 'saturation_threshold', None) if 'cfg' in dir() or 'cfg' in globals() else None
+    _ann_in = getattr(cfg_obj, "annulus_r_in", None)
+    _ann_out = getattr(cfg_obj, "annulus_r_out", None)
+    _sat_th = getattr(cfg_obj, "saturation_threshold", None)
 
     radii = []
     for x, y in stars_xy:
-        r_sel = _growth_radius_for_star(img, x, y, r_min, r_max, growth_fraction,
-                                         annulus_r_in=_ann_in, annulus_r_out=_ann_out)
+        r_sel = _growth_radius_for_star(
+            img, x, y, r_min, r_max, growth_fraction,
+            cfg_obj=cfg_obj, annulus_r_in=_ann_in, annulus_r_out=_ann_out
+        )
         if r_sel is None:
             continue
         if _sat_th is not None:
@@ -896,9 +909,9 @@ def estimate_aperture_radius(
 # [已拆至 phot_catalog.py] filter_catalog_in_frame, select_comp_from_catalog
 
 
-def select_check_star(target_radec_deg, comp_refs, catalog_df):
-    if cfg.check_star_radec_deg is not None:
-        ra_c, dec_c = cfg.check_star_radec_deg
+def select_check_star(target_radec_deg, comp_refs, catalog_df, cfg_obj):
+    if cfg_obj.check_star_radec_deg is not None:
+        ra_c, dec_c = cfg_obj.check_star_radec_deg
         m_cat = None
         if catalog_df is not None and len(catalog_df) > 0 and "m_cat" in catalog_df.columns:
             sc_cat = SkyCoord(catalog_df["ra_deg"].values * u.deg,
@@ -906,7 +919,7 @@ def select_check_star(target_radec_deg, comp_refs, catalog_df):
             sc_k   = SkyCoord(ra=ra_c * u.deg, dec=dec_c * u.deg)
             sep    = sc_cat.separation(sc_k).arcsec
             idx    = int(np.argmin(sep))
-            if np.isfinite(sep[idx]) and sep[idx] <= cfg.apass_match_arcsec:
+            if np.isfinite(sep[idx]) and sep[idx] <= cfg_obj.apass_match_arcsec:
                 m_cat = float(catalog_df.iloc[idx]["m_cat"])
         return (float(ra_c), float(dec_c), m_cat)
 
@@ -915,8 +928,8 @@ def select_check_star(target_radec_deg, comp_refs, catalog_df):
         return None
 
     cand = catalog_df.copy()
-    if "max_pix" in cand.columns and cfg.saturation_threshold is not None:
-        cand = cand[~cand["max_pix"].apply(lambda v: is_saturated(v, cfg.saturation_threshold))]
+    if "max_pix" in cand.columns and cfg_obj.saturation_threshold is not None:
+        cand = cand[~cand["max_pix"].apply(lambda v: is_saturated(v, cfg_obj.saturation_threshold))]
     if comp_refs:
         comp_coords = SkyCoord(
             [r[0] for r in comp_refs] * u.deg,
@@ -925,7 +938,7 @@ def select_check_star(target_radec_deg, comp_refs, catalog_df):
         cand_coords = SkyCoord(cand["ra_deg"].values * u.deg,
                                cand["dec_deg"].values * u.deg)
         _, sep2d, _ = cand_coords.match_to_catalog_sky(comp_coords)
-        cand = cand[sep2d.arcsec > cfg.apass_match_arcsec].copy()
+        cand = cand[sep2d.arcsec > cfg_obj.apass_match_arcsec].copy()
 
     if len(cand) == 0:
         print("[WARN] Auto check-star selection failed: no safe candidates.")
@@ -985,16 +998,6 @@ def compute_airmass(
     return float(airmass)
 
 
-def time_from_header(
-    header,
-    ra_deg: float,
-    dec_deg: float,
-) -> "tuple[float, float, float]":
-    """Compatibility wrapper for the shared timing implementation."""
-    return _shared_time_from_header(header, ra_deg, dec_deg, cfg)
-
-
-
 """## Auto-select comparison stars (APASS)
 
 """
@@ -1024,27 +1027,6 @@ from pathlib import Path
 # [已拆至 phot_catalog.py] _selection_radius_px, _stars_in_circle,
 # _fetch_apass_from_cache, fetch_apass_cone, fetch_tycho2_cone,
 # fetch_gaia_dr3_cone, _match_catalog_to_detected, APASS_SCS_URL
-
-def _save_regression_diagnostic(
-    frame_name: str,
-    aavso_matched: "pd.DataFrame | None",
-    apass_matched: "pd.DataFrame | None",
-    fit_aavso: "dict | None",
-    fit_apass: "dict | None",
-    active_source: str,
-    diag_dir: Path,
-) -> None:
-    """Compatibility wrapper for the shared diagnostics implementation."""
-    return _shared_save_regression_diagnostic(
-        frame_name,
-        aavso_matched,
-        apass_matched,
-        fit_aavso,
-        fit_apass,
-        active_source,
-        diag_dir,
-    )
-
 
 def _load_or_build_unified_catalog(
     cfg,
@@ -1361,6 +1343,7 @@ def _load_or_build_unified_catalog(
 def auto_select_comps(
     wcs_fits_path: Path,
     target_radec_deg: tuple,
+    cfg_obj=None,
     band: str = "V",
     max_detect: int = 500,
     psf_box: int = 25,
@@ -1387,6 +1370,9 @@ def auto_select_comps(
     vsx_field       : VSX 查詢結果 DataFrame（供額外目標星測光用）
     """
     # Band → unified catalog column mapping
+    if cfg_obj is None:
+        raise RuntimeError("auto_select_comps requires cfg_obj")
+
     _band_mag_col = {"V": "V_mag", "B": "B_mag", "R": "R_mag"}
     _band_err_col = {"V": "V_err", "B": "B_err", "R": "R_err"}
     _band_src_col = {"V": "source_V", "B": "source_B", "R": "source_R"}
@@ -1400,13 +1386,13 @@ def auto_select_comps(
         wcs_obj = WCS(hdr)
 
     ra_t, dec_t = float(target_radec_deg[0]), float(target_radec_deg[1])
-    epsilon = cfg.plate_scale_arcsec / 2.0    # 防零 ε（arcsec）
+    epsilon = cfg_obj.plate_scale_arcsec / 2.0    # 防零 ε（arcsec）
     tgt_sc = SkyCoord(ra=ra_t * u.deg, dec=dec_t * u.deg)
     _h, _w = img.shape
 
     # 孔徑參數：使用 cfg 靜態值（孔徑估算在本函式之後才執行）
-    _ap_r = float(cfg.aperture_radius)
-    _r_in, _r_out = compute_annulus_radii(_ap_r, cfg.annulus_r_in, cfg.annulus_r_out)
+    _ap_r = float(cfg_obj.aperture_radius)
+    _r_in, _r_out = compute_annulus_radii(_ap_r, cfg_obj.annulus_r_in, cfg_obj.annulus_r_out)
     _margin = int(np.ceil(_r_out + 2))
 
     def _catalog_direct_phot(cat_df, ra_col, dec_col, mag_col_, err_col_, mag_min, mag_max):
@@ -1442,7 +1428,7 @@ def auto_select_comps(
             if phot.get("ok") != 1 or not np.isfinite(phot.get("flux_net", np.nan)):
                 n_phot += 1
                 continue
-            if is_saturated(phot.get("max_pix", np.nan), cfg.saturation_threshold):
+            if is_saturated(phot.get("max_pix", np.nan), cfg_obj.saturation_threshold):
                 n_sat += 1
                 continue
             m_inst = m_inst_from_flux(phot["flux_net"])
@@ -1461,10 +1447,10 @@ def auto_select_comps(
 
     # ── 3–5. 統一視場星表（所有波段共用一份快取）────────────────────────────
     # catalogs 放在 group（星場）層級，同星場多目標共用
-    _field_cat_dir  = cfg.out_dir.parent.parent.parent / "catalogs"
+    _field_cat_dir  = cfg_obj.out_dir.parent.parent.parent / "catalogs"
 
     unified_df, _sources_used = _load_or_build_unified_catalog(
-        cfg, ra_t, dec_t, _field_cat_dir,
+        cfg_obj, ra_t, dec_t, _field_cat_dir,
     )
 
     # 篩選此波段有值的星
@@ -1499,8 +1485,8 @@ def auto_select_comps(
     #   cfg.comp_mag_min/max 是用 vmag_approx(V) 算的，B/R 波段需要修正。
     #   從 unified catalog 查目標星在此 band 的星等，用相同 bright/faint offset 重算。
     #   注意：必須在 VSX 排除之前查，因為目標星本身是變星會被 VSX 踢掉。
-    _comp_mag_min_band = cfg.comp_mag_min
-    _comp_mag_max_band = cfg.comp_mag_max
+    _comp_mag_min_band = cfg_obj.comp_mag_min
+    _comp_mag_max_band = cfg_obj.comp_mag_max
     if band != "V" and len(band_df) > 0:
         _tgt_cat = SkyCoord(band_df["ra_deg"].values * u.deg,
                             band_df["dec_deg"].values * u.deg)
@@ -1509,8 +1495,8 @@ def auto_select_comps(
         if _sep[_nearest_idx] < 10.0:  # 10" 以內才信
             _tgt_band_mag = float(band_df.iloc[_nearest_idx]["m_cat"])
             # 用 cfg 裡的 bright/faint offset（從 vmag 反推）
-            _bright_offset = cfg.vmag_approx - cfg.comp_mag_min
-            _faint_offset  = cfg.comp_mag_max - cfg.vmag_approx
+            _bright_offset = cfg_obj.vmag_approx - cfg_obj.comp_mag_min
+            _faint_offset  = cfg_obj.comp_mag_max - cfg_obj.vmag_approx
             _comp_mag_min_band = _tgt_band_mag - _bright_offset
             _comp_mag_max_band = _tgt_band_mag + _faint_offset
             # 再套 yaml 夾鉗
@@ -1520,14 +1506,14 @@ def auto_select_comps(
             _comp_mag_max_band = min(_comp_mag_max_band, _yaml_ceil)
             print(f"  [mag range] band={band}: 目標星 {band}_mag={_tgt_band_mag:.2f} "
                   f"→ comp range [{_comp_mag_min_band:.1f}, {_comp_mag_max_band:.1f}] "
-                  f"(V 基準 [{cfg.comp_mag_min:.1f}, {cfg.comp_mag_max:.1f}])")
+                  f"(V 基準 [{cfg_obj.comp_mag_min:.1f}, {cfg_obj.comp_mag_max:.1f}])")
 
     # ── VSX 已知變星排除（比較星不能是變星）──────────────────────────────
     _vsx = pd.DataFrame()
     if len(band_df) > 0:
         try:
             from tools.local_catalog import query_vsx_cone, filter_known_variables
-            _vsx = query_vsx_cone(ra_t, dec_t, radius_deg=cfg.apass_radius_deg)
+            _vsx = query_vsx_cone(ra_t, dec_t, radius_deg=cfg_obj.apass_radius_deg)
             if len(_vsx) > 0:
                 _n_before_vsx = len(band_df)
                 band_df = filter_known_variables(band_df, _vsx, match_arcsec=10.0)
@@ -1564,15 +1550,15 @@ def auto_select_comps(
         comp_refs.append((ra_c, dec_c, m_cat, m_err, weight))
 
     # ── 6b. comp_max 截斷 ──────────────────────────────────────────────────────
-    if cfg.comp_max > 0 and len(comp_refs) > cfg.comp_max:
-        _vmag_t = float(getattr(cfg, "vmag_approx", np.nan))
+    if cfg_obj.comp_max > 0 and len(comp_refs) > cfg_obj.comp_max:
+        _vmag_t = float(getattr(cfg_obj, "vmag_approx", np.nan))
         if np.isfinite(_vmag_t):
             comp_refs.sort(key=lambda x: abs(x[2] - _vmag_t))
         else:
             comp_refs.sort(key=lambda x: x[4], reverse=True)
         _n_before = len(comp_refs)
-        comp_refs = comp_refs[:cfg.comp_max]
-        print(f"[比較星] comp_max={cfg.comp_max}：{_n_before} → {len(comp_refs)} 顆"
+        comp_refs = comp_refs[:cfg_obj.comp_max]
+        print(f"[比較星] comp_max={cfg_obj.comp_max}：{_n_before} → {len(comp_refs)} 顆"
               f"（按星等接近度排序）")
         _kept_coords = {(r[0], r[1]) for r in comp_refs}
         active_df = active_df[
@@ -1583,7 +1569,7 @@ def auto_select_comps(
     # band_df 含該波段所有候選星（含 mag range 外），比 active_df 寬得多，
     # 確保扣除 comp 後仍有 check star 候選。
     check_star = select_check_star(
-        cfg.target_radec_deg, comp_refs, band_df
+        cfg_obj.target_radec_deg, comp_refs, band_df, cfg_obj
     )
 
     print(f"[比較星] band={band} 使用 {active_source}：{len(comp_refs)} 顆")
@@ -1602,27 +1588,6 @@ def auto_select_comps(
 #      完全消除後需併同此檔案再行決定。
 
 # [已拆至 phot_regression.py] differential_mag
-
-
-def ensemble_normalize(
-    df: pd.DataFrame,
-    comp_lightcurves: "dict[str, pd.Series]",
-    initial_weights: "dict[str, float]",
-    time_key: str = "bjd_tdb",
-    min_comp_stars: int = 3,
-    max_iter: int = 10,
-    convergence_tol: float = 1e-4,
-) -> "tuple[pd.DataFrame, pd.Series]":
-    """Compatibility wrapper for the shared ensemble implementation."""
-    return _shared_ensemble_normalize(
-        df,
-        comp_lightcurves,
-        initial_weights,
-        time_key=time_key,
-        min_comp_stars=min_comp_stars,
-        max_iter=max_iter,
-        convergence_tol=convergence_tol,
-    )
 
 
 class _FrameCompCache:
@@ -1647,145 +1612,307 @@ class _FrameCompCache:
 
 
 
-def plot_light_curve(
+def _emit_photometry_products(
     df: pd.DataFrame,
+    out_csv: Path,
     out_png: Path,
     channel: str,
     cfg,
-    obs_date: "str | None" = None,
-    ylim: "tuple[float, float] | None" = None,
-):
-    """
-    Generate the light curve plot from a photometry result DataFrame.
+    time_key: str,
+    check_star,
+    ap_radius: float,
+    r_in: float,
+    r_out: float,
+    n_skipped: int,
+    n_before_clip: int,
+    n_after_clip: int,
+    ext_k: float,
+    first_frame_diag_data,
+) -> bool:
+    """Write post-run artifacts after the science dataframe is finalized."""
+    # 第一次寫入（ensemble normalize 後會再寫一次，更新 m_var_norm/delta_ensemble）
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    n_written = len(df)
+    print(f"[CSV] saved → {out_csv}  "
+          f"({n_written} rows written, {n_after_clip} successful "
+          f"[{n_before_clip - n_after_clip} sigma-clipped], "
+          f"{n_skipped} skipped [airmass > {cfg.alt_min_airmass:.3f}])")
 
-    ylim : (ymin, ymax) in mag — 若提供則鎖定 Y 軸範圍（已含 invert）。
-    """
-    from astropy.time import Time as ATime
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
-    import datetime as _dt_local
+    # ── 回歸診斷總覽圖：回歸散佈圖（主）+ RMS 時序（輔）──────────────────────
+    if cfg.save_regression_diagnostic:
+        try:
+            _reg_diag_path = cfg.regression_diag_dir / (
+                f"reg_overview_{out_csv.stem.split('_')[1]}_{out_csv.stem.split('_', 1)[-1]}.png"
+            )
+            _df_ok = df[df["ok"] == 1].copy()
+            import matplotlib.ticker as _mticker_reg
+            import matplotlib.gridspec as _mgs
 
-    time_key = "bjd_tdb" if "bjd_tdb" in df.columns else "jd"
-    if time_key not in df.columns:
-        print(f"[PLOT] Error: time column '{time_key}' not found.")
-        return
+            fig_diag = plt.figure(figsize=(8, 11))
+            gs = _mgs.GridSpec(2, 1, height_ratios=[4, 1], hspace=0.30)
+            ax_sc = fig_diag.add_subplot(gs[0])
+            ax_sc.set_box_aspect(1.0)
+            ax_ts = fig_diag.add_subplot(gs[1])
 
-    # Filter valid points
-    # ensemble_normalize 啟用時優先用 m_var_norm；否則退回 m_var
-    _mag_col = "m_var"  # v1.5 邏輯：直接用回歸校正星等；ensemble normalization 已知有問題
-    d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df[_mag_col])].copy()
+            _ffd = first_frame_diag_data
+            if _ffd is not None:
+                _mc, _mi, _fit = _ffd[:3]
+                _tgt_vmag_diag = _ffd[3] if len(_ffd) > 3 else np.nan
+                _tgt_minst = _ffd[4] if len(_ffd) > 4 else np.nan
+                _ok_pts = np.isfinite(_mc) & np.isfinite(_mi)
+                ax_sc.scatter(_mc[_ok_pts], _mi[_ok_pts], s=18, alpha=0.6,
+                              color="steelblue", label=f"comp (n={_ok_pts.sum()})")
+                if _fit and np.isfinite(_fit.get("a", np.nan)):
+                    _a, _b, _r2 = _fit["a"], _fit["b"], _fit.get("r2", np.nan)
+                    _xl = np.linspace(_mc[_ok_pts].min(), _mc[_ok_pts].max(), 100)
+                    ax_sc.plot(_xl, _a * _xl + _b, "r-", lw=1.8,
+                               label=f"$m_{{inst}}={_a:.3f}\\,m_{{cat}}+({_b:.3f})$  $R^2={_r2:.3f}$")
+                if _fit and np.isfinite(_tgt_minst):
+                    _a_d, _b_d = _fit["a"], _fit["b"]
+                    if np.isfinite(_a_d) and _a_d != 0:
+                        _tgt_mvar = (_tgt_minst - _b_d) / _a_d
+                        ax_sc.scatter([_tgt_mvar], [_tgt_minst], s=100, marker="o",
+                                      facecolors="none", edgecolors="red", linewidths=2.0,
+                                      zorder=5, label=f"target  $m_{{var}}$={_tgt_mvar:.1f}")
+                _brightest_comp = float(_mc[_ok_pts].min()) if _ok_pts.any() else float(cfg.comp_mag_min)
+                _x_lo = _brightest_comp
+                if _fit and np.isfinite(_tgt_vmag_diag):
+                    _x_lo = min(_x_lo, float(_tgt_vmag_diag))
+                _x_hi = float(cfg.comp_mag_max)
+                ax_sc.set_xlim(_x_lo - 0.2, _x_hi + 0.1)
+                if _fit and np.isfinite(_fit.get("a", np.nan)) and _ok_pts.any():
+                    _comp_lo = float(_mc[_ok_pts].min())
+                    _comp_hi = float(_mc[_ok_pts].max())
+                    if _x_lo < _comp_lo - 0.01:
+                        _xl_ext = np.linspace(_x_lo - 0.2, _comp_lo, 50)
+                        ax_sc.plot(_xl_ext, _a * _xl_ext + _b, "r--", lw=1.2, alpha=0.5)
+                    if _x_hi > _comp_hi + 0.01:
+                        _xl_ext = np.linspace(_comp_hi, _x_hi + 0.1, 50)
+                        ax_sc.plot(_xl_ext, _a * _xl_ext + _b, "r--", lw=1.2, alpha=0.5)
+                _all_mi = list(_mi[_ok_pts]) if _ok_pts.any() else []
+                if _fit and np.isfinite(_tgt_minst):
+                    _all_mi.append(float(_tgt_minst))
+                if _fit and np.isfinite(_fit.get("a", np.nan)):
+                    _all_mi.append(float(_fit["a"] * _x_lo + _fit["b"]))
+                    _all_mi.append(float(_fit["a"] * _x_hi + _fit["b"]))
+                if _all_mi:
+                    _mi_lo, _mi_hi = min(_all_mi), max(_all_mi)
+                    _mi_pad = (_mi_hi - _mi_lo) * 0.12
+                    ax_sc.set_ylim(_mi_hi + _mi_pad, _mi_lo - _mi_pad)
+                else:
+                    ax_sc.invert_yaxis()
+                ax_sc.set_xlabel(f"$m_{{cat}}$ ({cfg.phot_band})", fontsize=11)
+                ax_sc.set_ylabel("$m_{inst}$", fontsize=11)
+                _extrap_note = ""
+                if _ok_pts.any() and np.isfinite(_tgt_vmag_diag):
+                    if _tgt_vmag_diag < float(_mc[_ok_pts].min()):
+                        _extrap_note = "  [EXTRAPOLATION]"
+                ax_sc.set_title(
+                    f"Regression Fit — Frame 1  ({_x_lo:.1f}–{_x_hi:.1f} mag){_extrap_note}",
+                    fontsize=12,
+                )
+                ax_sc.legend(fontsize=8, frameon=False)
+                ax_sc.grid(True, alpha=0.3)
+            else:
+                ax_sc.text(0.5, 0.5, "No first-frame data",
+                           transform=ax_sc.transAxes, ha="center", va="center")
+
+            if "reg_residual_rms" in _df_ok.columns and np.isfinite(_df_ok["reg_residual_rms"]).any():
+                ax_ts.plot(
+                    _df_ok[time_key], _df_ok["reg_residual_rms"],
+                    "o-", ms=2, lw=0.6, color="steelblue", alpha=0.7
+                )
+                ax_ts.axhline(
+                    _df_ok["reg_residual_rms"].median(), color="red",
+                    lw=1, ls="--", label=f"median={_df_ok['reg_residual_rms'].median():.4f}"
+                )
+                ax_ts.set_xlabel(time_key.upper(), fontsize=9)
+                ax_ts.set_ylabel("Residual RMS (mag)", fontsize=9)
+                ax_ts.legend(fontsize=7)
+                ax_ts.grid(True, alpha=0.3)
+                ax_ts.tick_params(labelsize=8)
+                ax_ts.xaxis.set_major_formatter(
+                    _mticker_reg.FuncFormatter(lambda v, _: f"{v:.2f}")
+                )
+            else:
+                ax_ts.text(0.5, 0.5, "No residual data", transform=ax_ts.transAxes,
+                           ha="center", va="center")
+
+            fig_diag.suptitle(
+                f"Regression Diagnostic  |  {cfg.target_name}  "
+                f"channel={channel}  {out_csv.stem}",
+                fontsize=11
+            )
+            fig_diag.savefig(_reg_diag_path, dpi=150, bbox_inches="tight")
+            plt.close(fig_diag)
+            print(f"[reg_diag] saved → {_reg_diag_path}")
+        except Exception as _e:
+            import traceback
+            traceback.print_exc()
+            print(f"[WARN] regression diagnostic failed: {_e}")
+
+    try:
+        _rej_colors = {
+            "high_airmass": "#aaaaaa",
+            "high_fwhm": "#e67e22",
+            "low_sharpness": "#9b59b6",
+            "low_peak_ratio": "#1abc9c",
+            "low_reg_r2": "#e74c3c",
+            "phot_fail": "#c0392b",
+            "sigma_clip": "#2980b9",
+            "reg_jump": "#f39c12",
+            "high_sky": "#16a085",
+            "ok": "#cccccc",
+        }
+        _rej_fig, _rej_ax = plt.subplots(figsize=(12, 3))
+        _df_all = df.copy()
+        _ok_flag_col = _df_all["ok_flag"] if "ok_flag" in _df_all.columns else pd.Series("", index=_df_all.index)
+        _df_all["_flag"] = _ok_flag_col.fillna("ok").where(_df_all["ok"] == 0, "ok")
+        if time_key in _df_all.columns and _df_all[time_key].notna().any():
+            _t_local = (_df_all[time_key] - 2400000.5) * 86400
+            _t0 = _t_local.min()
+            _t_rel = (_t_local - _t0) / 3600
+        else:
+            _t_rel = pd.Series(range(len(_df_all)), dtype=float)
+        for _flag, _grp in _df_all.groupby("_flag"):
+            _col = _rej_colors.get(_flag, "#888888")
+            _size = 15 if _flag == "ok" else 40
+            _zord = 2 if _flag == "ok" else 3
+            _idx = _df_all.index[_df_all["_flag"] == _flag]
+            _rej_ax.scatter(_t_rel.iloc[_idx], _df_all.loc[_df_all["_flag"] == _flag, "airmass"],
+                            c=_col, s=_size, label=_flag, zorder=_zord, alpha=0.85)
+        _rej_ax.set_xlabel("Elapsed time (hours from first frame)")
+        _rej_ax.set_ylabel("Airmass")
+        _rej_ax.invert_yaxis()
+        _rej_ax.set_title(
+            f"Rejection timeline  |  {cfg.target_name}  ch={cfg.phot_band}  {out_csv.stem}",
+            fontsize=9)
+        _rej_ax.legend(fontsize=7, ncol=5, loc="upper right")
+        _rej_ax.grid(True, alpha=0.25)
+        _rej_fig.tight_layout()
+        _rej_path = out_csv.parent / f"rejection_timeline_{out_csv.stem}.png"
+        _rej_fig.savefig(_rej_path, dpi=150)
+        plt.close(_rej_fig)
+        print(f"[剔除時序圖] saved → {_rej_path}")
+    except Exception as _e:
+        print(f"[WARN] 剔除時序圖輸出失敗：{_e}")
+
+    d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
     if len(d) == 0:
         print("[PLOT] No valid photometry points to plot.")
-        return
+        df["m_var_norm"] = df["m_var"]
+        df["delta_ensemble"] = np.nan
+        return False
 
-    bjd_arr = d[time_key].values
-    bjd_min = float(bjd_arr.min())
-    bjd_max = float(bjd_arr.max())
+    _lc_obs_date = str(out_csv.stem).split("_")[-1]
 
-    # Time scaling for Local Time (UTC+8 default)
-    _tz_offset_h = float(getattr(cfg, "tz_offset_hours", 8))
+    if check_star is not None and "k_minus_c" in df.columns:
+        k = df[(df["ok"] == 1) & np.isfinite(df[time_key])
+               & np.isfinite(df["k_minus_c"])].copy()
+        if len(k) > 1:
+            _t0_check = float(k[time_key].min())
+            k["t_rel_d"] = k[time_key] - _t0_check
+            sigma_k = float(np.nanstd(k["k_minus_c"]))
+            flag = " [!] EXCEEDS THRESHOLD" if sigma_k > cfg.check_star_max_sigma else ""
+            print(f"[CHECK] K-C sigma = {sigma_k:.5f} mag "
+                  f"(threshold = {cfg.check_star_max_sigma}){flag}")
+            fig2, ax2 = plt.subplots(figsize=(10, 3))
+            ax2.plot(k["t_rel_d"], k["k_minus_c"], "o-", ms=4, lw=0.8)
+            ax2.xaxis.set_major_formatter(plt.FuncFormatter(
+                lambda x, _: f"{int(x)}d {int((x % 1)*24)}h {int(((x % 1)*24 % 1)*60)}m"
+            ))
+            ax2.invert_yaxis()
+            ax2.set_xlabel("t_rel (days)")
+            ax2.set_ylabel("K - C  (mag)")
+            ax2.set_title("Check Star Validation")
+            ax2.grid(True, alpha=0.4)
+            fig2.tight_layout()
+            plt.close("all")
 
-    def _bjd_to_local_hm(bjd_val):
-        try:
-            t_utc = ATime(bjd_val, format="jd", scale="tdb").to_datetime()
-            return t_utc + _dt_local.timedelta(hours=_tz_offset_h)
-        except Exception:
-            return None
+    df["m_var_norm"] = df["m_var"]
+    df["delta_ensemble"] = np.nan
 
-    # Compute Ticks
-    _t_local_min = _bjd_to_local_hm(bjd_min)
-    _t_local_max = _bjd_to_local_hm(bjd_max)
-    _label30_bjd_ticks = []
-    _label30_labels = []
-    _minor_bjd_ticks = []
-    if _t_local_min is not None and _t_local_max is not None:
-        _cur = _t_local_min.replace(second=0, microsecond=0)
-        _cur = _cur.replace(minute=(_cur.minute // 10) * 10)
-        while _cur <= _t_local_max + _dt_local.timedelta(minutes=1):
-            _utc = _cur - _dt_local.timedelta(hours=_tz_offset_h)
-            _b_tick = ATime(_utc).jd
-            _minor_bjd_ticks.append(_b_tick)
-            if _cur.minute in (0, 30):
-                _label30_bjd_ticks.append(_b_tick)
-                _label30_labels.append(_cur.strftime("%H:%M"))
-            _cur += _dt_local.timedelta(minutes=10)
+    plot_light_curve(df, out_png, channel, cfg, obs_date=_lc_obs_date)
 
-    fig, ax = plt.subplots(figsize=(12, 4))
+    try:
+        _ok_df = df[df["ok"] == 1]
+        _n_ok = len(_ok_df)
+        _n_total = len(df)
+        _summary_lines = [
+            f"=== VarStar Photometry Summary ===",
+            f"Target    : {cfg.target_name}",
+            f"Channel   : {channel}",
+            f"Date      : {out_csv.stem.split('_')[-1]}",
+            f"Frames    : {_n_ok}/{_n_total} ok  "
+            f"({n_skipped} airmass-cut, "
+            f"{n_before_clip - n_after_clip} sigma-clipped)",
+            f"Aperture  : {ap_radius:.1f} px  "
+            f"(annulus {r_in:.1f}–{r_out:.1f})",
+        ]
+        _summary_lines.append(
+            f"GrowthFr  : {getattr(cfg, 'aperture_growth_fraction', float('nan')):.3f}"
+        )
+        if _n_ok > 0:
+            _mvar = _ok_df["m_var_norm"] if "m_var_norm" in _ok_df.columns else _ok_df["m_var"]
+            _mvar_ok = _mvar[np.isfinite(_mvar)]
+            if len(_mvar_ok) > 0:
+                _summary_lines.append(
+                    f"Mag range : {_mvar_ok.min():.3f} – {_mvar_ok.max():.3f}  "
+                    f"(median {_mvar_ok.median():.3f}, std {_mvar_ok.std():.4f})"
+                )
+            if "reg_r2" in _ok_df.columns:
+                _r2_ok = _ok_df["reg_r2"][np.isfinite(_ok_df["reg_r2"])]
+                if len(_r2_ok) > 0:
+                    _summary_lines.append(
+                        f"Reg R²    : median {_r2_ok.median():.4f}  "
+                        f"min {_r2_ok.min():.4f}  max {_r2_ok.max():.4f}"
+                    )
+            if "airmass" in _ok_df.columns:
+                _am_ok = _ok_df["airmass"][np.isfinite(_ok_df["airmass"])]
+                if len(_am_ok) > 0:
+                    _summary_lines.append(
+                        f"Airmass   : {_am_ok.min():.3f} – {_am_ok.max():.3f}"
+                    )
+            if "t_snr" in _ok_df.columns:
+                _snr_ok = _ok_df["t_snr"][np.isfinite(_ok_df["t_snr"])]
+                if len(_snr_ok) > 0:
+                    _summary_lines.append(
+                        f"SNR       : median {_snr_ok.median():.1f}  "
+                        f"min {_snr_ok.min():.1f}"
+                    )
+            if "comp_used" in _ok_df.columns:
+                _comp_ok = _ok_df["comp_used"][np.isfinite(_ok_df["comp_used"])]
+                if len(_comp_ok) > 0:
+                    _summary_lines.append(
+                        f"Comp stars: median {_comp_ok.median():.0f}  "
+                        f"min {_comp_ok.min():.0f}"
+                    )
+            if ext_k > 0:
+                _summary_lines.append(
+                    f"Extinction: k={ext_k:.3f} mag/airmass applied"
+                )
+            if time_key in _ok_df.columns:
+                _t_ok = _ok_df[time_key][np.isfinite(_ok_df[time_key])]
+                if len(_t_ok) > 1:
+                    _baseline_hr = (_t_ok.max() - _t_ok.min()) * 24
+                    _summary_lines.append(
+                        f"Baseline  : {_baseline_hr:.2f} hr"
+                    )
+        _summary_lines.append(f"Output    : {out_csv}")
+        _summary_lines.append("")
 
-    # Error bars or dots
-    _y_vals = d[_mag_col].values
-    if "t_sigma_mag" in d.columns and np.isfinite(d["t_sigma_mag"]).any():
-        ax.errorbar(bjd_arr, _y_vals, yerr=d["t_sigma_mag"].values,
-                    fmt="o", ms=4, capsize=2, lw=0.8, label="± σ", zorder=3)
-    else:
-        ax.plot(bjd_arr, _y_vals, "o-", ms=4, lw=0.8, label="± σ", zorder=3)
+        _summary_text = "\n".join(_summary_lines)
+        _summary_path = out_csv.parent / f"summary_{out_csv.stem}.txt"
+        _summary_path.write_text(_summary_text, encoding="utf-8")
+        print(f"[摘要] saved → {_summary_path}")
+        for _sl in _summary_lines:
+            if _sl:
+                print(f"  {_sl}")
+    except Exception as _e_summary:
+        print(f"[WARN] 摘要報告輸出失敗：{_e_summary}")
 
-    ax.invert_yaxis()
-    if ylim is not None:
-        ax.set_ylim(ylim[0], ylim[1])   # ylim 應已考慮 invert（大值在下）
-        # 強制統一 Y 軸 tick 間距（0.05 mag），避免 matplotlib 自動選不同間距
-        _y_lo = min(ylim)   # 亮端（小數值）
-        _y_hi = max(ylim)   # 暗端（大數值）
-        _yticks = np.arange(np.ceil(_y_lo * 20) / 20, _y_hi + 0.001, 0.05)
-        ax.set_yticks(_yticks)
-    ax.set_xlim(bjd_min - 0.002, bjd_max + 0.002)
-
-    # Ticks & Label (Navy)
-    if _minor_bjd_ticks:
-        ax.set_xticks(_minor_bjd_ticks, minor=True)
-    if _label30_bjd_ticks:
-        ax.set_xticks(_label30_bjd_ticks)
-        ax.set_xticklabels(_label30_labels, color="navy", fontsize=9)
-    ax.tick_params(axis="x", which="major", direction="out", colors="navy", length=6)
-    ax.tick_params(axis="x", which="minor", direction="out", colors="navy", length=3)
-
-    # BJD Text (Navy Alpha)
-    _xlim = ax.get_xlim()
-    _xspan = _xlim[1] - _xlim[0]
-    for _i, _tick_v in enumerate(_label30_bjd_ticks):
-        if _i == 0: continue
-        _xf = (_tick_v - _xlim[0]) / _xspan
-        if 0.0 <= _xf <= 1.0:
-            ax.text(_xf, 0.01, f"{_tick_v:.4f}", transform=ax.transAxes,
-                    ha="center", va="bottom", fontsize=7, color="navy", alpha=0.4,
-                    rotation=45, clip_on=True, zorder=5)
-
-    ax.text(0.0, 0.01, "BJD", transform=ax.transAxes, ha="left", va="bottom",
-            fontsize=9, color="navy", zorder=5)
-
-    # Labels
-    ax.set_xlabel("Local Time (HH:MM)", color="navy", loc="left", fontsize=9, labelpad=2)
-    ax.set_ylabel("Calibrated Magnitude (mag)")
-
-    # Title: Bold, Large (22), pad (10)
-    _title_star = getattr(cfg, "display_name", None) or getattr(cfg, "target_name", "Target")
-    ax.set_title(f"{_title_star} Light Curve [{channel}]", fontsize=22, fontweight='bold', pad=10)
-
-    # Legend & Date
-    _fs = 16
-    _obs_str = obs_date if obs_date else ""
-    ax.text(0.01, 1.02, _obs_str, transform=ax.transAxes, ha="left", va="bottom",
-            fontsize=_fs, color="navy")
-
-    # Legend using V6-style compact parameters
-    ax.legend(fontsize=_fs, loc="upper left", frameon=True, edgecolor='gray',
-              borderaxespad=0.2, handletextpad=0.0, handlelength=1.0, borderpad=0.2, labelspacing=0.2)
-
-    # Coordinates
-    _lat = getattr(cfg, "obs_lat_deg", None)
-    _lon = getattr(cfg, "obs_lon_deg", None)
-    if _lat is not None and _lon is not None:
-        _ls = f"{abs(_lat):.2f}°{'N' if _lat >= 0 else 'S'}"
-        _rs = f"{abs(_lon):.2f}°{'E' if _lon >= 0 else 'W'}"
-        ax.text(0.99, 1.02, f"{_ls} {_rs}", transform=ax.transAxes, ha="right", va="bottom",
-                fontsize=_fs, color="#2d6a4f")
-
-    ax.grid(True, alpha=0.3)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
-    plt.close("all")
-    print(f"[PNG] saved → {out_png}")
+    return True
 
 
 def run_photometry_on_wcs_dir(
@@ -1855,8 +1982,22 @@ def run_photometry_on_wcs_dir(
     # 對應 star_id → 初始權重（來自幀迴圈中計算的距離＋誤差複合權重）
     # 只取第一次出現的值（各幀理論上相同，因為距離和 m_err 不隨時間變化）
     _comp_init_weights: "dict[str, float]" = {}
+    _frame_stage_started = time.perf_counter()
+    _emit_progress(
+        _phot_logger,
+        f"channel {channel} frame loop start total={len(wcs_files_sorted)}"
+    )
+    _last_heartbeat_at = _frame_stage_started
 
-    for f in wcs_files_sorted:
+    for _frame_idx, f in enumerate(wcs_files_sorted, start=1):
+        _now = time.perf_counter()
+        if (_frame_idx % 25 == 0) or (_now - _last_heartbeat_at >= 30.0):
+            _emit_progress(
+                _phot_logger,
+                f"channel {channel} heartbeat frames={_frame_idx}/{len(wcs_files_sorted)} "
+                f"elapsed={_now - _frame_stage_started:.1f}s"
+            )
+            _last_heartbeat_at = _now
         with fits.open(f) as hdul:
             img = hdul[0].data.astype(np.float32)
             hdr = hdul[0].header
@@ -1868,7 +2009,7 @@ def run_photometry_on_wcs_dir(
             cfg_checked = True
 
         # ── Time, BJD_TDB, airmass ───────────────────────────────────────────
-        mjd, bjd_tdb, airmass = time_from_header(hdr, ra_t, dec_t)
+        mjd, bjd_tdb, airmass = time_from_header(hdr, ra_t, dec_t, cfg)
 
         xt, yt = radec_to_pixel(wcs_obj, ra_t, dec_t)
         rec = {
@@ -2182,8 +2323,15 @@ def run_photometry_on_wcs_dir(
         _m_inst_fit = comp_m_inst[mask]
         _m_inst_pred = a * _m_cat_fit + b   # 預測 m_inst（擬合方向：m_inst = a*m_cat + b）
         _residuals   = _m_inst_fit - _m_inst_pred
+        _abs_residuals = np.abs(_residuals)
         reg_resid_rms = float(np.sqrt(np.mean(_residuals ** 2))) if len(_residuals) > 0 else np.nan
+        reg_abs_resid_med = float(np.median(_abs_residuals)) if len(_abs_residuals) > 0 else np.nan
+        reg_abs_resid_p90 = float(np.percentile(_abs_residuals, 90)) if len(_abs_residuals) > 0 else np.nan
+        reg_abs_resid_max = float(np.max(_abs_residuals)) if len(_abs_residuals) > 0 else np.nan
         rec["reg_residual_rms"] = reg_resid_rms
+        rec["reg_abs_resid_med"] = reg_abs_resid_med
+        rec["reg_abs_resid_p90"] = reg_abs_resid_p90
+        rec["reg_abs_resid_max"] = reg_abs_resid_max
 
         # ── Check star ───────────────────────────────────────────────────────
         if check_star is not None:
@@ -2204,6 +2352,7 @@ def run_photometry_on_wcs_dir(
                                 rec["k_minus_c"] = m_check - float(m_cat_k)
         rows.append(rec)
 
+    _emit_progress_done(_phot_logger, f"channel {channel} frame loop", _frame_stage_started)
     df = pd.DataFrame(rows)
 
     if len(df) == 0:
@@ -2253,17 +2402,22 @@ def run_photometry_on_wcs_dir(
     # m_var_ext = m_var - k × (X_frame - X_ref)
     # k = extinction_k (mag/airmass)，X_ref = 觀測中最小氣團
     # 差分測光中目標與比較星消光大致抵消，但長基線或大氣團差時殘差累積。
+    # 2026-04-14: disabled by user decision.
+    # Reason:
+    # - current mainline already uses per-frame free-slope regression
+    # - applying extinction here risks double-correcting atmospheric effects
+    # Keep `_ext_k` for summary/report compatibility, but do not modify `m_var`.
     _ext_k = float(getattr(cfg, "extinction_k", 0.0))
-    if _ext_k > 0 and "airmass" in df.columns:
-        _ok_am = (df["ok"] == 1) & np.isfinite(df["airmass"]) & np.isfinite(df["m_var"])
-        if _ok_am.sum() >= 3:
-            _X_ref = float(df.loc[_ok_am, "airmass"].min())
-            _delta_ext = _ext_k * (df["airmass"] - _X_ref)
-            df["m_var_raw"] = df["m_var"].copy()
-            df.loc[_ok_am, "m_var"] = df.loc[_ok_am, "m_var"] - _delta_ext[_ok_am]
-            _med_corr = float(_delta_ext[_ok_am].median())
-            print(f"[extinction] k={_ext_k:.3f} mag/airmass  X_ref={_X_ref:.3f}  "
-                  f"median correction={_med_corr:.4f} mag  ({_ok_am.sum()} frames)")
+    # if _ext_k > 0 and "airmass" in df.columns:
+    #     _ok_am = (df["ok"] == 1) & np.isfinite(df["airmass"]) & np.isfinite(df["m_var"])
+    #     if _ok_am.sum() >= 3:
+    #         _X_ref = float(df.loc[_ok_am, "airmass"].min())
+    #         _delta_ext = _ext_k * (df["airmass"] - _X_ref)
+    #         df["m_var_raw"] = df["m_var"].copy()
+    #         df.loc[_ok_am, "m_var"] = df.loc[_ok_am, "m_var"] - _delta_ext[_ok_am]
+    #         _med_corr = float(_delta_ext[_ok_am].median())
+    #         print(f"[extinction] k={_ext_k:.3f} mag/airmass  X_ref={_X_ref:.3f}  "
+    #               f"median correction={_med_corr:.4f} mag  ({_ok_am.sum()} frames)")
 
     # ── 回歸截距突變篩選 ───────────────────────────────────────────────────────
     # 薄雲或透明度驟變時所有比較星同步變暗，零點截距 b 會系統性漂移。
@@ -2285,6 +2439,47 @@ def run_photometry_on_wcs_dir(
             n_reg_jump = int(_reg_jump_mask.sum())
             print(f"[reg_jump] MAD={_reg_mad:.4f}  thresh={_reg_thresh:.4f}  "
                   f"clipped {n_reg_jump} frames")
+
+    # ── 回歸殘差散布篩選 ───────────────────────────────────────────────────────
+    # 若只有少數比較星局部失真，截距未必大跳，但比較星殘差散布會變寬。
+    # 這裡保留兩種 dispersion 指標：
+    #   reg_residual_rms     : 全體 inlier residual 的 RMS
+    #   reg_abs_resid_p90    : |residual| 的第 90 百分位，對少數壞比較星較敏感
+    n_reg_resid_rms = 0
+    _reg_residual_rms_sigma = float(getattr(cfg, "reg_residual_rms_sigma", 0.0))
+    if _reg_residual_rms_sigma > 0 and "reg_residual_rms" in df.columns:
+        _rr_col = df["reg_residual_rms"].copy()
+        _rr_roll_med = _rr_col.rolling(window=11, center=True, min_periods=3).median()
+        _rr_resid = _rr_col - _rr_roll_med
+        _rr_mad = float(np.nanmedian(_rr_resid[df["ok"] == 1].abs()))
+        _rr_thresh = _reg_residual_rms_sigma * 1.4826 * _rr_mad if _rr_mad > 0 else np.inf
+        _rr_mask = (df["ok"] == 1) & (_rr_resid > _rr_thresh)
+        if _rr_mask.any():
+            df.loc[_rr_mask, "ok"] = 0
+            if "ok_flag" not in df.columns:
+                df["ok_flag"] = ""
+            df.loc[_rr_mask, "ok_flag"] = "reg_resid_rms"
+            n_reg_resid_rms = int(_rr_mask.sum())
+            print(f"[reg_resid_rms] MAD={_rr_mad:.4f}  thresh={_rr_thresh:.4f}  "
+                  f"clipped {n_reg_resid_rms} frames")
+
+    n_reg_resid_p90 = 0
+    _reg_residual_p90_sigma = float(getattr(cfg, "reg_residual_p90_sigma", 0.0))
+    if _reg_residual_p90_sigma > 0 and "reg_abs_resid_p90" in df.columns:
+        _rp_col = df["reg_abs_resid_p90"].copy()
+        _rp_roll_med = _rp_col.rolling(window=11, center=True, min_periods=3).median()
+        _rp_resid = _rp_col - _rp_roll_med
+        _rp_mad = float(np.nanmedian(_rp_resid[df["ok"] == 1].abs()))
+        _rp_thresh = _reg_residual_p90_sigma * 1.4826 * _rp_mad if _rp_mad > 0 else np.inf
+        _rp_mask = (df["ok"] == 1) & (_rp_resid > _rp_thresh)
+        if _rp_mask.any():
+            df.loc[_rp_mask, "ok"] = 0
+            if "ok_flag" not in df.columns:
+                df["ok_flag"] = ""
+            df.loc[_rp_mask, "ok_flag"] = "reg_resid_p90"
+            n_reg_resid_p90 = int(_rp_mask.sum())
+            print(f"[reg_resid_p90] MAD={_rp_mad:.4f}  thresh={_rp_thresh:.4f}  "
+                  f"clipped {n_reg_resid_p90} frames")
 
     # ── 天空背景突升篩選 ──────────────────────────────────────────────────────
     # 起霧或散射光使目標孔徑背景環中位數升高，t_b_sky 突升可做為霧的早期指標。
@@ -2344,7 +2539,8 @@ def run_photometry_on_wcs_dir(
     # 重新計算 _n_phot_fail：排除所有已命名篩選計數
     _n_qual_filtered = (_n_high_fwhm_val + _n_low_sharpness_val
                         + _n_low_peak_ratio_val + _n_low_reg_r2_val
-                        + n_reg_jump + n_high_sky + n_low_peak_ratio_adaptive)
+                        + n_reg_jump + n_reg_resid_rms + n_reg_resid_p90
+                        + n_high_sky + n_low_peak_ratio_adaptive)
     _n_phot_fail   = _n_in_df - _n_ok_final - _n_sigma_clip - _n_qual_filtered
 
     _sep = "-" * 68
@@ -2360,6 +2556,8 @@ def run_photometry_on_wcs_dir(
     print(f"  {'孔徑/WCS/邊界失敗':<24} {_n_phot_fail:>6}    flux/位置無效")
     print(f"  {'sigma_clip':<24} {_n_sigma_clip:>6}    |m_var - median| > 3 * 1.4826 * MAD")
     print(f"  {'回歸截距突變':<24} {n_reg_jump:>6}    rolling median ± {float(getattr(cfg,'reg_intercept_sigma',0.0)):.1f} MAD (0=停用)")
+    print(f"  {'回歸殘差 RMS 突升':<24} {n_reg_resid_rms:>6}    rolling median + {float(getattr(cfg,'reg_residual_rms_sigma',0.0)):.1f} MAD (0=停用)")
+    print(f"  {'回歸殘差 P90 突升':<24} {n_reg_resid_p90:>6}    rolling median + {float(getattr(cfg,'reg_residual_p90_sigma',0.0)):.1f} MAD (0=停用)")
     print(f"  {'天空背景突升':<24} {n_high_sky:>6}    rolling median + {float(getattr(cfg,'sky_sigma',0.0)):.1f} MAD (0=停用)")
     print(f"  {'Peak Ratio 自適應':<24} {n_low_peak_ratio_adaptive:>6}    median - {float(getattr(cfg,'peak_ratio_k',0.0)):.1f} MAD (0=停用)")
     print(_sep)
@@ -2376,6 +2574,8 @@ def run_photometry_on_wcs_dir(
         {"reason": "孔徑/WCS/邊界失敗", "count": _n_phot_fail,           "threshold": "flux/位置無效",                                                     "config_key": "—",                   "config_value": "—"},
         {"reason": "sigma_clip",        "count": _n_sigma_clip,          "threshold": "|m_var - median| > 3 * 1.4826 * MAD",                               "config_key": "—",                   "config_value": "—"},
         {"reason": "回歸截距突變",       "count": n_reg_jump,              "threshold": f"rolling |reg_intercept - med| > {float(getattr(cfg,'reg_intercept_sigma',0.0)):.1f} MAD", "config_key": "reg_intercept_sigma", "config_value": float(getattr(cfg, "reg_intercept_sigma", 0.0))},
+        {"reason": "回歸殘差 RMS 突升",  "count": n_reg_resid_rms,         "threshold": f"rolling (reg_residual_rms - med) > {float(getattr(cfg,'reg_residual_rms_sigma',0.0)):.1f} MAD", "config_key": "reg_residual_rms_sigma", "config_value": float(getattr(cfg, "reg_residual_rms_sigma", 0.0))},
+        {"reason": "回歸殘差 P90 突升",  "count": n_reg_resid_p90,         "threshold": f"rolling (reg_abs_resid_p90 - med) > {float(getattr(cfg,'reg_residual_p90_sigma',0.0)):.1f} MAD", "config_key": "reg_residual_p90_sigma", "config_value": float(getattr(cfg, "reg_residual_p90_sigma", 0.0))},
         {"reason": "天空背景突升",       "count": n_high_sky,                    "threshold": f"rolling (t_b_sky - med) > {float(getattr(cfg,'sky_sigma',0.0)):.1f} MAD",                     "config_key": "sky_sigma",           "config_value": float(getattr(cfg, "sky_sigma", 0.0))},
         {"reason": "Peak Ratio 自適應", "count": n_low_peak_ratio_adaptive,    "threshold": f"peak_ratio < median - {float(getattr(cfg,'peak_ratio_k',0.0)):.1f} * 1.4826 * MAD",           "config_key": "peak_ratio_k",        "config_value": float(getattr(cfg, "peak_ratio_k", 0.0))},
         {"reason": "保留 (ok=1)",       "count": _n_ok_final,                   "threshold": f"/ {_n_total_fits} 幀",                                                                         "config_key": "—",                   "config_value": "—"},
@@ -2386,395 +2586,24 @@ def run_photometry_on_wcs_dir(
     pd.DataFrame(_rej_rows).to_csv(_rej_path, index=False, encoding="utf-8-sig")
     print(f"[剔除統計] saved → {_rej_path}")
 
-    # 第一次寫入（ensemble normalize 後會再寫一次，更新 m_var_norm/delta_ensemble）
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    n_written = len(df)
-    print(f"[CSV] saved → {out_csv}  "
-          f"({n_written} rows written, {_n_after_clip} successful "
-          f"[{_n_before_clip - _n_after_clip} sigma-clipped], "
-          f"{n_skipped} skipped [airmass > {cfg.alt_min_airmass:.3f}])")
-
-    # ── 回歸診斷總覽圖：回歸散佈圖（主）+ RMS 時序（輔）──────────────────────
-    if cfg.save_regression_diagnostic:
-        try:
-            _reg_diag_path = cfg.regression_diag_dir / (
-                f"reg_overview_{out_csv.stem.split('_')[1]}_{out_csv.stem.split('_', 1)[-1]}.png"
-            )
-            _df_ok = df[df["ok"] == 1].copy()
-            import datetime as _dt_reg
-            import matplotlib.ticker as _mticker_reg
-            import matplotlib.gridspec as _mgs
-
-            fig_diag = plt.figure(figsize=(8, 11))
-            gs = _mgs.GridSpec(2, 1, height_ratios=[4, 1], hspace=0.30)
-            ax_sc = fig_diag.add_subplot(gs[0])
-            ax_sc.set_box_aspect(1.0)   # 正方形圖框
-            ax_ts = fig_diag.add_subplot(gs[1])
-
-            # ── 上：第一幀回歸散佈圖（全部比較星，正方形）────────────────────
-            _ffd = _first_frame_diag_data
-            if _ffd is not None:
-                _mc, _mi, _fit = _ffd[:3]
-                _tgt_vmag_diag = _ffd[3] if len(_ffd) > 3 else np.nan
-                _tgt_minst     = _ffd[4] if len(_ffd) > 4 else np.nan
-                _ok_pts = np.isfinite(_mc) & np.isfinite(_mi)
-                ax_sc.scatter(_mc[_ok_pts], _mi[_ok_pts], s=18, alpha=0.6,
-                              color="steelblue", label=f"comp (n={_ok_pts.sum()})")
-                if _fit and np.isfinite(_fit.get("a", np.nan)):
-                    _a, _b, _r2 = _fit["a"], _fit["b"], _fit.get("r2", np.nan)
-                    _xl = np.linspace(_mc[_ok_pts].min(), _mc[_ok_pts].max(), 100)
-                    ax_sc.plot(_xl, _a * _xl + _b, "r-", lw=1.8,
-                               label=f"$m_{{inst}}={_a:.3f}\\,m_{{cat}}+({_b:.3f})$  $R^2={_r2:.3f}$")
-                # 目標星紅圈
-                if _fit and np.isfinite(_tgt_minst):
-                    _a_d, _b_d = _fit["a"], _fit["b"]
-                    if np.isfinite(_a_d) and _a_d != 0:
-                        _tgt_mvar = (_tgt_minst - _b_d) / _a_d
-                        ax_sc.scatter([_tgt_mvar], [_tgt_minst], s=100, marker="o",
-                                      facecolors="none", edgecolors="red", linewidths=2.0,
-                                      zorder=5, label=f"target  $m_{{var}}$={_tgt_mvar:.1f}")
-                # x 軸：左界=比較星+目標星中最亮，右界=comp_mag_max
-                _brightest_comp = float(_mc[_ok_pts].min()) if _ok_pts.any() else float(cfg.comp_mag_min)
-                _x_lo = _brightest_comp
-                if _fit and np.isfinite(_tgt_vmag_diag):
-                    _x_lo = min(_x_lo, float(_tgt_vmag_diag))
-                _x_hi = float(cfg.comp_mag_max)
-                ax_sc.set_xlim(_x_lo - 0.2, _x_hi + 0.1)
-                # 外插區域：回歸線用虛線
-                if _fit and np.isfinite(_fit.get("a", np.nan)) and _ok_pts.any():
-                    _comp_lo = float(_mc[_ok_pts].min())
-                    _comp_hi = float(_mc[_ok_pts].max())
-                    # 亮端外插（比較星最亮 → x 左界）
-                    if _x_lo < _comp_lo - 0.01:
-                        _xl_ext = np.linspace(_x_lo - 0.2, _comp_lo, 50)
-                        ax_sc.plot(_xl_ext, _a * _xl_ext + _b, "r--", lw=1.2, alpha=0.5)
-                    # 暗端外插（比較星最暗 → x 右界）
-                    if _x_hi > _comp_hi + 0.01:
-                        _xl_ext = np.linspace(_comp_hi, _x_hi + 0.1, 50)
-                        ax_sc.plot(_xl_ext, _a * _xl_ext + _b, "r--", lw=1.2, alpha=0.5)
-                # y 軸：緊貼資料 + 目標星 + 回歸線在 x 範圍內的值
-                _all_mi = list(_mi[_ok_pts]) if _ok_pts.any() else []
-                if _fit and np.isfinite(_tgt_minst):
-                    _all_mi.append(float(_tgt_minst))
-                if _fit and np.isfinite(_fit.get("a", np.nan)):
-                    _all_mi.append(float(_fit["a"] * _x_lo + _fit["b"]))
-                    _all_mi.append(float(_fit["a"] * _x_hi + _fit["b"]))
-                if _all_mi:
-                    _mi_lo, _mi_hi = min(_all_mi), max(_all_mi)
-                    _mi_pad = (_mi_hi - _mi_lo) * 0.12
-                    ax_sc.set_ylim(_mi_hi + _mi_pad, _mi_lo - _mi_pad)  # inverted
-                else:
-                    ax_sc.invert_yaxis()
-                ax_sc.set_xlabel(f"$m_{{cat}}$ ({cfg.phot_band})", fontsize=11)
-                ax_sc.set_ylabel("$m_{inst}$", fontsize=11)
-                _extrap_note = ""
-                if _ok_pts.any() and np.isfinite(_tgt_vmag_diag):
-                    if _tgt_vmag_diag < float(_mc[_ok_pts].min()):
-                        _extrap_note = "  [EXTRAPOLATION]"
-                ax_sc.set_title(
-                    f"Regression Fit — Frame 1  ({_x_lo:.1f}–{_x_hi:.1f} mag){_extrap_note}",
-                    fontsize=12,
-                )
-                ax_sc.legend(fontsize=8, frameon=False)
-                ax_sc.grid(True, alpha=0.3)
-            else:
-                ax_sc.text(0.5, 0.5, "No first-frame data",
-                           transform=ax_sc.transAxes, ha="center", va="center")
-
-            # ── 下：RMS 時序圖（參考用）───────────────────────────────────────
-            if "reg_residual_rms" in _df_ok.columns and np.isfinite(_df_ok["reg_residual_rms"]).any():
-                ax_ts.plot(
-                    _df_ok[time_key], _df_ok["reg_residual_rms"],
-                    "o-", ms=2, lw=0.6, color="steelblue", alpha=0.7
-                )
-                ax_ts.axhline(
-                    _df_ok["reg_residual_rms"].median(), color="red",
-                    lw=1, ls="--", label=f"median={_df_ok['reg_residual_rms'].median():.4f}"
-                )
-                ax_ts.set_xlabel(time_key.upper(), fontsize=9)
-                ax_ts.set_ylabel("Residual RMS (mag)", fontsize=9)
-                ax_ts.legend(fontsize=7)
-                ax_ts.grid(True, alpha=0.3)
-                ax_ts.tick_params(labelsize=8)
-                ax_ts.xaxis.set_major_formatter(
-                    _mticker_reg.FuncFormatter(lambda v, _: f"{v:.2f}")
-                )
-            else:
-                ax_ts.text(0.5, 0.5, "No residual data", transform=ax_ts.transAxes,
-                           ha="center", va="center")
-
-            fig_diag.suptitle(
-                f"Regression Diagnostic  |  {cfg.target_name}  "
-                f"channel={channel}  {out_csv.stem}",
-                fontsize=11
-            )
-            fig_diag.savefig(_reg_diag_path, dpi=150, bbox_inches="tight")
-            plt.close(fig_diag)
-            print(f"[reg_diag] saved → {_reg_diag_path}")
-        except Exception as _e:
-            import traceback; traceback.print_exc()
-            print(f"[WARN] regression diagnostic failed: {_e}")
-
-    # ── Rejection timeline 圖 ────────────────────────────────────────────────
-    try:
-        _rej_colors = {
-            "high_airmass":  "#aaaaaa",
-            "high_fwhm":     "#e67e22",
-            "low_sharpness": "#9b59b6",
-            "low_peak_ratio":"#1abc9c",
-            "low_reg_r2":     "#e74c3c",
-            "phot_fail":     "#c0392b",
-            "sigma_clip":    "#2980b9",
-            "reg_jump":       "#f39c12",
-            "high_sky":      "#16a085",
-            "ok":            "#cccccc",
-        }
-        _rej_fig, _rej_ax = plt.subplots(figsize=(12, 3))
-        _df_all = df.copy()
-        _df_all["_flag"] = _df_all["ok_flag"].fillna("ok").where(_df_all["ok"] == 0, "ok")
-        # 用 bjd_tdb 轉本地時間（UTC+8）
-        _tz_h = float(getattr(cfg, "tz_offset_hours", 8))
-        if time_key in _df_all.columns and _df_all[time_key].notna().any():
-            _t_local = (_df_all[time_key] - 2400000.5) * 86400  # MJD → 秒，只取相對值
-            _t0 = _t_local.min()
-            _t_rel = (_t_local - _t0) / 3600  # 相對小時
-        else:
-            _t_rel = pd.Series(range(len(_df_all)), dtype=float)
-        for _flag, _grp in _df_all.groupby("_flag"):
-            _col = _rej_colors.get(_flag, "#888888")
-            _size = 15 if _flag == "ok" else 40
-            _zord = 2 if _flag == "ok" else 3
-            _idx = _df_all.index[_df_all["_flag"] == _flag]
-            _rej_ax.scatter(_t_rel.iloc[_idx], _df_all.loc[_df_all["_flag"] == _flag, "airmass"],
-                            c=_col, s=_size, label=_flag, zorder=_zord, alpha=0.85)
-        _rej_ax.set_xlabel("Elapsed time (hours from first frame)")
-        _rej_ax.set_ylabel("Airmass")
-        _rej_ax.invert_yaxis()
-        _rej_ax.set_title(
-            f"Rejection timeline  |  {cfg.target_name}  ch={cfg.phot_band}  {out_csv.stem}",
-            fontsize=9)
-        _rej_ax.legend(fontsize=7, ncol=5, loc="upper right")
-        _rej_ax.grid(True, alpha=0.25)
-        _rej_fig.tight_layout()
-        _rej_path = out_csv.parent / f"rejection_timeline_{out_csv.stem}.png"
-        _rej_fig.savefig(_rej_path, dpi=150)
-        plt.close(_rej_fig)
-        print(f"[剔除時序圖] saved → {_rej_path}")
-    except Exception as _e:
-        print(f"[WARN] 剔除時序圖輸出失敗：{_e}")
-
-    # ── Plot light curve ──────────────────────────────────────────────────────
-    d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
-    if len(d) == 0:
-        print("[PLOT] No valid photometry points to plot.")
-        df["m_var_norm"] = df["m_var"]
-        df["delta_ensemble"] = np.nan
+    if not _emit_photometry_products(
+        df=df,
+        out_csv=out_csv,
+        out_png=out_png,
+        channel=channel,
+        cfg=cfg,
+        time_key=time_key,
+        check_star=check_star,
+        ap_radius=ap_radius,
+        r_in=r_in,
+        r_out=r_out,
+        n_skipped=n_skipped,
+        n_before_clip=_n_before_clip,
+        n_after_clip=_n_after_clip,
+        ext_k=_ext_k,
+        first_frame_diag_data=_first_frame_diag_data,
+    ):
         return df, {}
-
-    import matplotlib.ticker as mticker
-    # ATime 已在行 2950 附近作為 local 變數使用，不在此重新 import（會遮蔽）
-
-    # 從 csv 檔名取觀測日期
-    _lc_obs_date = str(out_csv.stem).split("_")[-1]
-
-    bjd_arr = d[time_key].values
-    bjd_min = float(bjd_arr.min())
-    bjd_max = float(bjd_arr.max())
-
-    # 本地時間（UTC+8）換算：BJD_TDB ≈ BJD_UTC + 67.2s（微小），近似用 UTC+8
-    _tz_offset_h = float(getattr(cfg, "tz_offset_hours", 8))
-
-    def _bjd_to_local_hm(bjd_val):
-        """BJD → 本地時間 HH:MM（近似，UTC+8）"""
-        try:
-            t_utc = ATime(bjd_val, format="jd", scale="tdb").to_datetime()
-            import datetime as _dt_local
-            t_local = t_utc + _dt_local.timedelta(hours=_tz_offset_h)
-            return t_local
-        except Exception:
-            return None
-
-    # 計算 Local Time 刻度位置（BJD）
-    _t_local_min = _bjd_to_local_hm(bjd_min)
-    _t_local_max = _bjd_to_local_hm(bjd_max)
-
-    _major_bjd_ticks = []   # 整點
-    _label30_bjd_ticks = []  # 整點 + 半點（有數字標示）
-    _label30_labels = []
-    _minor_bjd_ticks = []   # 每 10 分鐘
-    if _t_local_min is not None and _t_local_max is not None:
-        import datetime as _dt_local
-        # 每 10 分鐘刻度，收集整點 / 半點 / 其他
-        _cur = _t_local_min.replace(second=0, microsecond=0)
-        _min_round = (_cur.minute // 10) * 10
-        _cur = _cur.replace(minute=_min_round)
-        while _cur <= _t_local_max + _dt_local.timedelta(minutes=1):
-            _utc = _cur - _dt_local.timedelta(hours=_tz_offset_h)
-            _bjd_tick = ATime(_utc).jd
-            _minor_bjd_ticks.append(_bjd_tick)
-            if _cur.minute == 0:
-                _major_bjd_ticks.append(_bjd_tick)
-            if _cur.minute in (0, 30):
-                _label30_bjd_ticks.append(_bjd_tick)
-                _label30_labels.append(_cur.strftime("%H:%M"))
-            _cur += _dt_local.timedelta(minutes=10)
-
-    _lc_obs_date = str(out_csv.stem).split("_")[-1]
-    # 光變曲線圖移至 ensemble normalize 之後繪製（使用 m_var_norm）
-
-    # ── Check star residuals ──────────────────────────────────────────────────
-    if check_star is not None and "k_minus_c" in df.columns:
-        k = df[(df["ok"] == 1) & np.isfinite(df[time_key])
-               & np.isfinite(df["k_minus_c"])].copy()
-        if len(k) > 1:
-            _t0_check = float(k[time_key].min())
-            k["t_rel_d"] = k[time_key] - _t0_check
-            sigma_k = float(np.nanstd(k["k_minus_c"]))
-            flag    = " [!] EXCEEDS THRESHOLD" if sigma_k > cfg.check_star_max_sigma else ""
-            print(f"[CHECK] K-C sigma = {sigma_k:.5f} mag "
-                  f"(threshold = {cfg.check_star_max_sigma}){flag}")
-            fig2, ax2 = plt.subplots(figsize=(10, 3))
-            ax2.plot(k["t_rel_d"], k["k_minus_c"], "o-", ms=4, lw=0.8)
-            ax2.xaxis.set_major_formatter(plt.FuncFormatter(
-                lambda x, _: f"{int(x)}d {int((x % 1)*24)}h {int(((x % 1)*24 % 1)*60)}m"
-            ))
-            ax2.invert_yaxis()
-            ax2.set_xlabel("t_rel (days)")
-            ax2.set_ylabel("K - C  (mag)")
-            ax2.set_title("Check Star Validation")
-            ax2.grid(True, alpha=0.4)
-            fig2.tight_layout()
-            plt.close("all")
-
-    # ── ⏸ 待決定：Broeg (2005) ensemble 正規化 ─────────────────────────────────
-    # 理由：逐幀自由斜率回歸已消除逐幀大氣，ensemble 重複修正可能引入雜訊。
-    # 待驗：移除後 R² 是否有變化（預期無）。
-    # 原本邏輯：_ensemble_on=True 時迭代算 Δ(t)，然後 m_var_norm = m_var - Δ(t)。
-    # 簡化版本：關閉 ensemble，m_var_norm 直接 = m_var（回歸後的校正星等）。
-    """
-    # ── 原始 ensemble 迴圈（已停用，整塊保留作參考）────────────────────────────────
-    comp_lightcurves: "dict[str, pd.Series]" = {}
-    if _ensemble_on:
-        # _comp_lc_buf → pd.Series，index = time 值
-        for _sid, _tdict in _comp_lc_buf.items():
-            if len(_tdict) >= 2:   # 至少 2 幀才有意義
-                comp_lightcurves[_sid] = pd.Series(_tdict, dtype=float)
-
-        _n_comp_lc = len(comp_lightcurves)
-        print(f"[ensemble] 比較星光變曲線：{_n_comp_lc} 顆")
-
-        if _n_comp_lc >= _ensemble_min_comp:
-            df, _delta_series = ensemble_normalize(
-                df,
-                comp_lightcurves=comp_lightcurves,
-                initial_weights=_comp_init_weights,
-                time_key=time_key,
-                min_comp_stars=_ensemble_min_comp,
-                max_iter=_ensemble_max_iter,
-                convergence_tol=_ensemble_tol,
-            )
-            # ── CSV 更新（已含 m_var_norm、delta_ensemble）────────────────────
-            df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-            print(f"[CSV] ensemble 正規化後重新寫入 → {out_csv}")
-        else:
-            _phot_logger.warning(
-                "[ensemble] 比較星光變曲線數量 %d < min_comp_stars %d，"
-                "跳過 ensemble 正規化。",
-                _n_comp_lc, _ensemble_min_comp,
-            )
-            df["m_var_norm"] = df["m_var"]
-            df["delta_ensemble"] = np.nan
-    else:
-        # ensemble 停用：m_var_norm 直通 m_var
-        df["m_var_norm"] = df["m_var"]
-        df["delta_ensemble"] = np.nan
-    """
-    # ── 簡化版本：直接用回歸結果 ────────────────────────────────────────────────
-    df["m_var_norm"] = df["m_var"]        # 直通回歸的 m_var，不加 ensemble 修正
-    df["delta_ensemble"] = np.nan         # 預留欄位，暫不計算
-
-    # ── 光變曲線圖（ensemble 之後重畫，使用 m_var_norm）──────────────────────
-    plot_light_curve(df, out_png, channel, cfg, obs_date=_lc_obs_date)
-
-    # ── 單通道摘要報告 ──────────────────────────────────────────────────────────
-    try:
-        _ok_df = df[df["ok"] == 1]
-        _n_ok = len(_ok_df)
-        _n_total = len(df)
-        _summary_lines = [
-            f"=== VarStar Photometry Summary ===",
-            f"Target    : {cfg.target_name}",
-            f"Channel   : {channel}",
-            f"Date      : {out_csv.stem.split('_')[-1]}",
-            f"Frames    : {_n_ok}/{_n_total} ok  "
-            f"({n_skipped} airmass-cut, "
-            f"{_n_before_clip - _n_after_clip} sigma-clipped)",
-            f"Aperture  : {ap_radius:.1f} px  "
-            f"(annulus {r_in:.1f}–{r_out:.1f})",
-        ]
-        _summary_lines.append(
-            f"GrowthFr  : {getattr(cfg, 'aperture_growth_fraction', float('nan')):.3f}"
-        )
-        if _n_ok > 0:
-            _mvar = _ok_df["m_var_norm"] if "m_var_norm" in _ok_df.columns else _ok_df["m_var"]
-            _mvar_ok = _mvar[np.isfinite(_mvar)]
-            if len(_mvar_ok) > 0:
-                _summary_lines.append(
-                    f"Mag range : {_mvar_ok.min():.3f} – {_mvar_ok.max():.3f}  "
-                    f"(median {_mvar_ok.median():.3f}, std {_mvar_ok.std():.4f})"
-                )
-            if "reg_r2" in _ok_df.columns:
-                _r2_ok = _ok_df["reg_r2"][np.isfinite(_ok_df["reg_r2"])]
-                if len(_r2_ok) > 0:
-                    _summary_lines.append(
-                        f"Reg R²    : median {_r2_ok.median():.4f}  "
-                        f"min {_r2_ok.min():.4f}  max {_r2_ok.max():.4f}"
-                    )
-            if "airmass" in _ok_df.columns:
-                _am_ok = _ok_df["airmass"][np.isfinite(_ok_df["airmass"])]
-                if len(_am_ok) > 0:
-                    _summary_lines.append(
-                        f"Airmass   : {_am_ok.min():.3f} – {_am_ok.max():.3f}"
-                    )
-            if "t_snr" in _ok_df.columns:
-                _snr_ok = _ok_df["t_snr"][np.isfinite(_ok_df["t_snr"])]
-                if len(_snr_ok) > 0:
-                    _summary_lines.append(
-                        f"SNR       : median {_snr_ok.median():.1f}  "
-                        f"min {_snr_ok.min():.1f}"
-                    )
-            if "comp_used" in _ok_df.columns:
-                _comp_ok = _ok_df["comp_used"][np.isfinite(_ok_df["comp_used"])]
-                if len(_comp_ok) > 0:
-                    _summary_lines.append(
-                        f"Comp stars: median {_comp_ok.median():.0f}  "
-                        f"min {_comp_ok.min():.0f}"
-                    )
-            if _ext_k > 0:
-                _summary_lines.append(
-                    f"Extinction: k={_ext_k:.3f} mag/airmass applied"
-                )
-            _baseline_hr = 0.0
-            if time_key in _ok_df.columns:
-                _t_ok = _ok_df[time_key][np.isfinite(_ok_df[time_key])]
-                if len(_t_ok) > 1:
-                    _baseline_hr = (_t_ok.max() - _t_ok.min()) * 24
-                    _summary_lines.append(
-                        f"Baseline  : {_baseline_hr:.2f} hr"
-                    )
-        _summary_lines.append(f"Output    : {out_csv}")
-        _summary_lines.append("")
-
-        _summary_text = "\n".join(_summary_lines)
-        _summary_path = out_csv.parent / f"summary_{out_csv.stem}.txt"
-        _summary_path.write_text(_summary_text, encoding="utf-8")
-        print(f"[摘要] saved → {_summary_path}")
-        for _sl in _summary_lines:
-            if _sl:
-                print(f"  {_sl}")
-    except Exception as _e_summary:
-        print(f"[WARN] 摘要報告輸出失敗：{_e_summary}")
 
     return df, {}  # comp_lightcurves 已隨 ensemble 停用，回傳空 dict
 
@@ -2783,8 +2612,27 @@ def run_photometry_on_wcs_dir(
 # 原內建 LS + Fourier 程式碼已保留於 photometry_ls_legacy.py，供手動使用。
 # 移出日期：2026-03-21
 
-# ── 執行 ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+
+def _resolve_channels(args, yaml_cfg) -> "list[str]":
+    if args.channels:
+        channels = [str(ch).upper() for ch in args.channels]
+        if "G1" in channels and "G2" not in channels:
+            _g1_idx = channels.index("G1")
+            channels.insert(_g1_idx + 1, "G2")
+    else:
+        _ch_raw = yaml_cfg.get("photometry", {}).get(
+            "channels", yaml_cfg.get("photometry", {}).get("channel", ["B"])
+        )
+        if isinstance(_ch_raw, str):
+            _ch_raw = [_ch_raw]
+        channels = [str(ch).upper() for ch in _ch_raw]
+        if "G1" in channels and "G2" not in channels:
+            _g1_idx = channels.index("G1")
+            channels.insert(_g1_idx + 1, "G2")
+    return channels
+
+
+def _parse_cli_args(argv=None):
     import argparse
 
     _parser = argparse.ArgumentParser(description="差分測光管線 — 步驟 4")
@@ -2804,20 +2652,21 @@ if __name__ == "__main__":
                          help="跳過 VSX 額外目標星測光，只跑主目標")
     _parser.add_argument("--raw", action="store_true",
                          help="使用 raw 未校正影像（splits_raw/）")
-    _args = _parser.parse_args()
+    _args = _parser.parse_args(argv)
     if _args.raw:
         _args.split_subdir = "splits_raw"
         if not _args.out_tag:
             _args.out_tag = "raw"
+    return _args
 
-    # ── Logger 初始化 ──────────────────────────────────────────────────────────
-    _log_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if _args.out_tag:
-        _log_ts = f"{_log_ts}_{_args.out_tag}"
-    _logger   = logging.getLogger("photometry")
+
+def _init_summary_logger(args):
+    _log_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.out_tag:
+        _log_ts = f"{_log_ts}_{args.out_tag}"
+    _logger = logging.getLogger("photometry")
     _logger.setLevel(logging.DEBUG)
-    # Console：只印重要摘要訊息
-    _con_hdl  = logging.StreamHandler(sys.stdout)
+    _con_hdl = logging.StreamHandler(sys.stdout)
     _con_hdl.setLevel(logging.INFO)
     _KEEP_PREFIXES = (
         "[sigma-clip]", "[CSV]", "[完成]", "[LS]", "[Fourier]",
@@ -2825,6 +2674,7 @@ if __name__ == "__main__":
         "======", "  通道", "  FITS", "  輸出", "所有通道",
         "[photometry]", "找到",
     )
+
     class _SummaryFilter(logging.Filter):
         def filter(self, record):
             msg = record.getMessage()
@@ -2832,57 +2682,920 @@ if __name__ == "__main__":
                 record.levelno >= logging.ERROR
                 or any(msg.startswith(p) for p in _KEEP_PREFIXES)
             )
+
     _con_hdl.addFilter(_SummaryFilter())
     _con_hdl.setFormatter(logging.Formatter("%(message)s"))
     _logger.addHandler(_con_hdl)
-    # FITSFixedWarning → logger DEBUG（只進 log 檔）
     warnings.showwarning = lambda msg, cat, fn, ln, f=None, li=None: \
         _logger.debug("[astropy] %s", str(msg))
-    # log 檔 handler 在取得 out_dir 後才加入（下方）
+    return _logger, _log_ts
 
-    _yaml = load_pipeline_config()
 
-    # ── 通道清單（所有目標共用）──────────────────────────────────────────────
-    if _args.channels:
-        CHANNELS = [str(ch).upper() for ch in _args.channels]
-        if "G1" in CHANNELS and "G2" not in CHANNELS:
-            _g1_idx = CHANNELS.index("G1")
-            CHANNELS.insert(_g1_idx + 1, "G2")
-    else:
-        _ch_raw = _yaml.get("photometry", {}).get(
-            "channels", _yaml.get("photometry", {}).get("channel", ["B"])
-        )
-        if isinstance(_ch_raw, str):
-            _ch_raw = [_ch_raw]
-        CHANNELS = [str(ch).upper() for ch in _ch_raw]
-        # G2 自動補入（G1 存在但 G2 未列時）
-        if "G1" in CHANNELS and "G2" not in CHANNELS:
-            _g1_idx = CHANNELS.index("G1")
-            CHANNELS.insert(_g1_idx + 1, "G2")
+def _load_pipeline_yaml():
+    return load_pipeline_config()
 
-    # ── 建立要處理的 (target, date) 列表 ─────────────────────────────────────
-    if _args.all:
-        _targets_list = [
+
+def _build_targets_list(args, yaml_cfg) -> "list[tuple[str, str]]":
+    if args.all:
+        return [
             (str(_t), str(_sess["date"]))
-            for _sess in _yaml.get("obs_sessions", [])
+            for _sess in yaml_cfg.get("obs_sessions", [])
             for _t in _sess.get("targets", [])
         ]
-    elif _args.target is None and _args.date is not None:
-        # 只指定日期：跑該場次所有目標
+    if args.target is None and args.date is not None:
         _targets_list = []
-        for _sess in _yaml.get("obs_sessions", []):
-            if str(_sess["date"]) == str(_args.date):
+        for _sess in yaml_cfg.get("obs_sessions", []):
+            if str(_sess["date"]) == str(args.date):
                 for _t in _sess.get("targets", []):
-                    _targets_list.append((str(_t), str(_args.date)))
+                    _targets_list.append((str(_t), str(args.date)))
         if not _targets_list:
-            print(f"[WARN] yaml 中找不到日期 {_args.date} 的場次，試圖直接推測單一目標")
-            _targets_list = [("V1162Ori", _args.date)]
-    elif _args.target is None and _args.date is None:
-        # 全空：預設
-        _targets_list = [("V1162Ori", "20251220")]
+            print(f"[WARN] yaml 中找不到日期 {args.date} 的場次，試圖直接推測單一目標")
+            _targets_list = [("V1162Ori", args.date)]
+        return _targets_list
+    if args.target is None and args.date is None:
+        return [("V1162Ori", "20251220")]
+    return [(args.target or "V1162Ori", args.date or "20251220")]
+
+
+def _compute_field_key(yaml_cfg, target, date, ch0, split_subdir):
+    try:
+        _cfg_tmp = cfg_from_yaml(
+            yaml_cfg, target, date, channel=ch0, split_subdir=split_subdir
+        )
+        _ff = sorted(_cfg_tmp.wcs_dir.glob(f"*_{ch0}.fits"))
+        return tuple(f.name for f in _ff[:3]) if _ff else None
+    except Exception:
+        return None
+
+
+def _build_shared_field_caches(yaml_cfg, targets_list, ch0, split_subdir):
+    from collections import defaultdict as _defaultdict
+
+    _field_groups: "dict[tuple, list]" = _defaultdict(list)
+    for _tgt, _dt in targets_list:
+        _fk = _compute_field_key(yaml_cfg, _tgt, _dt, ch0, split_subdir)
+        if _fk:
+            _field_groups[_fk].append((_tgt, _dt))
+    _field_caches: "dict[tuple, _FrameCompCache]" = {
+        _fk: _FrameCompCache()
+        for _fk, _grp in _field_groups.items()
+        if len(_grp) > 1
+    }
+    return _field_groups, _field_caches
+
+
+def _prepare_target_aperture_state(logger, cfg, wcs_files, active_target):
+    _catalog_started = time.perf_counter()
+    _emit_progress(logger, f"catalog preload start target={active_target}")
+    _field_cat_dir_pre = cfg.out_dir.parent.parent.parent / "catalogs"
+    _field_cat_path_pre = _field_cat_dir_pre / "field_catalog_unified.csv"
+    if not _field_cat_path_pre.exists():
+        print(f"[catalog] 預建統一視場星表...")
+        _load_or_build_unified_catalog(
+            cfg, cfg.target_radec_deg[0], cfg.target_radec_deg[1], _field_cat_dir_pre,
+        )
+
+    _emit_progress_done(logger, f"catalog preload target={active_target}", _catalog_started)
+
+    try:
+        (_comp_ap, comp_df_matched, check_star,
+         aavso_matched, apass_matched, active_source,
+         _vsx_field) = auto_select_comps(
+            wcs_files[0], cfg.target_radec_deg, cfg_obj=cfg, band="V"
+        )
+    except RuntimeError as _e:
+        logger.warning(f"[SKIP] {active_target} aperture preselect failed: {_e}")
+        print(f"[SKIP] {active_target} 孔徑估算比較星選取失敗，跳過此目標：{_e}")
+        return None
+    print(f"check_star：{check_star}")
+
+    logger.info(f"[check_star] {check_star}")
+    ap_r = None
+    if cfg.aperture_auto:
+        _aperture_started = time.perf_counter()
+        _emit_progress(logger, f"aperture estimate start target={active_target}")
+        logger.info(
+            f"[aperture_auto] growth_fraction={cfg.aperture_growth_fraction:.3f} "
+            f"r_min={cfg.aperture_min_radius} r_max={cfg.aperture_max_radius}"
+        )
+        ap_r = estimate_aperture_radius(
+            wcs_files[0], comp_df_matched,   # comp_df_matched from V-band initial selection
+            cfg.aperture_min_radius, cfg.aperture_max_radius,
+            cfg.aperture_growth_fraction,
+            cfg_obj=cfg,
+            max_stars=(
+                max(10, min(30, len(comp_df_matched)))
+                if comp_df_matched is not None else 20
+            ),
+        )
+        if ap_r is not None:
+            logger.info(
+                f"[aperture_auto] selected_radius={ap_r:.2f} "
+                f"growth_fraction={cfg.aperture_growth_fraction:.3f}"
+            )
+            cfg.aperture_radius = ap_r
+            print(
+                f"[生長曲線] 自動孔徑半徑 = {cfg.aperture_radius:.2f} px"
+                "（所有通道共用）"
+            )
+
+    if cfg.aperture_auto:
+        _emit_progress_done(logger, f"aperture estimate target={active_target}", _aperture_started)
+
+    if cfg.aperture_auto and ap_r is None:
+        logger.warning(
+            f"[aperture_auto] estimate failed; keep fixed aperture={cfg.aperture_radius:.2f} "
+            f"growth_fraction={cfg.aperture_growth_fraction:.3f}"
+        )
+
+    ap_r_in, ap_r_out = compute_annulus_radii(
+        cfg.aperture_radius, cfg.annulus_r_in, cfg.annulus_r_out
+    )
+    print(f"孔徑 r={cfg.aperture_radius:.2f}  r_in={ap_r_in:.2f}  r_out={ap_r_out:.2f}")
+    logger.info(
+        f"[aperture] radius={cfg.aperture_radius:.2f} r_in={ap_r_in:.2f} "
+        f"r_out={ap_r_out:.2f} growth_fraction={cfg.aperture_growth_fraction:.3f}"
+    )
+    _shared_aperture_radius = cfg.aperture_radius
+    return _shared_aperture_radius, check_star, _vsx_field, ap_r_in, ap_r_out
+
+
+def _open_target_run(logger, yaml_cfg, args, log_ts, active_target, active_date, channels):
+    for _h in list(logger.handlers):
+        if isinstance(_h, logging.FileHandler):
+            _h.close()
+            logger.removeHandler(_h)
+
+    try:
+        cfg = cfg_from_yaml(
+            yaml_cfg, active_target, active_date, channel=channels[0],
+            split_subdir=args.split_subdir, out_tag=args.out_tag, run_ts=log_ts
+        )
+    except Exception as _e_cfg:
+        logger.warning(f"[SKIP] {active_target}/{active_date} cfg error: {_e_cfg}")
+        print(f"[SKIP] {active_target}/{active_date} cfg 錯誤：{_e_cfg}")
+        return None
+
+    _log_path = cfg.run_root / "1_photometry" / f"photometry_{active_date}_{log_ts}.log"
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    _file_hdl = logging.FileHandler(_log_path, encoding="utf-8")
+    _file_hdl.setLevel(logging.DEBUG)
+    _file_hdl.setFormatter(
+        logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logger.addHandler(_file_hdl)
+    logger.info(f"[LOG] {_log_path}")
+    print(f"[LOG] {_log_path}")
+    logger.info(
+        f"[runtime] target={active_target} date={active_date} "
+        f"aperture_growth_fraction={cfg.aperture_growth_fraction:.3f}"
+    )
+
+    _ch0 = channels[0]
+    wcs_files = sorted(cfg.wcs_dir.glob(f"*_{_ch0}.fits"))
+    if not wcs_files:
+        logger.warning(f"[SKIP] no split FITS for channel={_ch0} dir={cfg.wcs_dir}")
+        print(f"[SKIP] 找不到 split/{_ch0} FITS：{cfg.wcs_dir}，跳過此目標")
+        return None
+    print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
+
+    return cfg, wcs_files, _file_hdl
+
+
+def _prepare_target_run_state(logger, yaml_cfg, args, log_ts, active_target, active_date, channels):
+    logger.info(f"[target] start target={active_target} date={active_date} channels={channels}")
+    _target_started = time.perf_counter()
+    _emit_progress(logger, f"main target start target={active_target} date={active_date}")
+    print(f"\n{'#'*60}")
+    print(f"# 目標：{active_target}  日期：{active_date}  通道：{channels}")
+    print(f"{'#'*60}")
+
+    _target_boot = _open_target_run(
+        logger, yaml_cfg, args, log_ts, active_target, active_date, channels
+    )
+    if _target_boot is None:
+        return None
+    cfg, wcs_files, _file_hdl = _target_boot
+
+    _prep_state = _prepare_target_aperture_state(logger, cfg, wcs_files, active_target)
+    if _prep_state is None:
+        return None
+    _shared_aperture_radius, check_star, _vsx_field, ap_r_in, ap_r_out = _prep_state
+    _emit_progress_done(logger, f"main target setup target={active_target}", _target_started)
+    return cfg, _shared_aperture_radius, check_star, _vsx_field, ap_r_in, ap_r_out
+
+
+def _build_channel_cfg(
+    yaml_cfg, args, log_ts, active_target, active_date,
+    channel, base_cfg, shared_aperture_radius,
+):
+    cfg_ch = cfg_from_yaml(
+        yaml_cfg, active_target, active_date, channel=channel,
+        split_subdir=args.split_subdir, out_tag=args.out_tag,
+        run_ts=log_ts,
+    )
+    cfg_ch.aperture_radius = shared_aperture_radius
+    # gain/read_noise：cfg_ch 從 sensor_db 讀取；若為 None 才從首通道 fallback
+    if cfg_ch.gain_e_per_adu is None and base_cfg.gain_e_per_adu is not None:
+        cfg_ch.gain_e_per_adu = base_cfg.gain_e_per_adu
+    if cfg_ch.read_noise_e is None and base_cfg.read_noise_e is not None:
+        cfg_ch.read_noise_e = base_cfg.read_noise_e
+    return cfg_ch
+
+
+def _select_channel_comps(logger, channel, fits_files, cfg_ch):
+    # ── 比較星 m_cat 波段重映射（每通道用正確星表）──
+    _band_map_ch = {"R": "R", "G1": "V", "G2": "V", "B": "B"}
+    _band_ch = _band_map_ch.get(str(channel).upper(), "V")
+    try:
+        (_comp_refs_ch, _comp_df_ch, _check_star_ch,
+         _aavso_ch, _apass_ch, _active_source_ch,
+         _vsx_ch) = auto_select_comps(
+            fits_files[0], cfg_ch.target_radec_deg, cfg_obj=cfg_ch, band=_band_ch
+        )
+        logger.info(f"[comp] channel={channel} source={_active_source_ch} n={len(_comp_refs_ch)}")
+        print(f"  [comp] {channel} source={_active_source_ch} n={len(_comp_refs_ch)}")
+        return _comp_refs_ch, _check_star_ch
+    except RuntimeError as _e_comp_ch:
+        logger.warning(f"[SKIP] channel={channel} comp selection failed: {_e_comp_ch}")
+        print(f"  [SKIP] {channel} 比較星讀取失敗：{_e_comp_ch}")
+        return None
+
+
+def _run_r_gaia_sidecar(cfg_ch):
+    # R 通道：額外跑 Gaia RP→Rc 輸出獨立 R_GAIA 結果
+    try:
+        print(f"\n[R_GAIA] 對 R 通道額外執行 Gaia RP→Rc 測光")
+        _gaia_r_raw = fetch_gaia_dr3_cone(
+            cfg_ch.target_radec_deg[0], cfg_ch.target_radec_deg[1],
+            radius_arcmin=cfg_ch.apass_radius_deg * 60.0,
+            mag_min=cfg_ch.comp_mag_min, mag_max=cfg_ch.comp_mag_max,
+            channel="R",
+        )
+        if len(_gaia_r_raw) >= cfg_ch.ensemble_min_comp:
+            if hasattr(cfg_ch, "out_dir"):
+                _cat_dir_r = cfg_ch.run_root / "1_photometry" / "catalogs"
+                _cat_dir_r.mkdir(parents=True, exist_ok=True)
+                _gaia_r_raw.to_csv(_cat_dir_r / "catalog_GaiaDR3_Rc.csv", index=False)
+                print(f"  [R_GAIA] 星表已儲存 ({len(_gaia_r_raw)} 筆)")
+        else:
+            print(f"  [R_GAIA] Gaia RP→Rc 有效星不足，跳過")
+    except Exception as _e_gaia_r:
+        print(f"  [WARN] R_GAIA 失敗：{_e_gaia_r}")
+
+
+def _prepare_channel_fits_inputs(logger, channel, cfg_ch):
+    _split_dir = cfg_ch.wcs_dir
+    _fits_ch = sorted(_split_dir.glob(f"*_{channel}.fits"))
+    if not _fits_ch:
+        logger.warning(f"[SKIP] channel={channel} no split FITS in dir={_split_dir}")
+        print(f"  [SKIP] split/{channel}/ 找不到 FITS，跳過此通道")
+        return _split_dir, None
+    print(f"  FITS 張數：{len(_fits_ch)}")
+    print(f"  輸出 CSV ：{cfg_ch.phot_out_csv}")
+    return _split_dir, _fits_ch
+
+
+def _run_channel_photometry(
+    logger, channel, split_dir, cfg_ch, comp_refs_ch, check_star_ch, active_cache,
+):
+    # 同視野多目標：傳入共用比較星快取
+    df_ch, _comp_lc_ch = run_photometry_on_wcs_dir(
+        split_dir,
+        cfg_ch.phot_out_csv,
+        cfg_ch.phot_out_png,
+        comp_refs=comp_refs_ch,
+        check_star=check_star_ch,
+        ap_radius=cfg_ch.aperture_radius,
+        channel=channel,
+        shared_cache=active_cache,
+    )
+    if active_cache:
+        print(f"  [快取] 比較星快取 {len(active_cache)} 筆")
+    _ok_cnt = int(df_ch['ok'].sum()) if 'ok' in df_ch.columns else 0
+    logger.info(f"[channel] done channel={channel} ok={_ok_cnt}/{len(df_ch)}")
+    print(f"  [完成] {channel}：ok={_ok_cnt} / {len(df_ch)} 幀")
+    return df_ch
+
+
+def _run_single_channel(
+    logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
+    base_cfg, shared_aperture_radius, channel, active_cache,
+):
+    logger.info(f"[channel] start channel={channel} shared_aperture={shared_aperture_radius:.2f}")
+    _channel_started = time.perf_counter()
+    _emit_progress(logger, f"channel start target={active_target} channel={channel}")
+    print(f"\n{'='*55}")
+    print(f"  通道 {channel}  ({channels.index(channel) + 1}/{len(channels)})")
+    print(f"{'='*55}")
+
+    cfg_ch = _build_channel_cfg(
+        yaml_cfg, args, log_ts, active_target, active_date,
+        channel, base_cfg, shared_aperture_radius,
+    )
+    _split_dir, _fits_ch = _prepare_channel_fits_inputs(logger, channel, cfg_ch)
+    if _fits_ch is None:
+        return cfg_ch.run_root, _split_dir, None
+
+    _comp_pick = _select_channel_comps(logger, channel, _fits_ch, cfg_ch)
+    if _comp_pick is None:
+        return cfg_ch.run_root, _split_dir, None
+    _comp_refs_ch, _check_star_ch = _comp_pick
+
+    df_ch = _run_channel_photometry(
+        logger, channel, _split_dir, cfg_ch,
+        _comp_refs_ch, _check_star_ch, active_cache,
+    )
+    _emit_progress_done(logger, f"channel target={active_target} channel={channel}", _channel_started)
+    if str(channel).upper() == "R":
+        _run_r_gaia_sidecar(cfg_ch)
+    return cfg_ch.run_root, _split_dir, (df_ch, _comp_refs_ch, _check_star_ch)
+
+
+def _resolve_active_field_cache(
+    yaml_cfg, active_target, active_date, channels, split_subdir, field_caches,
+):
+    _active_field_key = _compute_field_key(
+        yaml_cfg, active_target, active_date, channels[0], split_subdir
+    )
+    return field_caches.get(_active_field_key) if _active_field_key else None
+
+
+def _run_channel_loop(
+    logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
+    cfg, shared_aperture_radius, active_cache,
+):
+    channel_results: dict = {}
+    _comp_refs_per_ch: dict = {}
+    _check_star_per_ch: dict = {}
+    _split_dir_per_ch: dict = {}
+    _stage4_run_root = None
+
+    for _ch in channels:
+        _run_root_ch, _split_dir, _single_result = _run_single_channel(
+            logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
+            cfg, shared_aperture_radius, _ch, active_cache,
+        )
+        _stage4_run_root = _run_root_ch
+        _split_dir_per_ch[_ch] = _split_dir
+        if _single_result is None:
+            continue
+        df_ch, _comp_refs_ch, _check_star_ch = _single_result
+        _comp_refs_per_ch[_ch] = _comp_refs_ch
+        _check_star_per_ch[_ch] = _check_star_ch
+        channel_results[_ch] = df_ch
+
+    return (
+        channel_results, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
+        _stage4_run_root,
+    )
+
+
+def _run_channels_for_target(
+    logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
+    cfg, shared_aperture_radius, field_caches,
+):
+    _active_cache = _resolve_active_field_cache(
+        yaml_cfg, active_target, active_date, channels, args.split_subdir, field_caches,
+    )
+    (
+        channel_results, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
+        _stage4_run_root,
+    ) = _run_channel_loop(
+        logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
+        cfg, shared_aperture_radius, _active_cache,
+    )
+
+    print(f"\n所有通道完成：{list(channel_results.keys())}")
+    return (
+        channel_results, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
+        _active_cache, _stage4_run_root
+    )
+
+
+def _stage4_replot_shared_g1g2_ylim(cfg, active_date, channel_results):
+    # ── G1/G2 共享 Y 軸重繪 ───────────────────────────────────────────
+    _shared_chs = [c for c in ("G1", "G2") if c in channel_results]
+    if len(_shared_chs) == 2:
+        _all_ok_mag = []
+        for _sc in _shared_chs:
+            _sdf = channel_results[_sc]
+            _sdf_ok = _sdf[(_sdf["ok"] == 1) & np.isfinite(_sdf["m_var"])]
+            _all_ok_mag.extend(_sdf_ok["m_var"].tolist())
+        if _all_ok_mag:
+            _margin = 0.02
+            _ymin = min(_all_ok_mag) - _margin   # 亮端（小數值）
+            _ymax = max(_all_ok_mag) + _margin   # 暗端（大數值）
+            _shared_ylim = (_ymax, _ymin)         # invert: 大值在下(bottom)
+            for _sc in _shared_chs:
+                # 直接寫回原 run_root，不重建 cfg（避免產生新時間戳目錄）
+                _sc_png = cfg.run_root / "3_light_curve" / f"light_curve_{_sc}_{active_date}.png"
+                plot_light_curve(channel_results[_sc], _sc_png, _sc,
+                                cfg, obs_date=active_date, ylim=_shared_ylim)
+            print(f"[PLOT] G1/G2 Y 軸已鎖定：{_ymin:.3f} – {_ymax:.3f} mag")
+
+
+def _stage4_run_period_analysis(active_target, channel_results, stage4_run_root):
+    # ── 週期分析（統一使用 period_analysis.py）─────────────────────────
+    from period_analysis import run_period_analysis
+
+    _pa_any = False
+    for _ls_ch, _ls_df in channel_results.items():
+        if _ls_df is None:
+            continue
+        _n_ok = int(_ls_df["ok"].sum())
+        if _n_ok < 10:
+            print(f"[LS] {_ls_ch} 有效幀數 {_n_ok} < 10，跳過")
+            continue
+        print(f"\n[LS] 通道 {_ls_ch}（有效幀數：{_n_ok}）")
+        try:
+            _pa_dir = stage4_run_root / "4_period_analysis"
+            # 準備 DataFrame 欄位名稱對應（period_analysis 期望 ok, bjd_tdb, m_var/m_var_norm, v_err）
+            _pa_df = _ls_df.copy()
+            if "v_err" not in _pa_df.columns and "t_sigma_mag" in _pa_df.columns:
+                _pa_df["v_err"] = _pa_df["t_sigma_mag"]
+            _pa_result = run_period_analysis(
+                _pa_df,
+                target_name=active_target,
+                channel=_ls_ch,
+                out_dir=_pa_dir,
+            )
+            if _pa_result:
+                _pa_any = True
+                _ls_r = _pa_result.get("ls_result", {})
+                _bp = _ls_r.get("best_period", np.nan)
+                _fap = _ls_r.get("fap", np.nan)
+                if np.isfinite(_bp):
+                    print(f"[LS] Best period = {_bp:.6f} d  ({_bp * 24:.4f} h)")
+                    print(f"[LS] FAP         = {_fap:.2e}")
+                else:
+                    print(f"[LS] {_ls_ch} 週期分析無有效結果（keys: {list(_pa_result.keys())}）")
+                _fit_r = _pa_result.get("fit_result", {})
+                if _fit_r:
+                    _amp = _fit_r.get("amplitude", np.nan)
+                    print(f"[Fourier] Amplitude = {_amp:.4f} mag")
+                elif _ls_r:
+                    print(f"[Fourier] 擬合失敗或跳過")
+            else:
+                print(f"[LS] {_ls_ch} run_period_analysis 回傳空結果")
+        except Exception as _e_ls:
+            print(f"[LS] {_ls_ch} 失敗：{_e_ls}")
+
+    if not _pa_any:
+        print("[LS] 跳過（所有通道有效幀數 < 10 或分析失敗）")
+
+
+def _stage4_run_g1g2_ratio_products(cfg, active_target, active_date, channel_results, stage4_run_root):
+    # ── G1/G2 比值光變曲線 ────────────────────────────────────────────────
+    from period_analysis import run_period_analysis
+
+    _dg1 = channel_results.get("G1")
+    _dg2 = channel_results.get("G2")
+    if _dg1 is not None and _dg2 is not None:
+        _need_cols = ["bjd_tdb", "t_flux_net", "m_var", "ok"]
+        _g1_ok = all(_c in _dg1.columns for _c in _need_cols)
+        _g2_ok = all(_c in _dg2.columns for _c in _need_cols)
+        if _g1_ok and _g2_ok:
+            _mg = pd.merge(
+                _dg1[_need_cols].rename(columns={
+                    "t_flux_net": "flux_G1", "m_var": "m_G1", "ok": "ok_G1"
+                }),
+                _dg2[_need_cols].rename(columns={
+                    "t_flux_net": "flux_G2", "m_var": "m_G2", "ok": "ok_G2"
+                }),
+                on="bjd_tdb", how="inner",
+            )
+            _mg = _mg[(_mg["ok_G1"] == 1) & (_mg["ok_G2"] == 1)].copy()
+            if len(_mg) >= 3:
+                _mg["flux_ratio_G1G2"] = (
+                    _mg["flux_G1"] / _mg["flux_G2"].replace(0, np.nan)
+                )
+                _mg["mag_diff_G1G2"] = _mg["m_G1"] - _mg["m_G2"]
+                # CSV 輸出
+                _ratio_csv = stage4_run_root / "1_photometry" / f"G1G2_ratio_{active_date}.csv"
+                _mg[["bjd_tdb", "flux_ratio_G1G2", "mag_diff_G1G2",
+                     "flux_G1", "flux_G2", "m_G1", "m_G2"]].to_csv(
+                    _ratio_csv, index=False, float_format="%.8f"
+                )
+                print(f"[G1/G2] 比值 CSV：{_ratio_csv}（{len(_mg)} 幀）")
+                # 繪圖：flux ratio + mag diff
+                _ratio_png = stage4_run_root / "3_light_curve" / f"G1G2_ratio_{active_date}.png"
+                # sharex=False：兩軸各自設 formatter，避免互相覆蓋
+                _fig_r, _ax_r = plt.subplots(
+                    2, 1, figsize=(12, 6), sharex=False,
+                    gridspec_kw={"hspace": 0.12},
+                )
+                _med_ratio = float(np.nanmedian(_mg["flux_ratio_G1G2"]))
+                _med_mag = float(np.nanmedian(_mg["mag_diff_G1G2"]))
+                _rms_mag = float(np.sqrt(np.nanmean(
+                    (_mg["mag_diff_G1G2"] - _med_mag) ** 2
+                )))
+
+                # ── 資料繪製 ────────────────────────────────────────────
+                from matplotlib.transforms import blended_transform_factory
+                import matplotlib.ticker as _mticker
+
+                _bjd_arr_r = _mg["bjd_tdb"].values
+                _bjd_lo = float(_bjd_arr_r.min())
+                _bjd_hi = float(_bjd_arr_r.max())
+                _xlim_r = (_bjd_lo - 0.002, _bjd_hi + 0.002)
+                for _a in _ax_r:
+                    _a.set_xlim(_xlim_r)
+
+                _ax_r[0].plot(_mg["bjd_tdb"], _mg["flux_ratio_G1G2"], "g.", ms=4)
+                _ax_r[0].axhline(_med_ratio, color="k", ls="--", lw=0.8)
+                _ax_r[0].set_ylabel("G1 / G2 flux ratio")
+                # median 標註：繪圖區左端，緊貼虛線上方
+                _ax_r[0].text(
+                    0.0, _med_ratio,
+                    f"  median={_med_ratio:.4f}",
+                    transform=blended_transform_factory(
+                        _ax_r[0].transAxes, _ax_r[0].transData
+                    ),
+                    ha="left", va="bottom", fontsize=8,
+                )
+
+                _ax_r[1].plot(_mg["bjd_tdb"], _mg["mag_diff_G1G2"], "g.", ms=4)
+                _ax_r[1].axhline(_med_mag, color="k", ls="--", lw=0.8)
+                _ax_r[1].set_ylabel("G1 − G2 (mag)")
+                _ax_r[1].set_xlabel("BJD_TDB", color="steelblue", fontsize=12)
+                _ax_r[1].tick_params(axis='x', colors='steelblue')
+
+                if cfg.obs_lat_deg is not None:
+                    _ax_r[0].text(1.0, 1.12, f"{cfg.obs_lat_deg:.2f}N {cfg.obs_lon_deg:.2f}E",
+                                  transform=_ax_r[0].transAxes, ha='right', va='bottom',
+                                  fontsize=12, color='#2d6a4f')
+                # median 標註：繪圖區左端，緊貼虛線上方
+                _ax_r[1].text(
+                    0.0, _med_mag,
+                    f"  median={_med_mag:.4f} mag",
+                    transform=blended_transform_factory(
+                        _ax_r[1].transAxes, _ax_r[1].transData
+                    ),
+                    ha="left", va="bottom", fontsize=8,
+                )
+
+                # ── 標題（fontsize=14）+ 棕色可信度文字 ─────────────────
+                _ax_r[0].set_title(
+                    f"{active_target} {active_date} — G1/G2 flux ratio",
+                    fontsize=14, loc="left",
+                )
+                _ax_r[0].text(
+                    1.0, 1.01,
+                    f"Reliability: G1-G2 RMS = {_rms_mag:.4f} mag",
+                    transform=_ax_r[0].transAxes,
+                    ha="right", va="bottom",
+                    fontsize=14, color="saddlebrown",
+                )
+
+                # ── 兩圖之間 Local Time 刻度軸 ───────────────────────────
+                # 計算 HH:MM 刻度（UTC+8）
+                import datetime as _dt
+                _tz_r = float(getattr(cfg, "tz_offset_hours", 8))
+                _tmin_r = (ATime(_bjd_lo, format="jd", scale="tdb").to_datetime()
+                           + _dt.timedelta(hours=_tz_r))
+                _tmax_r = (ATime(_bjd_hi, format="jd", scale="tdb").to_datetime()
+                           + _dt.timedelta(hours=_tz_r))
+
+                _ticks_30 = []   # 每 30 分（含整點）→ 淡藍線
+                _ticks_60 = []   # 整點 → 稍深藍線
+                _tick_labs = []   # HH:MM 標籤（整點 + 半點）
+                _cur_r = _tmin_r.replace(second=0, microsecond=0)
+                _cur_r = _cur_r.replace(minute=(_cur_r.minute // 30) * 30)
+                while _cur_r <= _tmax_r + _dt.timedelta(minutes=1):
+                    _utc_r = _cur_r - _dt.timedelta(hours=_tz_r)
+                    _bjd_r = ATime(_utc_r).jd
+                    _ticks_30.append(_bjd_r)
+                    _tick_labs.append(_cur_r.strftime("%H:%M"))
+                    if _cur_r.minute == 0:
+                        _ticks_60.append(_bjd_r)
+                    _cur_r += _dt.timedelta(minutes=30)
+
+                # 垂直線畫在兩個子圖上
+                for _bv in _ticks_30:
+                    _ax_r[0].axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
+                    _ax_r[1].axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
+                for _bv in _ticks_60:
+                    _ax_r[0].axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
+                    _ax_r[1].axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
+
+                # _ax_r[0] 底部（兩圖中間）：HH:MM，FuncFormatter 各自獨立
+                def _bjd_to_hhmm(bjd_val, pos):
+                    try:
+                        _t = (ATime(bjd_val, format="jd", scale="tdb")
+                              .to_datetime()
+                              + _dt.timedelta(hours=_tz_r))
+                        return _t.strftime("%H:%M")
+                    except Exception:
+                        return ""
+
+                _ax_r[0].xaxis.set_major_locator(
+                    _mticker.FixedLocator(_ticks_30)
+                )
+                _ax_r[0].xaxis.set_major_formatter(
+                    _mticker.FuncFormatter(_bjd_to_hhmm)
+                )
+                _ax_r[0].tick_params(
+                    axis="x", which="major",
+                    bottom=True, labelbottom=True,
+                    top=False, labeltop=False,
+                    direction="in", length=5,
+                    colors="steelblue", labelsize=8,
+                    labelcolor="steelblue",
+                )
+                # "Local Time" 標籤：略偏出繪圖區左側，避免與第一個刻度重疊
+                _ax_r[0].text(
+                    -0.002, -0.01, "Local Time",
+                    transform=_ax_r[0].transAxes,
+                    ha="right", va="top",
+                    fontsize=8, color="steelblue",
+                    clip_on=False,
+                )
+
+                # _ax_r[1] 頂部：刻度朝內；底部：完整 BJD 數值
+                _ax_r[1].xaxis.set_major_locator(
+                    _mticker.FixedLocator(_ticks_30)
+                )
+                _ax_r[1].xaxis.set_major_formatter(
+                    _mticker.FuncFormatter(lambda v, _: f"{v:.2f}")
+                )
+                _ax_r[1].tick_params(
+                    axis="x", which="major",
+                    top=True, labeltop=False,
+                    bottom=True, labelbottom=True,
+                    direction="in", length=5,
+                    colors="steelblue", labelsize=8,
+                    labelcolor="black",
+                )
+
+                _fig_r.savefig(_ratio_png, dpi=150, bbox_inches="tight")
+                plt.close("all")
+                print(f"[G1/G2] 比值圖：{_ratio_png}")
+                # LS on G1/G2 ratio（使用 period_analysis）
+                if len(_mg) >= 10:
+                    try:
+                        _ratio_df = pd.DataFrame({
+                            "bjd_tdb": _mg["bjd_tdb"].values,
+                            "m_var": _mg["mag_diff_G1G2"].values,
+                            "v_err": np.full(len(_mg), 0.001),
+                            "ok": 1,
+                        })
+                        _pa_dir_r = stage4_run_root / "4_period_analysis"
+                        run_period_analysis(
+                            _ratio_df,
+                            target_name=active_target,
+                            channel="G1G2ratio",
+                            out_dir=_pa_dir_r,
+                        )
+                        print("[G1/G2] ratio LS + Fourier 完成")
+                    except Exception as _e_ratio:
+                        print(f"[G1/G2] LS 失敗：{_e_ratio}")
+            else:
+                print(f"[G1/G2] 對齊幀數 {len(_mg)} < 3，跳過比值計算")
+        else:
+            print("[G1/G2] 欄位不完整（需要 t_flux_net、m_var、ok），跳過比值計算")
     else:
-        # 指定目標（或目標+日期）
-        _targets_list = [(_args.target or "V1162Ori", _args.date or "20251220")]
+        print("[G1/G2] G1 或 G2 通道資料不存在，跳過比值計算")
+
+
+def _run_stage4_postprocess(cfg, active_target, active_date, channel_results, stage4_run_root):
+    _stage4_started = time.perf_counter()
+    _emit_progress(_phot_logger, f"stage4 postprocess start target={active_target} date={active_date}")
+    _stage4_replot_shared_g1g2_ylim(cfg, active_date, channel_results)
+    _stage4_run_period_analysis(active_target, channel_results, stage4_run_root)
+    _stage4_run_g1g2_ratio_products(
+        cfg, active_target, active_date, channel_results, stage4_run_root
+    )
+
+    _emit_progress_done(_phot_logger, f"stage4 postprocess target={active_target} date={active_date}", _stage4_started)
+    print(f"\n[完成] {active_target} {active_date} 全部通道週期分析完成")
+
+
+def _prepare_vsx_candidates(logger, args, vsx_field, cfg):
+    _VSX_MAG_MIN, _VSX_MAG_MAX = 6.0, 12.0
+    if args.no_vsx:
+        _emit_progress(logger, "VSX disabled by --no-vsx")
+        logger.info("[VSX] disabled by --no-vsx")
+        print("[VSX 額外目標] --no-vsx 旗標啟用，跳過額外目標測光")
+        return None
+    if vsx_field is None or len(vsx_field) == 0:
+        return None
+
+    _vsx_mag_col = None
+    for _vc in ("max", "min"):
+        if _vc in vsx_field.columns:
+            _vsx_mag_col = _vc
+            break
+    if _vsx_mag_col is None:
+        return None
+
+    _vsx_cand = vsx_field.copy()
+    _vsx_cand["_mag"] = pd.to_numeric(_vsx_cand[_vsx_mag_col], errors="coerce")
+    _vsx_cand = _vsx_cand[
+        _vsx_cand["_mag"].between(_VSX_MAG_MIN, _VSX_MAG_MAX)
+    ].reset_index(drop=True)
+
+    # 排除主目標自身（10" 以內）
+    if len(_vsx_cand) > 0:
+        logger.info(f"[vsx] candidates={len(_vsx_cand)} mag_window={_VSX_MAG_MIN}-{_VSX_MAG_MAX}")
+        _tgt_sc = SkyCoord(ra=cfg.target_radec_deg[0] * u.deg,
+                           dec=cfg.target_radec_deg[1] * u.deg)
+        _vsx_sc = SkyCoord(ra=_vsx_cand["ra_deg"].values * u.deg,
+                           dec=_vsx_cand["dec_deg"].values * u.deg)
+        _sep = _tgt_sc.separation(_vsx_sc).arcsec
+        _vsx_cand = _vsx_cand[_sep > 10.0].reset_index(drop=True)
+
+    return _vsx_cand, _VSX_MAG_MIN, _VSX_MAG_MAX
+
+
+def _vsx_short_name(raw: str) -> str:
+    """VSX 星名 → 短目錄名。
+    短名（ASAS/NSV/V*/...）直接去空格；
+    Gaia DR3 長 ID 截後 8 碼：GDR3_12345678。
+    ASASSN-V 去掉 J 後面的秒數小數。
+    """
+    s = raw.strip()
+    if s.startswith("Gaia DR3 "):
+        return "GDR3_" + s.split()[-1][-8:]
+    if s.startswith("ASASSN-V "):
+        # ASASSN-V J083045.90-480325.0 → ASASSN_J083045-4803
+        tail = s[len("ASASSN-V "):].strip()
+        tail = tail.replace("J", "J", 1)
+        # 簡化：去小數點後的秒數
+        import re as _re
+        m = _re.match(r"(J\d{6})\.\d+([+-]\d{4})", tail)
+        if m:
+            return "ASASSN_" + m.group(1) + m.group(2)
+    return s.replace(" ", "")
+
+
+def _get_vsx_ready_channels(channels, comp_refs_per_ch, split_dir_per_ch):
+    return [
+        _vch for _vch in channels
+        if _vch in comp_refs_per_ch
+        and _vch in split_dir_per_ch
+        and any(split_dir_per_ch[_vch].glob(f"*_{_vch}.fits"))
+    ]
+
+
+def _run_single_vsx_channel(
+    logger, cfg, vsx_name, vsx_ra, vsx_dec, vsx_run_root, active_date, vch,
+    comp_refs_per_ch, check_star_per_ch, check_star, split_dir_per_ch,
+    shared_aperture_radius, active_cache,
+):
+    _vsx_csv = (vsx_run_root / "1_photometry" / f"photometry_{vch}_{active_date}.csv")
+    _vsx_png = (vsx_run_root / "3_light_curve" / f"light_curve_{vch}_{active_date}.png")
+    try:
+        # 暫存並覆寫全域 cfg
+        _cfg_backup_radec = cfg.target_radec_deg
+        _cfg_backup_name = cfg.target_name
+        _cfg_backup_band = cfg.phot_band
+        _cfg_backup_regdir = cfg.regression_diag_dir
+        _vsx_band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
+        cfg.target_radec_deg = (vsx_ra, vsx_dec)
+        cfg.target_name = vsx_name
+        cfg.phot_band = _vsx_band_map.get(vch.upper(), "V")
+        # 回歸診斷圖存到 VSX 目標自己的目錄，避免覆蓋主目標
+        _vsx_reg_dir = vsx_run_root / "2_regression_diag"
+        _vsx_reg_dir.mkdir(parents=True, exist_ok=True)
+        cfg.regression_diag_dir = _vsx_reg_dir
+
+        _vsx_df, _ = run_photometry_on_wcs_dir(
+            split_dir_per_ch[vch],
+            _vsx_csv,
+            _vsx_png,
+            comp_refs=comp_refs_per_ch[vch],
+            check_star=check_star_per_ch.get(vch, check_star),
+            ap_radius=shared_aperture_radius,
+            channel=vch,
+            shared_cache=active_cache,
+        )
+        _n_ok = int(_vsx_df["ok"].sum()) if "ok" in _vsx_df.columns else 0
+        if _n_ok > 0 and "m_var" in _vsx_df.columns:
+            _ok_rows = _vsx_df[_vsx_df["ok"] == 1]
+            _med = float(_ok_rows["m_var"].median())
+            _amp = float(_ok_rows["m_var"].max() - _ok_rows["m_var"].min())
+            logger.info(
+                f"[vsx] target={vsx_name} channel={vch} ok={_n_ok}/{len(_vsx_df)} "
+                f"median={_med:.3f} amp={_amp:.3f}"
+            )
+            print(f"    {vch}: ok={_n_ok}/{len(_vsx_df)}  "
+                  f"median={_med:.3f}  amp={_amp:.3f}")
+        else:
+            logger.info(
+                f"[vsx] target={vsx_name} channel={vch} ok={_n_ok}/{len(_vsx_df)}"
+            )
+            print(f"    {vch}: ok={_n_ok}/{len(_vsx_df)}")
+        return _vsx_df
+    except Exception as _e_vsx_phot:
+        logger.warning(
+            f"[vsx] target={vsx_name} channel={vch} error: {_e_vsx_phot}"
+        )
+        print(f"    {vch}: 測光失敗 — {_e_vsx_phot}")
+        return None
+    finally:
+        cfg.target_radec_deg = _cfg_backup_radec
+        cfg.target_name = _cfg_backup_name
+        cfg.phot_band = _cfg_backup_band
+        cfg.regression_diag_dir = _cfg_backup_regdir
+
+
+def _run_single_vsx_target(
+    logger, cfg, channels, active_date, log_ts, vsx_group, vsx_project_root, vsx_date_fmt,
+    vsx_row, vsx_idx, comp_refs_per_ch, check_star_per_ch, split_dir_per_ch,
+    shared_aperture_radius, active_cache, check_star,
+):
+    _vsx_name_raw = str(vsx_row.get("Name", f"VSX_{vsx_idx}")).strip()
+    _vsx_name = _vsx_short_name(_vsx_name_raw)
+    _vsx_ra = float(vsx_row["ra_deg"])
+    _vsx_dec = float(vsx_row["dec_deg"])
+    _vsx_type = str(vsx_row.get("Type", "?"))
+    _vsx_per = vsx_row.get("Period", "?")
+    _vsx_mag = float(vsx_row["_mag"])
+    _vsx_ready_channels = _get_vsx_ready_channels(
+        channels, comp_refs_per_ch, split_dir_per_ch
+    )
+    if not _vsx_ready_channels:
+        logger.warning(
+            f"[VSX SKIP] name={_vsx_name} no ready channel before target tree creation"
+        )
+        return
+    logger.info(
+        f"[vsx] target={_vsx_name} mag={_vsx_mag:.2f} ready_channels={_vsx_ready_channels}"
+    )
+    print(f"\n  ── {_vsx_name_raw}  ({_vsx_type})  "
+          f"mag={_vsx_mag:.2f}  P={_vsx_per}d  "
+          f"RA={_vsx_ra:.4f}  Dec={_vsx_dec:.4f}")
+
+    # 輸出路徑：與 YAML 目標相同層級
+    # output/{date}/{group}/{VSXname}/{timestamp}/
+    _vsx_run_root = (vsx_project_root / "output" / vsx_date_fmt
+                     / vsx_group / _vsx_name / log_ts)
+    _vsx_out_dir = _vsx_run_root / "1_photometry"
+    _vsx_out_dir.mkdir(parents=True, exist_ok=True)
+    _vsx_lc_dir = _vsx_run_root / "3_light_curve"
+    _vsx_lc_dir.mkdir(parents=True, exist_ok=True)
+
+    _vsx_ch_results = {}
+    for _vch in channels:
+        if _vch not in comp_refs_per_ch:
+            logger.warning(f"[VSX SKIP] target={_vsx_name} channel={_vch} missing comp refs")
+            print(f"    {_vch}: 跳過（主目標該通道無比較星）")
+            continue
+        _vsx_df = _run_single_vsx_channel(
+            logger, cfg, _vsx_name, _vsx_ra, _vsx_dec, _vsx_run_root, active_date, _vch,
+            comp_refs_per_ch, check_star_per_ch, check_star, split_dir_per_ch,
+            shared_aperture_radius, active_cache,
+        )
+        if _vsx_df is not None:
+            _vsx_ch_results[_vch] = _vsx_df
+
+
+def _run_vsx_targets_for_target(
+    logger, yaml_cfg, active_target, active_date, log_ts, channels,
+    cfg, vsx_cand, comp_refs_per_ch, check_star_per_ch, split_dir_per_ch,
+    shared_aperture_radius, active_cache, check_star,
+):
+    _vsx_started = time.perf_counter()
+    _emit_progress(logger, f"VSX start target={active_target} count={len(vsx_cand)}")
+    # 取得主目標的 group 和 project_root（用於建構輸出路徑）
+    _main_tgt_yaml = yaml_cfg.get("targets", {}).get(active_target, {})
+    _vsx_group = _main_tgt_yaml.get("group", active_target)
+    _vsx_project_root = Path(yaml_cfg["_project_root"])
+    _vsx_date_fmt = f"{active_date[:4]}-{active_date[4:6]}-{active_date[6:8]}"
+    _last_vsx_heartbeat_at = _vsx_started
+
+    for _loop_idx, (_vi, _vr) in enumerate(vsx_cand.iterrows(), start=1):
+        _now = time.perf_counter()
+        if (_loop_idx % 25 == 0) or (_now - _last_vsx_heartbeat_at >= 30.0):
+            _emit_progress(
+                logger,
+                f"VSX heartbeat target={active_target} processed={_loop_idx}/{len(vsx_cand)} "
+                f"elapsed={_now - _vsx_started:.1f}s"
+            )
+            _last_vsx_heartbeat_at = _now
+        _run_single_vsx_target(
+            logger, cfg, channels, active_date, log_ts, _vsx_group, _vsx_project_root, _vsx_date_fmt,
+            _vr, _vi, comp_refs_per_ch, check_star_per_ch, split_dir_per_ch,
+            shared_aperture_radius, active_cache, check_star,
+        )
+
+    print(f"\n  [VSX 額外目標] 全部完成")
+
+
+# ── 執行 ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    _args = _parse_cli_args()
+    _logger, _log_ts = _init_summary_logger(_args)
+    # log 檔 handler 在取得 out_dir 後才加入（下方）
+
+    _yaml = _load_pipeline_yaml()
+
+    # ── 通道清單（所有目標共用）──────────────────────────────────────────────
+    CHANNELS = _resolve_channels(_args, _yaml)
+
+    # ── 建立要處理的 (target, date) 列表 ─────────────────────────────────────
+    _targets_list = _build_targets_list(_args, _yaml)
 
     print(f"[photometry] 待處理目標：{_targets_list}  通道：{CHANNELS}")
 
@@ -2890,29 +3603,9 @@ if __name__ == "__main__":
     # 相同視野的目標（hardlink 或同一 session 同一視野）共用 _FrameCompCache，
     # 避免重複做比較星孔徑測光。
     _logger.info(f"[photometry] targets={_targets_list} channels={CHANNELS}")
-
-    def _get_field_key(tgt, dt):
-        try:
-            _cfg_tmp = cfg_from_yaml(_yaml, tgt, dt, channel=CHANNELS[0],
-                                     split_subdir=_args.split_subdir)
-            _ff = sorted(_cfg_tmp.wcs_dir.glob(f"*_{CHANNELS[0]}.fits"))
-            return tuple(f.name for f in _ff[:3]) if _ff else None
-        except Exception:
-            return None
-
-    from collections import defaultdict as _defaultdict
-    _field_groups: "dict[tuple, list]" = _defaultdict(list)
-    for _tgt, _dt in _targets_list:
-        _fk = _get_field_key(_tgt, _dt)
-        if _fk:
-            _field_groups[_fk].append((_tgt, _dt))
-
-    # 為多目標視野建立共用快取（單目標視野不需要）
-    _field_caches: "dict[tuple, _FrameCompCache]" = {
-        _fk: _FrameCompCache()
-        for _fk, _grp in _field_groups.items()
-        if len(_grp) > 1
-    }
+    _field_groups, _field_caches = _build_shared_field_caches(
+        _yaml, _targets_list, CHANNELS[0], _args.split_subdir
+    )
     _multi_fields = sum(1 for v in _field_groups.values() if len(v) > 1)
     if _multi_fields:
         _logger.info(f"[photometry] shared_field_groups={_multi_fields}")
@@ -2920,652 +3613,41 @@ if __name__ == "__main__":
 
     # ── 各目標迴圈 ────────────────────────────────────────────────────────────
     for (ACTIVE_TARGET, ACTIVE_DATE) in _targets_list:
-        _logger.info(f"[target] start target={ACTIVE_TARGET} date={ACTIVE_DATE} channels={CHANNELS}")
-        print(f"\n{'#'*60}")
-        print(f"# 目標：{ACTIVE_TARGET}  日期：{ACTIVE_DATE}  通道：{CHANNELS}")
-        print(f"{'#'*60}")
-
-        # 關閉前一目標的 log 檔 handler
-        for _h in list(_logger.handlers):
-            if isinstance(_h, logging.FileHandler):
-                _h.close()
-                _logger.removeHandler(_h)
-
-        # ── 第一通道 cfg（用於比較星選取和孔徑估計）──────────────────────────
-        try:
-            cfg = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=CHANNELS[0],
-                                split_subdir=_args.split_subdir, out_tag=_args.out_tag,
-                                run_ts=_log_ts)
-        except Exception as _e_cfg:
-            _logger.warning(f"[SKIP] {ACTIVE_TARGET}/{ACTIVE_DATE} cfg error: {_e_cfg}")
-            print(f"[SKIP] {ACTIVE_TARGET}/{ACTIVE_DATE} cfg 建立失敗：{_e_cfg}")
+        _main_target_started = time.perf_counter()
+        _target_state = _prepare_target_run_state(
+            _logger, _yaml, _args, _log_ts, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS
+        )
+        if _target_state is None:
             continue
+        cfg, _shared_aperture_radius, check_star, _vsx_field, ap_r_in, ap_r_out = _target_state
 
-        # ── Log 檔 handler（每個目標獨立 log 檔）─────────────────────────────
-        _log_path = cfg.run_root / "1_photometry" / f"photometry_{ACTIVE_DATE}_{_log_ts}.log"
-        cfg.out_dir.mkdir(parents=True, exist_ok=True)
-        _file_hdl = logging.FileHandler(_log_path, encoding="utf-8")
-        _file_hdl.setLevel(logging.DEBUG)
-        _file_hdl.setFormatter(
-            logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s",
-                              datefmt="%Y-%m-%d %H:%M:%S")
+        channel_results, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch, _active_cache, _stage4_run_root = (
+            _run_channels_for_target(
+                _logger, _yaml, _args, _log_ts, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS,
+                cfg, _shared_aperture_radius, _field_caches,
+            )
         )
-        _logger.addHandler(_file_hdl)
-        _logger.info(f"[LOG] {_log_path}")
-        print(f"[LOG] {_log_path}")
-        _logger.info(
-            f"[runtime] target={ACTIVE_TARGET} date={ACTIVE_DATE} "
-            f"aperture_growth_fraction={cfg.aperture_growth_fraction:.3f}"
-        )
+        if _stage4_run_root is None:
+            _stage4_run_root = cfg.run_root
 
-        _ch0 = CHANNELS[0]
-        wcs_files = sorted(cfg.wcs_dir.glob(f"*_{_ch0}.fits"))
-        if not wcs_files:
-            _logger.warning(f"[SKIP] no split FITS for channel={_ch0} dir={cfg.wcs_dir}")
-            print(f"[SKIP] 找不到 split/{_ch0} FITS：{cfg.wcs_dir}，跳過此目標")
-            continue
-        print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
-
-        # ── 統一視場星表預建（所有通道共用一次 cone search）──────────────────
-        _field_cat_dir_pre = cfg.out_dir.parent.parent.parent / "catalogs"
-        _field_cat_path_pre = _field_cat_dir_pre / "field_catalog_unified.csv"
-        if not _field_cat_path_pre.exists():
-            print(f"[catalog] 預建統一視場星表...")
-            _load_or_build_unified_catalog(
-                cfg, cfg.target_radec_deg[0], cfg.target_radec_deg[1], _field_cat_dir_pre,
-            )
-
-        # ── 孔徑估計用比較星（首通道 V band，僅供 estimate_aperture_radius 使用）─
-        # 注意：此時用 YAML 預設孔徑（8px）做初選測光。
-        # 孔徑估計在之後用比較星做，正式測光用估計後的孔徑。
-        # 初選與正式孔徑的微小差異（~1-2px）不影響比較星篩選結果。
-        try:
-            (_comp_ap, comp_df_matched, check_star,
-             aavso_matched, apass_matched, active_source,
-             _vsx_field) = auto_select_comps(
-                wcs_files[0], cfg.target_radec_deg, band="V"
-            )
-        except RuntimeError as _e:
-            _logger.warning(f"[SKIP] {ACTIVE_TARGET} aperture preselect failed: {_e}")
-            print(f"[SKIP] {ACTIVE_TARGET} 孔徑估算比較星選取失敗，跳過此目標：{_e}")
-            continue
-        print(f"check_star：{check_star}")
-
-        # ── 孔徑估計（用比較星，亮度接近目標星）──────────────────────────────
-        _logger.info(f"[check_star] {check_star}")
-        ap_r = None
-        if cfg.aperture_auto:
-            _logger.info(
-                f"[aperture_auto] growth_fraction={cfg.aperture_growth_fraction:.3f} "
-                f"r_min={cfg.aperture_min_radius} r_max={cfg.aperture_max_radius}"
-            )
-            ap_r = estimate_aperture_radius(
-                wcs_files[0], comp_df_matched,   # comp_df_matched from V-band initial selection
-                cfg.aperture_min_radius, cfg.aperture_max_radius,
-                cfg.aperture_growth_fraction,
-                max_stars=(
-                    max(10, min(30, len(comp_df_matched)))
-                    if comp_df_matched is not None else 20
-                ),
-            )
-            if ap_r is not None:
-                _logger.info(
-                    f"[aperture_auto] selected_radius={ap_r:.2f} "
-                    f"growth_fraction={cfg.aperture_growth_fraction:.3f}"
-                )
-                cfg.aperture_radius = ap_r
-                print(
-                    f"[生長曲線] 自動孔徑半徑 = {cfg.aperture_radius:.2f} px"
-                    "（所有通道共用）"
-                )
-
-        if cfg.aperture_auto and ap_r is None:
-            _logger.warning(
-                f"[aperture_auto] estimate failed; keep fixed aperture={cfg.aperture_radius:.2f} "
-                f"growth_fraction={cfg.aperture_growth_fraction:.3f}"
-            )
-
-        ap_r_in, ap_r_out = compute_annulus_radii(
-            cfg.aperture_radius, cfg.annulus_r_in, cfg.annulus_r_out
-        )
-        print(f"孔徑 r={cfg.aperture_radius:.2f}  r_in={ap_r_in:.2f}  r_out={ap_r_out:.2f}")
-        _logger.info(
-            f"[aperture] radius={cfg.aperture_radius:.2f} r_in={ap_r_in:.2f} "
-            f"r_out={ap_r_out:.2f} growth_fraction={cfg.aperture_growth_fraction:.3f}"
-        )
-        _shared_aperture_radius = cfg.aperture_radius
-
-        # ── 多通道測光迴圈 ────────────────────────────────────────────────────
-        channel_results: dict = {}
-        _comp_refs_per_ch: dict = {}   # {channel: comp_refs} for VSX extra targets
-        _check_star_per_ch: dict = {}  # {channel: check_star}
-        _split_dir_per_ch: dict = {}   # {channel: split_dir}
-
-        for _ch in CHANNELS:
-            _logger.info(f"[channel] start channel={_ch} shared_aperture={_shared_aperture_radius:.2f}")
-            print(f"\n{'='*55}")
-            print(f"  通道 {_ch}  ({CHANNELS.index(_ch) + 1}/{len(CHANNELS)})")
-            print(f"{'='*55}")
-
-            cfg_ch = cfg_from_yaml(_yaml, ACTIVE_TARGET, ACTIVE_DATE, channel=_ch,
-                                   split_subdir=_args.split_subdir, out_tag=_args.out_tag,
-                                   run_ts=_log_ts)
-            cfg_ch.aperture_radius = _shared_aperture_radius
-            # gain/read_noise：cfg_ch 從 sensor_db 讀取；若為 None 才從首通道 fallback
-            if cfg_ch.gain_e_per_adu is None and cfg.gain_e_per_adu is not None:
-                cfg_ch.gain_e_per_adu = cfg.gain_e_per_adu
-            if cfg_ch.read_noise_e is None and cfg.read_noise_e is not None:
-                cfg_ch.read_noise_e = cfg.read_noise_e
-
-            _split_dir = cfg_ch.wcs_dir
-            _split_dir_per_ch[_ch] = _split_dir
-            _fits_ch   = sorted(_split_dir.glob(f"*_{_ch}.fits"))
-            if not _fits_ch:
-                _logger.warning(f"[SKIP] channel={_ch} no split FITS in dir={_split_dir}")
-                print(f"  [SKIP] split/{_ch}/ 找不到 FITS，跳過此通道")
-                continue
-
-            print(f"  FITS 張數：{len(_fits_ch)}")
-            print(f"  輸出 CSV ：{cfg_ch.phot_out_csv}")
-
-            # ── 比較星 m_cat 波段重映射（每通道用正確星表）──
-            _band_map_ch = {"R": "R", "G1": "V", "G2": "V", "B": "B"}
-            _band_ch = _band_map_ch.get(str(_ch).upper(), "V")
-            try:
-                (_comp_refs_ch, _comp_df_ch, _check_star_ch,
-                 _aavso_ch, _apass_ch, _active_source_ch,
-                 _vsx_ch) = auto_select_comps(
-                    _fits_ch[0], cfg_ch.target_radec_deg, band=_band_ch
-                )
-                _logger.info(f"[comp] channel={_ch} source={_active_source_ch} n={len(_comp_refs_ch)}")
-                print(f"  [comp] {_ch} source={_active_source_ch} n={len(_comp_refs_ch)}")
-                _comp_refs_per_ch[_ch] = _comp_refs_ch
-                _check_star_per_ch[_ch] = _check_star_ch
-            except RuntimeError as _e_comp_ch:
-                _logger.warning(f"[SKIP] channel={_ch} comp selection failed: {_e_comp_ch}")
-                print(f"  [SKIP] {_ch} 比較星讀取失敗：{_e_comp_ch}")
-                continue
-
-            # 同視野多目標：傳入共用比較星快取
-            _active_field_key = _get_field_key(ACTIVE_TARGET, ACTIVE_DATE)
-            _active_cache = _field_caches.get(_active_field_key) if _active_field_key else None
-            df_ch, _comp_lc_ch = run_photometry_on_wcs_dir(
-                _split_dir,
-                cfg_ch.phot_out_csv,
-                cfg_ch.phot_out_png,
-                comp_refs=_comp_refs_ch,
-                check_star=_check_star_ch,
-                ap_radius=cfg_ch.aperture_radius,
-                channel=_ch,
-                shared_cache=_active_cache,
-            )
-            if _active_cache:
-                print(f"  [快取] 比較星快取 {len(_active_cache)} 筆")
-            channel_results[_ch] = df_ch
-            _ok_cnt = int(df_ch['ok'].sum()) if 'ok' in df_ch.columns else 0
-            _logger.info(f"[channel] done channel={_ch} ok={_ok_cnt}/{len(df_ch)}")
-            print(f"  [完成] {_ch}：ok={_ok_cnt} / {len(df_ch)} 幀")
-
-            # R 通道：額外跑 Gaia RP→Rc 輸出獨立 R_GAIA 結果
-            if str(_ch).upper() == "R":
-                try:
-                    print(f"\n[R_GAIA] 對 R 通道額外執行 Gaia RP→Rc 測光")
-                    _gaia_r_raw = fetch_gaia_dr3_cone(
-                        cfg_ch.target_radec_deg[0], cfg_ch.target_radec_deg[1],
-                        radius_arcmin=cfg_ch.apass_radius_deg * 60.0,
-                        mag_min=cfg_ch.comp_mag_min, mag_max=cfg_ch.comp_mag_max,
-                        channel="R",
-                    )
-                    if len(_gaia_r_raw) >= cfg_ch.ensemble_min_comp:
-                        if hasattr(cfg_ch, "out_dir"):
-                            _cat_dir_r = cfg_ch.run_root / "1_photometry" / "catalogs"
-                            _cat_dir_r.mkdir(parents=True, exist_ok=True)
-                            _gaia_r_raw.to_csv(_cat_dir_r / "catalog_GaiaDR3_Rc.csv", index=False)
-                            print(f"  [R_GAIA] 星表已儲存 ({len(_gaia_r_raw)} 筆)")
-                    else:
-                        print(f"  [R_GAIA] Gaia RP→Rc 有效星不足，跳過")
-                except Exception as _e_gaia_r:
-                    print(f"  [WARN] R_GAIA 失敗：{_e_gaia_r}")
-
-        print(f"\n所有通道完成：{list(channel_results.keys())}")
-
-        # ── G1/G2 共享 Y 軸重繪 ───────────────────────────────────────────
-        _shared_chs = [c for c in ("G1", "G2") if c in channel_results]
-        if len(_shared_chs) == 2:
-            _all_ok_mag = []
-            for _sc in _shared_chs:
-                _sdf = channel_results[_sc]
-                _sdf_ok = _sdf[(_sdf["ok"] == 1) & np.isfinite(_sdf["m_var"])]
-                _all_ok_mag.extend(_sdf_ok["m_var"].tolist())
-            if _all_ok_mag:
-                _margin = 0.02
-                _ymin = min(_all_ok_mag) - _margin   # 亮端（小數值）
-                _ymax = max(_all_ok_mag) + _margin   # 暗端（大數值）
-                _shared_ylim = (_ymax, _ymin)         # invert: 大值在下(bottom)
-                for _sc in _shared_chs:
-                    # 直接寫回原 run_root，不重建 cfg（避免產生新時間戳目錄）
-                    _sc_png = cfg.run_root / "3_light_curve" / f"light_curve_{_sc}_{ACTIVE_DATE}.png"
-                    plot_light_curve(channel_results[_sc], _sc_png, _sc,
-                                    cfg, obs_date=ACTIVE_DATE, ylim=_shared_ylim)
-                print(f"[PLOT] G1/G2 Y 軸已鎖定：{_ymin:.3f} – {_ymax:.3f} mag")
-
-        # ── 週期分析（統一使用 period_analysis.py）─────────────────────────
-        from period_analysis import run_period_analysis
-        _pa_any = False
-        for _ls_ch, _ls_df in channel_results.items():
-            if _ls_df is None:
-                continue
-            _n_ok = int(_ls_df["ok"].sum())
-            if _n_ok < 10:
-                print(f"[LS] {_ls_ch} 有效幀數 {_n_ok} < 10，跳過")
-                continue
-            print(f"\n[LS] 通道 {_ls_ch}（有效幀數：{_n_ok}）")
-            try:
-                _pa_dir = cfg_ch.run_root / "4_period_analysis"
-                # 準備 DataFrame 欄位名稱對應（period_analysis 期望 ok, bjd_tdb, m_var/m_var_norm, v_err）
-                _pa_df = _ls_df.copy()
-                if "v_err" not in _pa_df.columns and "t_sigma_mag" in _pa_df.columns:
-                    _pa_df["v_err"] = _pa_df["t_sigma_mag"]
-                _pa_result = run_period_analysis(
-                    _pa_df,
-                    target_name=ACTIVE_TARGET,
-                    channel=_ls_ch,
-                    out_dir=_pa_dir,
-                )
-                if _pa_result:
-                    _pa_any = True
-                    _ls_r = _pa_result.get("ls_result", {})
-                    _bp = _ls_r.get("best_period", np.nan)
-                    _fap = _ls_r.get("fap", np.nan)
-                    if np.isfinite(_bp):
-                        print(f"[LS] Best period = {_bp:.6f} d  ({_bp * 24:.4f} h)")
-                        print(f"[LS] FAP         = {_fap:.2e}")
-                    else:
-                        print(f"[LS] {_ls_ch} 週期分析無有效結果（keys: {list(_pa_result.keys())}）")
-                    _fit_r = _pa_result.get("fit_result", {})
-                    if _fit_r:
-                        _amp = _fit_r.get("amplitude", np.nan)
-                        print(f"[Fourier] Amplitude = {_amp:.4f} mag")
-                    elif _ls_r:
-                        print(f"[Fourier] 擬合失敗或跳過")
-                else:
-                    print(f"[LS] {_ls_ch} run_period_analysis 回傳空結果")
-            except Exception as _e_ls:
-                print(f"[LS] {_ls_ch} 失敗：{_e_ls}")
-
-        if not _pa_any:
-            print("[LS] 跳過（所有通道有效幀數 < 10 或分析失敗）")
-
-        # ── G1/G2 比值光變曲線 ────────────────────────────────────────────────
-        _dg1 = channel_results.get("G1")
-        _dg2 = channel_results.get("G2")
-        if _dg1 is not None and _dg2 is not None:
-            _need_cols = ["bjd_tdb", "t_flux_net", "m_var", "ok"]
-            _g1_ok = all(_c in _dg1.columns for _c in _need_cols)
-            _g2_ok = all(_c in _dg2.columns for _c in _need_cols)
-            if _g1_ok and _g2_ok:
-                _mg = pd.merge(
-                    _dg1[_need_cols].rename(columns={
-                        "t_flux_net": "flux_G1", "m_var": "m_G1", "ok": "ok_G1"
-                    }),
-                    _dg2[_need_cols].rename(columns={
-                        "t_flux_net": "flux_G2", "m_var": "m_G2", "ok": "ok_G2"
-                    }),
-                    on="bjd_tdb", how="inner",
-                )
-                _mg = _mg[(_mg["ok_G1"] == 1) & (_mg["ok_G2"] == 1)].copy()
-                if len(_mg) >= 3:
-                    _mg["flux_ratio_G1G2"] = (
-                        _mg["flux_G1"] / _mg["flux_G2"].replace(0, np.nan)
-                    )
-                    _mg["mag_diff_G1G2"] = _mg["m_G1"] - _mg["m_G2"]
-                    # CSV 輸出
-                    _ratio_csv = cfg_ch.run_root / "1_photometry" / f"G1G2_ratio_{ACTIVE_DATE}.csv"
-                    _mg[["bjd_tdb", "flux_ratio_G1G2", "mag_diff_G1G2",
-                          "flux_G1", "flux_G2", "m_G1", "m_G2"]].to_csv(
-                        _ratio_csv, index=False, float_format="%.8f"
-                    )
-                    print(f"[G1/G2] 比值 CSV：{_ratio_csv}（{len(_mg)} 幀）")
-                    # 繪圖：flux ratio + mag diff
-                    _ratio_png = cfg_ch.run_root / "3_light_curve" / f"G1G2_ratio_{ACTIVE_DATE}.png"
-                    # sharex=False：兩軸各自設 formatter，避免互相覆蓋
-                    _fig_r, _ax_r = plt.subplots(
-                        2, 1, figsize=(12, 6), sharex=False,
-                        gridspec_kw={"hspace": 0.12},
-                    )
-                    _med_ratio = float(np.nanmedian(_mg["flux_ratio_G1G2"]))
-                    _med_mag   = float(np.nanmedian(_mg["mag_diff_G1G2"]))
-                    _rms_mag   = float(np.sqrt(np.nanmean(
-                        (_mg["mag_diff_G1G2"] - _med_mag) ** 2
-                    )))
-
-                    # ── 資料繪製 ────────────────────────────────────────────
-                    from matplotlib.transforms import blended_transform_factory
-                    import matplotlib.ticker as _mticker
-
-                    _bjd_arr_r = _mg["bjd_tdb"].values
-                    _bjd_lo    = float(_bjd_arr_r.min())
-                    _bjd_hi    = float(_bjd_arr_r.max())
-                    _xlim_r    = (_bjd_lo - 0.002, _bjd_hi + 0.002)
-                    for _a in _ax_r:
-                        _a.set_xlim(_xlim_r)
-
-                    _ax_r[0].plot(_mg["bjd_tdb"], _mg["flux_ratio_G1G2"], "g.", ms=4)
-                    _ax_r[0].axhline(_med_ratio, color="k", ls="--", lw=0.8)
-                    _ax_r[0].set_ylabel("G1 / G2 flux ratio")
-                    # median 標註：繪圖區左端，緊貼虛線上方
-                    _ax_r[0].text(
-                        0.0, _med_ratio,
-                        f"  median={_med_ratio:.4f}",
-                        transform=blended_transform_factory(
-                            _ax_r[0].transAxes, _ax_r[0].transData
-                        ),
-                        ha="left", va="bottom", fontsize=8,
-                    )
-
-                    _ax_r[1].plot(_mg["bjd_tdb"], _mg["mag_diff_G1G2"], "g.", ms=4)
-                    _ax_r[1].axhline(_med_mag, color="k", ls="--", lw=0.8)
-                    _ax_r[1].set_ylabel("G1 − G2 (mag)")
-                    _ax_r[1].set_xlabel("BJD_TDB", color="steelblue", fontsize=12)
-                    _ax_r[1].tick_params(axis='x', colors='steelblue')
-                    
-                    if cfg.obs_lat_deg is not None:
-                        _ax_r[0].text(1.0, 1.12, f"{cfg.obs_lat_deg:.2f}N {cfg.obs_lon_deg:.2f}E", 
-                                      transform=_ax_r[0].transAxes, ha='right', va='bottom', 
-                                      fontsize=12, color='#2d6a4f')
-                    # median 標註：繪圖區左端，緊貼虛線上方
-                    _ax_r[1].text(
-                        0.0, _med_mag,
-                        f"  median={_med_mag:.4f} mag",
-                        transform=blended_transform_factory(
-                            _ax_r[1].transAxes, _ax_r[1].transData
-                        ),
-                        ha="left", va="bottom", fontsize=8,
-                    )
-
-                    # ── 標題（fontsize=14）+ 棕色可信度文字 ─────────────────
-                    _ax_r[0].set_title(
-                        f"{ACTIVE_TARGET} {ACTIVE_DATE} — G1/G2 flux ratio",
-                        fontsize=14, loc="left",
-                    )
-                    _ax_r[0].text(
-                        1.0, 1.01,
-                        f"Reliability: G1-G2 RMS = {_rms_mag:.4f} mag",
-                        transform=_ax_r[0].transAxes,
-                        ha="right", va="bottom",
-                        fontsize=14, color="saddlebrown",
-                    )
-
-                    # ── 兩圖之間 Local Time 刻度軸 ───────────────────────────
-                    # 計算 HH:MM 刻度（UTC+8）
-                    import datetime as _dt
-                    _tz_r = float(getattr(cfg, "tz_offset_hours", 8))
-                    _tmin_r    = (ATime(_bjd_lo, format="jd", scale="tdb").to_datetime()
-                                  + _dt.timedelta(hours=_tz_r))
-                    _tmax_r    = (ATime(_bjd_hi, format="jd", scale="tdb").to_datetime()
-                                  + _dt.timedelta(hours=_tz_r))
-
-                    _ticks_30  = []   # 每 30 分（含整點）→ 淡藍線
-                    _ticks_60  = []   # 整點 → 稍深藍線
-                    _tick_labs = []   # HH:MM 標籤（整點 + 半點）
-                    _cur_r = _tmin_r.replace(second=0, microsecond=0)
-                    _cur_r = _cur_r.replace(minute=(_cur_r.minute // 30) * 30)
-                    while _cur_r <= _tmax_r + _dt.timedelta(minutes=1):
-                        _utc_r  = _cur_r - _dt.timedelta(hours=_tz_r)
-                        _bjd_r  = ATime(_utc_r).jd
-                        _ticks_30.append(_bjd_r)
-                        _tick_labs.append(_cur_r.strftime("%H:%M"))
-                        if _cur_r.minute == 0:
-                            _ticks_60.append(_bjd_r)
-                        _cur_r += _dt.timedelta(minutes=30)
-
-                    # 垂直線畫在兩個子圖上
-                    for _bv in _ticks_30:
-                        _ax_r[0].axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
-                        _ax_r[1].axvline(_bv, color="steelblue", lw=0.6, alpha=0.25, zorder=1)
-                    for _bv in _ticks_60:
-                        _ax_r[0].axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
-                        _ax_r[1].axvline(_bv, color="steelblue", lw=0.8, alpha=0.5, zorder=1)
-
-                    # _ax_r[0] 底部（兩圖中間）：HH:MM，FuncFormatter 各自獨立
-                    def _bjd_to_hhmm(bjd_val, pos):
-                        try:
-                            _t = (ATime(bjd_val, format="jd", scale="tdb")
-                                  .to_datetime()
-                                  + _dt.timedelta(hours=_tz_r))
-                            return _t.strftime("%H:%M")
-                        except Exception:
-                            return ""
-
-                    _ax_r[0].xaxis.set_major_locator(
-                        _mticker.FixedLocator(_ticks_30)
-                    )
-                    _ax_r[0].xaxis.set_major_formatter(
-                        _mticker.FuncFormatter(_bjd_to_hhmm)
-                    )
-                    _ax_r[0].tick_params(
-                        axis="x", which="major",
-                        bottom=True, labelbottom=True,
-                        top=False, labeltop=False,
-                        direction="in", length=5,
-                        colors="steelblue", labelsize=8,
-                        labelcolor="steelblue",
-                    )
-                    # "Local Time" 標籤：略偏出繪圖區左側，避免與第一個刻度重疊
-                    _ax_r[0].text(
-                        -0.002, -0.01, "Local Time",
-                        transform=_ax_r[0].transAxes,
-                        ha="right", va="top",
-                        fontsize=8, color="steelblue",
-                        clip_on=False,
-                    )
-
-                    # _ax_r[1] 頂部：刻度朝內；底部：完整 BJD 數值
-                    _ax_r[1].xaxis.set_major_locator(
-                        _mticker.FixedLocator(_ticks_30)
-                    )
-                    _ax_r[1].xaxis.set_major_formatter(
-                        _mticker.FuncFormatter(lambda v, _: f"{v:.2f}")
-                    )
-                    _ax_r[1].tick_params(
-                        axis="x", which="major",
-                        top=True, labeltop=False,
-                        bottom=True, labelbottom=True,
-                        direction="in", length=5,
-                        colors="steelblue", labelsize=8,
-                        labelcolor="black",
-                    )
-
-                    _fig_r.savefig(_ratio_png, dpi=150, bbox_inches="tight")
-                    plt.close("all")
-                    print(f"[G1/G2] 比值圖：{_ratio_png}")
-                    # LS on G1/G2 ratio（使用 period_analysis）
-                    if len(_mg) >= 10:
-                        try:
-                            _ratio_df = pd.DataFrame({
-                                "bjd_tdb": _mg["bjd_tdb"].values,
-                                "m_var":   _mg["mag_diff_G1G2"].values,
-                                "v_err":   np.full(len(_mg), 0.001),
-                                "ok":      1,
-                            })
-                            _pa_dir_r = cfg_ch.run_root / "4_period_analysis"
-                            run_period_analysis(
-                                _ratio_df,
-                                target_name=ACTIVE_TARGET,
-                                channel="G1G2ratio",
-                                out_dir=_pa_dir_r,
-                            )
-                            print("[G1/G2] ratio LS + Fourier 完成")
-                        except Exception as _e_ratio:
-                            print(f"[G1/G2] LS 失敗：{_e_ratio}")
-                else:
-                    print(f"[G1/G2] 對齊幀數 {len(_mg)} < 3，跳過比值計算")
-            else:
-                print("[G1/G2] 欄位不完整（需要 t_flux_net、m_var、ok），跳過比值計算")
-        else:
-            print("[G1/G2] G1 或 G2 通道資料不存在，跳過比值計算")
-
-        print(f"\n[完成] {ACTIVE_TARGET} {ACTIVE_DATE} 全部通道週期分析完成")
+        _run_stage4_postprocess(cfg, ACTIVE_TARGET, ACTIVE_DATE, channel_results, _stage4_run_root)
 
         # ── VSX 額外目標星測光 ────────────────────────────────────────────────
         # 從 VSX 查詢結果中篩選 9.8–11.2 等的已知變星，逐顆跑差分測光。
         # 使用與主目標相同的比較星、孔徑、FITS 檔案。
         # 輸出目錄與 YAML 目標相同層級：output/{date}/{group}/{VSXname}/{timestamp}/
         _logger.info(f"[target] base target complete target={ACTIVE_TARGET} date={ACTIVE_DATE}")
-        _VSX_MAG_MIN, _VSX_MAG_MAX = 6.0, 12.0
-        if _args.no_vsx:
-            _logger.info("[VSX] disabled by --no-vsx")
-            print("[VSX 額外目標] --no-vsx 旗標啟用，跳過額外目標測光")
-        elif _vsx_field is not None and len(_vsx_field) > 0:
-            _vsx_mag_col = None
-            for _vc in ("max", "min"):
-                if _vc in _vsx_field.columns:
-                    _vsx_mag_col = _vc
-                    break
-            if _vsx_mag_col is not None:
-                _vsx_cand = _vsx_field.copy()
-                _vsx_cand["_mag"] = pd.to_numeric(_vsx_cand[_vsx_mag_col], errors="coerce")
-                _vsx_cand = _vsx_cand[
-                    _vsx_cand["_mag"].between(_VSX_MAG_MIN, _VSX_MAG_MAX)
-                ].reset_index(drop=True)
-
-                # 排除主目標自身（10" 以內）
-                if len(_vsx_cand) > 0:
-                    _logger.info(f"[vsx] candidates={len(_vsx_cand)} mag_window={_VSX_MAG_MIN}-{_VSX_MAG_MAX}")
-                    _tgt_sc = SkyCoord(ra=cfg.target_radec_deg[0] * u.deg,
-                                       dec=cfg.target_radec_deg[1] * u.deg)
-                    _vsx_sc = SkyCoord(ra=_vsx_cand["ra_deg"].values * u.deg,
-                                       dec=_vsx_cand["dec_deg"].values * u.deg)
-                    _sep = _tgt_sc.separation(_vsx_sc).arcsec
-                    _vsx_cand = _vsx_cand[_sep > 10.0].reset_index(drop=True)
-
-                if len(_vsx_cand) > 0:
-                    print(f"\n{'='*55}")
-                    print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 ({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)")
-                    print(f"{'='*55}")
-
-                    # 取得主目標的 group 和 project_root（用於建構輸出路徑）
-                    _main_tgt_yaml = _yaml.get("targets", {}).get(ACTIVE_TARGET, {})
-                    _vsx_group = _main_tgt_yaml.get("group", ACTIVE_TARGET)
-                    _vsx_project_root = Path(_yaml["_project_root"])
-                    _vsx_date_fmt = f"{ACTIVE_DATE[:4]}-{ACTIVE_DATE[4:6]}-{ACTIVE_DATE[6:8]}"
-
-                    def _vsx_short_name(raw: str) -> str:
-                        """VSX 星名 → 短目錄名。
-                        短名（ASAS/NSV/V*/...）直接去空格；
-                        Gaia DR3 長 ID 截後 8 碼：GDR3_12345678。
-                        ASASSN-V 去掉 J 後面的秒數小數。
-                        """
-                        s = raw.strip()
-                        if s.startswith("Gaia DR3 "):
-                            return "GDR3_" + s.split()[-1][-8:]
-                        if s.startswith("ASASSN-V "):
-                            # ASASSN-V J083045.90-480325.0 → ASASSN_J083045-4803
-                            tail = s[len("ASASSN-V "):].strip()
-                            tail = tail.replace("J", "J", 1)
-                            # 簡化：去小數點後的秒數
-                            import re as _re
-                            m = _re.match(r"(J\d{6})\.\d+([+-]\d{4})", tail)
-                            if m:
-                                return "ASASSN_" + m.group(1) + m.group(2)
-                        return s.replace(" ", "")
-
-                    for _vi, _vr in _vsx_cand.iterrows():
-                        _vsx_name_raw = str(_vr.get("Name", f"VSX_{_vi}")).strip()
-                        _vsx_name = _vsx_short_name(_vsx_name_raw)
-                        _vsx_ra   = float(_vr["ra_deg"])
-                        _vsx_dec  = float(_vr["dec_deg"])
-                        _vsx_type = str(_vr.get("Type", "?"))
-                        _vsx_per  = _vr.get("Period", "?")
-                        _vsx_mag  = float(_vr["_mag"])
-                        _vsx_ready_channels = [
-                            _vch for _vch in CHANNELS
-                            if _vch in _comp_refs_per_ch
-                            and _vch in _split_dir_per_ch
-                            and any(_split_dir_per_ch[_vch].glob(f"*_{_vch}.fits"))
-                        ]
-                        if not _vsx_ready_channels:
-                            _logger.warning(
-                                f"[VSX SKIP] name={_vsx_name} no ready channel before target tree creation"
-                            )
-                            continue
-                        _logger.info(
-                            f"[vsx] target={_vsx_name} mag={_vsx_mag:.2f} ready_channels={_vsx_ready_channels}"
-                        )
-                        print(f"\n  ── {_vsx_name_raw}  ({_vsx_type})  "
-                              f"mag={_vsx_mag:.2f}  P={_vsx_per}d  "
-                              f"RA={_vsx_ra:.4f}  Dec={_vsx_dec:.4f}")
-
-                        # 輸出路徑：與 YAML 目標相同層級
-                        # output/{date}/{group}/{VSXname}/{timestamp}/
-                        _vsx_run_root = (_vsx_project_root / "output" / _vsx_date_fmt
-                                         / _vsx_group / _vsx_name / _log_ts)
-                        _vsx_out_dir = _vsx_run_root / "1_photometry"
-                        _vsx_out_dir.mkdir(parents=True, exist_ok=True)
-                        _vsx_lc_dir = _vsx_run_root / "3_light_curve"
-                        _vsx_lc_dir.mkdir(parents=True, exist_ok=True)
-
-                        _vsx_ch_results = {}
-                        for _vch in CHANNELS:
-                            if _vch not in _comp_refs_per_ch:
-                                _logger.warning(f"[VSX SKIP] target={_vsx_name} channel={_vch} missing comp refs")
-                                print(f"    {_vch}: 跳過（主目標該通道無比較星）")
-                                continue
-                            _vsx_csv = _vsx_out_dir / f"photometry_{_vch}_{ACTIVE_DATE}.csv"
-                            _vsx_png = _vsx_lc_dir / f"light_curve_{_vch}_{ACTIVE_DATE}.png"
-
-                            try:
-                                # 暫存並覆寫全域 cfg
-                                _cfg_backup_radec = cfg.target_radec_deg
-                                _cfg_backup_name  = cfg.target_name
-                                _cfg_backup_band  = cfg.phot_band
-                                _cfg_backup_regdir = cfg.regression_diag_dir
-                                _vsx_band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
-                                cfg.target_radec_deg = (_vsx_ra, _vsx_dec)
-                                cfg.target_name = _vsx_name
-                                cfg.phot_band = _vsx_band_map.get(_vch.upper(), "V")
-                                # 回歸診斷圖存到 VSX 目標自己的目錄，避免覆蓋主目標
-                                _vsx_reg_dir = _vsx_run_root / "2_regression_diag"
-                                _vsx_reg_dir.mkdir(parents=True, exist_ok=True)
-                                cfg.regression_diag_dir = _vsx_reg_dir
-
-                                _vsx_df, _ = run_photometry_on_wcs_dir(
-                                    _split_dir_per_ch[_vch],
-                                    _vsx_csv,
-                                    _vsx_png,
-                                    comp_refs=_comp_refs_per_ch[_vch],
-                                    check_star=_check_star_per_ch.get(_vch, check_star),
-                                    ap_radius=_shared_aperture_radius,
-                                    channel=_vch,
-                                    shared_cache=_active_cache,
-                                )
-                                _vsx_ch_results[_vch] = _vsx_df
-
-                                _n_ok = int(_vsx_df["ok"].sum()) if "ok" in _vsx_df.columns else 0
-                                if _n_ok > 0 and "m_var" in _vsx_df.columns:
-                                    _ok_rows = _vsx_df[_vsx_df["ok"] == 1]
-                                    _med = float(_ok_rows["m_var"].median())
-                                    _amp = float(_ok_rows["m_var"].max() - _ok_rows["m_var"].min())
-                                    _logger.info(
-                                        f"[vsx] target={_vsx_name} channel={_vch} ok={_n_ok}/{len(_vsx_df)} "
-                                        f"median={_med:.3f} amp={_amp:.3f}"
-                                    )
-                                    print(f"    {_vch}: ok={_n_ok}/{len(_vsx_df)}  "
-                                          f"median={_med:.3f}  amp={_amp:.3f}")
-                                else:
-                                    _logger.info(
-                                        f"[vsx] target={_vsx_name} channel={_vch} ok={_n_ok}/{len(_vsx_df)}"
-                                    )
-                                    print(f"    {_vch}: ok={_n_ok}/{len(_vsx_df)}")
-                            except Exception as _e_vsx_phot:
-                                _logger.warning(
-                                    f"[vsx] target={_vsx_name} channel={_vch} error: {_e_vsx_phot}"
-                                )
-                                print(f"    {_vch}: 測光失敗 — {_e_vsx_phot}")
-                            finally:
-                                cfg.target_radec_deg = _cfg_backup_radec
-                                cfg.target_name = _cfg_backup_name
-                                cfg.phot_band = _cfg_backup_band
-                                cfg.regression_diag_dir = _cfg_backup_regdir
-
-                    print(f"\n  [VSX 額外目標] 全部完成")
+        _vsx_shell = _prepare_vsx_candidates(_logger, _args, _vsx_field, cfg)
+        if _vsx_shell is not None:
+            _vsx_cand, _VSX_MAG_MIN, _VSX_MAG_MAX = _vsx_shell
+            if len(_vsx_cand) > 0:
+                print(f"\n{'='*55}")
+                print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 ({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)")
+                print(f"{'='*55}")
+                _run_vsx_targets_for_target(
+                    _logger, _yaml, ACTIVE_TARGET, ACTIVE_DATE, _log_ts, CHANNELS,
+                    cfg, _vsx_cand, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
+                    _shared_aperture_radius, _active_cache, check_star,
+                )
+                _emit_progress(_logger, f"VSX done target={ACTIVE_TARGET} count={len(_vsx_cand)}")
+        _emit_progress_done(_logger, f"main target target={ACTIVE_TARGET} date={ACTIVE_DATE}", _main_target_started)

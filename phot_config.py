@@ -125,13 +125,37 @@ class Cfg:
     stars_csv: Path = Path("stars.csv")
 
 
+def _extinction_channel_key(channel: str) -> str:
+    """Map photometry channel names to the YAML extinction key."""
+    return channel[0] if channel in ("G1", "G2") else channel
+
+
 def _resolve_extinction_k(yaml_dict: dict, channel: str, phot_cfg: dict) -> float:
-    """Resolve per-channel extinction coefficient with photometry fallback."""
-    ext_coeffs = yaml_dict.get("extinction", {}).get("coefficients", {})
-    ch_key = channel[0] if channel in ("G1", "G2") else channel
+    """
+    Resolve per-channel extinction coefficient.
+
+    Priority (behavior):
+    1) observation_config.yaml: extinction.coefficients.<channel-key>
+    2) observation_config.yaml: photometry.extinction_k (legacy fallback)
+    3) default: 0.0
+
+    Notes:
+    - This helper intentionally does not normalize channel casing; callers should
+      pass the canonical channel key used in YAML (e.g., "B", "R", "G1", "G2").
+    - For historical reasons, ("G1", "G2") map to the single key "G".
+    """
+    ext = yaml_dict.get("extinction", {})
+    ext_coeffs = ext.get("coefficients", {})
+
+    ch_key = _extinction_channel_key(channel)
     if ch_key in ext_coeffs:
         return float(ext_coeffs[ch_key])
+
     return float(phot_cfg.get("extinction_k", 0.0))
+
+
+# Public alias for shared imports; keep internal name for backward compatibility.
+resolve_extinction_k = _resolve_extinction_k
 
 
 def cfg_from_yaml(

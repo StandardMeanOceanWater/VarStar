@@ -10,11 +10,13 @@ import numpy as np
 import pandas as pd
 
 script_dir = Path(__file__).parent.absolute()
-if str(script_dir) not in sys.path:
-    sys.path.insert(0, str(script_dir))
+pipeline_dir = script_dir.parent
+if str(pipeline_dir) not in sys.path:
+    sys.path.insert(0, str(pipeline_dir))
 
 try:
-    from photometry import plot_light_curve, load_pipeline_config, cfg_from_yaml
+    from polt_light_curve import plot_light_curve
+    from photometry import load_pipeline_config, cfg_from_yaml
     from period_analysis import run_period_analysis
     print("匯入模組成功。")
 except ImportError:
@@ -30,7 +32,7 @@ DATE_STR  = "20251220"
 CHANNELS  = ["R", "G1", "G2", "B"]
 BASE      = Path("d:/VarStar")
 OUT_DIR   = BASE / "data/targets" / TARGET / "output"
-CONFIG    = script_dir / "observation_config.yaml"
+CONFIG    = pipeline_dir / "observation_config.yaml"
 
 
 def replot():
