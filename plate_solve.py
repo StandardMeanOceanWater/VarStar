@@ -40,14 +40,20 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import matplotlib
 import numpy as np
 from astropy.io import fits
+from matplotlib.colors import LinearSegmentedColormap
 from astropy.wcs import WCS  # noqa: F401  (保留供呼叫端 import)
 
 from Calibration import load_config, read_raw_image
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 # =============================================================================
@@ -167,6 +173,163 @@ def _get_hint_for_target(
     ra_hours = float(ra_h)                # 單位已是小時，直接使用
     spd_deg = 90.0 + float(dec_deg)       # 南極距：SPD = 90 + Dec
     return ra_hours, spd_deg
+
+
+def _relative_offset_arcmin(
+    ra_deg: float,
+    dec_deg: float,
+    ref_ra_deg: float,
+    ref_dec_deg: float,
+) -> tuple[float, float]:
+    dra_deg = (ra_deg - ref_ra_deg + 180.0) % 360.0 - 180.0
+    x_arcmin = dra_deg * float(np.cos(np.deg2rad(ref_dec_deg))) * 60.0
+    y_arcmin = (dec_deg - ref_dec_deg) * 60.0
+    return float(x_arcmin), float(y_arcmin)
+
+
+def _parse_local_hour(header: fits.Header) -> Optional[float]:
+    for key in ("MID-OBS", "DATE-OBS"):
+        value = header.get(key)
+        if not value:
+            continue
+        text = str(value).strip().replace("Z", "")
+        try:
+            dt_utc = datetime.fromisoformat(text)
+        except ValueError:
+            continue
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone(timezone(timedelta(hours=8)))
+        return (
+            float(dt_local.hour)
+            + float(dt_local.minute) / 60.0
+            + float(dt_local.second) / 3600.0
+        )
+    return None
+
+
+def _local_hour_to_color_value(local_hour: Optional[float]) -> float:
+    if local_hour is None:
+        return 0.5
+    hour = local_hour % 24.0
+    if hour >= 18.0:
+        return (hour - 18.0) / 12.0
+    return (hour + 6.0) / 12.0
+
+
+def _drift_colormap() -> LinearSegmentedColormap:
+    return LinearSegmentedColormap.from_list(
+        "night_cycle",
+        [
+            (0.0, "#00A2E8"),
+            (4.0 / 12.0, "#1b3358"),
+            (8.0 / 12.0, "#1b3358"),
+            (1.0, "#00A2E8"),
+        ],
+    )
+
+
+def _collect_drift_entries(wcs_files: list[Path]) -> list[dict]:
+    entries: list[dict] = []
+    for seq, wcs_path in enumerate(sorted(wcs_files), start=1):
+        with fits.open(wcs_path, ignore_missing_end=True) as hdul:
+            hdu = next((item for item in hdul if item.data is not None), None)
+            if hdu is None:
+                continue
+            data = np.asarray(hdu.data)
+            if data.ndim != 2:
+                continue
+            header = hdu.header.copy()
+        if "CRVAL1" not in header or "CRVAL2" not in header:
+            continue
+        wcs = WCS(header)
+        height, width = data.shape
+        pixel_map = {
+            "center": ((width - 1) / 2.0, (height - 1) / 2.0),
+            "tl": (0.0, 0.0),
+            "tr": (width - 1.0, 0.0),
+            "bl": (0.0, height - 1.0),
+            "br": (width - 1.0, height - 1.0),
+        }
+        entry = {
+            "seq": seq,
+            "file": wcs_path.name,
+            "local_hour": _parse_local_hour(header),
+            "points": {},
+        }
+        for label, (x_pix, y_pix) in pixel_map.items():
+            ra_deg, dec_deg = wcs.wcs_pix2world([[x_pix, y_pix]], 0)[0]
+            entry["points"][label] = (float(ra_deg), float(dec_deg))
+        entries.append(entry)
+    return entries
+
+
+def _plot_drift_report(
+    wcs_files: list[Path],
+    out_png: Path,
+    title: str,
+) -> bool:
+    entries = _collect_drift_entries(wcs_files)
+    if not entries:
+        return False
+
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=140)
+    ref_ra_deg, ref_dec_deg = entries[0]["points"]["center"]
+    center_ras: list[float] = []
+    center_decs: list[float] = []
+    center_colors: list[float] = []
+
+    for entry in entries:
+        tl = entry["points"]["tl"]
+        tr = entry["points"]["tr"]
+        br = entry["points"]["br"]
+        bl = entry["points"]["bl"]
+        outline_ra = [tl[0], tr[0], br[0], bl[0], tl[0]]
+        outline_dec = [tl[1], tr[1], br[1], bl[1], tl[1]]
+        ax.plot(outline_ra, outline_dec, color="#7f8c8d", linewidth=0.7, alpha=0.18)
+
+        center_ra, center_dec = entry["points"]["center"]
+        center_ras.append(center_ra)
+        center_decs.append(center_dec)
+        center_colors.append(_local_hour_to_color_value(entry.get("local_hour")))
+        ax.text(
+            center_ra,
+            center_dec,
+            str(entry["seq"]),
+            color="#0b1220",
+            fontsize=7,
+            ha="left",
+            va="bottom",
+        )
+
+    scatter = ax.scatter(
+        center_ras,
+        center_decs,
+        s=42,
+        c=center_colors,
+        cmap=_drift_colormap(),
+        marker="o",
+        edgecolors="none",
+        alpha=0.95,
+        zorder=3,
+    )
+
+    ax.axhline(ref_dec_deg, color="0.7", linewidth=0.8)
+    ax.axvline(ref_ra_deg, color="0.7", linewidth=0.8)
+    ax.set_title(title)
+    ax.set_xlabel("Right Ascension (deg)")
+    ax.set_ylabel("Declination (deg)")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.invert_xaxis()
+    cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_ticks([0.0, 4.0 / 12.0, 8.0 / 12.0, 1.0])
+    cbar.set_ticklabels(["18:00", "22:00", "02:00", "06:00"])
+    cbar.set_label("Local time")
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, bbox_inches="tight")
+    plt.close(fig)
+    return True
 
 
 # =============================================================================
@@ -516,12 +679,14 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
 
         date = str(session["date"])
         data_root = cfg["_data_root"]
+        project_root = cfg["_project_root"]
 
         for target in target_list:
             _tgt_cfg = cfg.get("targets", {}).get(target, {})
             _group = _tgt_cfg.get("group", target)
             _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             field_root = data_root / _date_fmt / _group
+            output_dir = project_root / "output" / _date_fmt / _group
             if src_dir:
                 cal_dir = field_root / src_dir
                 wcs_dir = field_root / (wcs_out_dir or src_dir)
@@ -631,6 +796,13 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                 f"已跳過（存在）{skipped}"
             )
             print(f"       WCS 輸出目錄：{wcs_dir}")
+
+            drift_suffix = "raw" if raw_mode else "cal"
+            drift_png = output_dir / f"plate_solve_drift_{drift_suffix}.png"
+            drift_title = f"Drift {date} ({_group})"
+            wcs_files = sorted(wcs_dir.glob("*_wcs.fits"))
+            if _plot_drift_report(wcs_files, drift_png, drift_title):
+                print(f"       Drift plot: {drift_png}")
 
     print("\n" + "=" * 20)
     print("所有 Session 星圖解算完成。")

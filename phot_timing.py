@@ -107,7 +107,7 @@ def apply_gain_from_header(header, cfg, force: bool = False) -> None:
         cfg.gain_e_per_adu = float(entry["gain"])
     if cfg.read_noise_e is None and entry.get("read_noise") is not None:
         cfg.read_noise_e = float(entry["read_noise"])
-    print(f"[GAIN] ISO {iso} ??gain={cfg.gain_e_per_adu:.4f} e-/DN, "
+    print(f"[GAIN] ISO {iso} -> gain={cfg.gain_e_per_adu:.4f} e-/DN, "
           f"read_noise={cfg.read_noise_e:.4f} e-")
 
 
@@ -226,7 +226,7 @@ def time_from_header(
                 .alt.deg
             )
             _phot_logger.debug(
-                "[WARN] High airmass X=%.2f (altitude=%.1f簞) in %s. "
+                "[WARN] High airmass X=%.2f (altitude=%.1f deg) in %s. "
                 "Differential photometry accuracy may be reduced.",
                 airmass, alt_deg, header.get("FILENAME", "unknown"),
             )

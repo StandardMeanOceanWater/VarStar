@@ -46,12 +46,15 @@ import yaml
 from astropy.io import fits
 from astropy.utils.exceptions import AstropyWarning
 from tqdm import tqdm
+from cal_sources.bias import build_master_bias_chain
+from cal_sources.dark import build_dark_rate_chain, build_master_dark_signal_chain
+from cal_sources.flat import build_flatnorm_map_chain
 
 try:
     import rawpy
     import exifread
 except ImportError:
-    print("[系統] 正在安裝必備套件 rawpy, exifread …")
+    print("[INFO] Installing required packages: rawpy, exifread")
     os.system("pip install rawpy exifread --quiet")
     import rawpy
     import exifread
@@ -570,9 +573,9 @@ def create_master(
         file_list 為空，或各幀尺寸不一致。
     """
     if not file_list:
-        raise ValueError(f"沒有 {desc} 幀，無法合成 Master。")
+        raise ValueError(f"no frames available for {desc}")
 
-    print(f"\n[Master] 合成 {desc}（共 {len(file_list)} 張）…")
+    print(f"\n[Master] Build {desc} ({len(file_list)} frames)")
 
     # 確認參考尺寸
     ref_data, _ = read_raw_image(file_list[0], tz_offset_hours=tz_offset_hours)
@@ -589,12 +592,12 @@ def create_master(
             try:
                 d, _ = read_raw_image(fp, tz_offset_hours=tz_offset_hours)
                 if d.shape != ref_shape:
-                    print(f"  [WARN] 尺寸不符，跳過：{fp.name} "
-                          f"({d.shape} ≠ {ref_shape})")
+                    print(f"  [WARN] shape mismatch, skipped: {fp.name} "
+                          f"({d.shape} != {ref_shape})")
                     continue
                 stack.append(d)
             except Exception as exc:
-                print(f"  [WARN] 讀取失敗，跳過：{fp.name}  ({exc})")
+                print(f"  [WARN] read failed, skipped: {fp.name} ({exc})")
         if stack:
             chunk_medians.append(
                 np.nanmedian(np.array(stack, dtype=np.float32), axis=0).astype(np.float32)
@@ -603,7 +606,7 @@ def create_master(
         gc.collect()
 
     if not chunk_medians:
-        raise ValueError(f"所有 {desc} 幀均讀取失敗。")
+        raise ValueError(f"all {desc} frames failed to load")
 
     master = np.nanmedian(
         np.array(chunk_medians, dtype=np.float32), axis=0
@@ -750,6 +753,33 @@ def _frame_type(path: Path) -> str:
     if suffix in (".fit", ".fits"):
         return "fits"
     raise ValueError(f"unsupported frame type: {path}")
+
+
+def _session_targets(session: dict) -> List[str]:
+    raw_targets = session.get("targets", session.get("target", "UNKNOWN"))
+    if isinstance(raw_targets, str):
+        return [str(raw_targets)]
+    return [str(item) for item in raw_targets]
+
+
+def _session_groups(cfg: dict, session: dict) -> List[str]:
+    groups: List[str] = []
+    for target in _session_targets(session):
+        group = _target_group(cfg, target)
+        if group not in groups:
+            groups.append(group)
+    return groups
+
+
+def _session_light_frame_types(cfg: dict, session: dict) -> List[str]:
+    frame_types: List[str] = []
+    for target in _session_targets(session):
+        paths = resolve_session_paths(cfg, {**session, "target": target})
+        for light_path in _list_image_files(paths["light_dir"]):
+            frame_type = _frame_type(light_path)
+            if frame_type not in frame_types:
+                frame_types.append(frame_type)
+    return frame_types
 
 
 def _extract_fractional_exposure(value: object) -> Optional[float]:
@@ -1067,110 +1097,92 @@ def _read_frame_data(path: Path, session: dict, tz_offset: int, gain_e: Optional
 
 
 def _build_master_bias(cfg: dict, session: dict, paths_ref: dict, tz_offset: int) -> Tuple[Optional[Array], Optional[fits.Header], Optional[int]]:
-    bias_files = _list_image_files(paths_ref["bias_dir"])
-    if not bias_files:
-        return None, None, None
-    master_root = _ensure_master_root(cfg)
-    frame_type = _frame_type(bias_files[0])
-    iso_value = _infer_calibration_iso(bias_files, str(session["date"]))
-    existing = _load_first_existing(_master_bias_paths(master_root, str(session["date"]), frame_type, iso_value))
-    if existing is not None:
-        data, header, path = existing
-        _info(f"loaded master bias: {path.name}")
-        return data.astype(np.float32), header, int(header["ISOSPEED"]) if "ISOSPEED" in header else iso_value
-    master_bias = create_master(bias_files, "Master Bias Raw", tz_offset_hours=tz_offset).astype(np.float32)
-    header = _build_master_header("bias_raw", str(session["date"]), frame_type, iso_value, None)
-    out_path = _master_bias_paths(master_root, str(session["date"]), frame_type, iso_value)[0]
-    _write_master(out_path, master_bias, header)
-    _info(f"saved master bias: {out_path.name}")
-    return master_bias, header, iso_value
+    return build_master_bias_chain(
+        cfg=cfg,
+        session=session,
+        paths_ref=paths_ref,
+        tz_offset=tz_offset,
+        list_image_files=_list_image_files,
+        ensure_master_root=_ensure_master_root,
+        frame_type_of=_frame_type,
+        infer_calibration_iso=_infer_calibration_iso,
+        load_first_existing=_load_first_existing,
+        master_bias_paths=_master_bias_paths,
+        create_master=create_master,
+        build_master_header=_build_master_header,
+        write_master=_write_master,
+        info=_info,
+    )
 
 
 def _build_master_dark_signal(cfg: dict, session: dict, paths_ref: dict, tz_offset: int, master_bias: Optional[Array]) -> Tuple[Optional[Array], Optional[fits.Header], Optional[float], Optional[int]]:
-    dark_files = _list_image_files(paths_ref["dark_dir"])
-    if not dark_files:
-        return None, None, None, None
-    master_root = _ensure_master_root(cfg)
-    frame_type = _frame_type(dark_files[0])
-    iso_value = _infer_calibration_iso(dark_files, str(session["date"]))
-    dark_temp_c = paths_ref.get("dark_temp_c")
-    existing = _load_first_existing(_master_dark_paths(master_root, str(session["date"]), frame_type, iso_value, dark_temp_c))
-    if existing is not None:
-        data, header, path = existing
-        _info(f"loaded master dark signal: {path.name}")
-        exposure_s = _extract_fractional_exposure(header.get("EXPTIME"))
-        return data.astype(np.float32), header, exposure_s, int(header["ISOSPEED"]) if "ISOSPEED" in header else iso_value
-    dark_raw = create_master(dark_files, "Master Dark Raw", tz_offset_hours=tz_offset).astype(np.float32)
-    t_dark = _infer_common_exposure(dark_files, str(session["date"]))
-    master_dark_signal = dark_raw.copy()
-    if master_bias is not None:
-        master_dark_signal -= master_bias.astype(np.float32)
-    header = _build_master_header(
-        "dark_signal",
-        str(session["date"]),
-        frame_type,
-        iso_value,
-        t_dark,
-        extra={"DARKTEMP": float(dark_temp_c) if dark_temp_c is not None else "UNKNOWN"},
+    return build_master_dark_signal_chain(
+        cfg=cfg,
+        session=session,
+        paths_ref=paths_ref,
+        tz_offset=tz_offset,
+        master_bias=master_bias,
+        list_image_files=_list_image_files,
+        ensure_master_root=_ensure_master_root,
+        frame_type_of=_frame_type,
+        infer_calibration_iso=_infer_calibration_iso,
+        load_first_existing=_load_first_existing,
+        master_dark_paths=_master_dark_paths,
+        extract_fractional_exposure=_extract_fractional_exposure,
+        create_master=create_master,
+        infer_common_exposure=_infer_common_exposure,
+        build_master_header=_build_master_header,
+        write_master=_write_master,
+        info=_info,
     )
-    out_path = _master_dark_paths(master_root, str(session["date"]), frame_type, iso_value, dark_temp_c)[0]
-    _write_master(out_path, master_dark_signal, header)
-    _info(f"saved master dark signal: {out_path.name}")
-    return master_dark_signal, header, t_dark, iso_value
 
 
 def _build_dark_rate(cfg: dict, session: dict, dark_signal: Optional[Array], dark_header: Optional[fits.Header], t_dark: Optional[float], dark_iso: Optional[int], dark_temp_c: Optional[float]) -> Optional[Array]:
-    if dark_signal is None:
-        return None
-    master_root = _ensure_master_root(cfg)
-    frame_type = "cr2"
-    if dark_header is not None and "FRMTYPE" in dark_header:
-        frame_type = str(dark_header["FRMTYPE"]).strip().lower()
-    existing = _load_first_existing(_dark_rate_paths(master_root, str(session["date"]), frame_type, dark_iso, dark_temp_c))
-    if existing is not None:
-        data, _, path = existing
-        _info(f"loaded dark rate: {path.name}")
-        return data.astype(np.float32)
-    dark_rate = compute_dark_rate(dark_signal, t_dark)
-    if dark_rate is None:
-        return None
-    header = _build_master_header("dark_rate", str(session["date"]), frame_type, dark_iso, t_dark, extra={"DARKTEMP": float(dark_temp_c) if dark_temp_c is not None else "UNKNOWN"})
-    out_path = _dark_rate_paths(master_root, str(session["date"]), frame_type, dark_iso, dark_temp_c)[0]
-    _write_master(out_path, dark_rate, header)
-    _info(f"saved dark rate: {out_path.name}")
-    return dark_rate
+    return build_dark_rate_chain(
+        cfg=cfg,
+        session=session,
+        dark_signal=dark_signal,
+        dark_header=dark_header,
+        t_dark=t_dark,
+        dark_iso=dark_iso,
+        dark_temp_c=dark_temp_c,
+        ensure_master_root=_ensure_master_root,
+        load_first_existing=_load_first_existing,
+        dark_rate_paths=_dark_rate_paths,
+        compute_dark_rate=compute_dark_rate,
+        build_master_header=_build_master_header,
+        write_master=_write_master,
+        info=_info,
+    )
 
 
 def _build_flatnorm_map(cfg: dict, session: dict, paths_ref: dict, tz_offset: int, master_bias: Optional[Array], dark_rate: Optional[Array], bad_pixel_floor: float, use_median_normalization: bool) -> Dict[str, Array]:
-    flat_map: Dict[str, Array] = {}
-    flat_dirs_by_format = dict(paths_ref.get("flat_dirs_by_format", {}))
-    master_root = _ensure_master_root(cfg)
-    for frame_type, flat_dir in sorted(flat_dirs_by_format.items()):
-        existing = _load_first_existing(_master_flat_product_paths(master_root, str(paths_ref["flat_date"]), frame_type, use_median_normalization))
-        if existing is not None:
-            data, _, path = existing
-            _info(f"loaded master flatnorm: {path.name}")
-            flat_map[frame_type] = data.astype(np.float32)
-            continue
-        flat_files = _list_image_files(flat_dir)
-        if not flat_files:
-            continue
-        master_flat_raw = create_master(flat_files, f"Master Flat Raw ({frame_type.upper()})", tz_offset_hours=tz_offset).astype(np.float32)
-        t_flat = _infer_common_exposure(flat_files, str(session["date"]))
-        flat_pure = compute_flat_pure(master_flat_raw, master_bias, dark_rate, t_flat)
-        master_flatnorm = normalize_flat_pure(flat_pure, bad_pixel_floor, use_median_normalization=use_median_normalization)
-        header = _build_master_header(
-            "flatnorm" if use_median_normalization else "flatdirect",
-            str(paths_ref["flat_date"]),
-            frame_type,
-            None,
-            t_flat,
-        )
-        out_path = _master_flat_product_paths(master_root, str(paths_ref["flat_date"]), frame_type, use_median_normalization)[0]
-        _write_master(out_path, master_flatnorm, header)
-        _info(f"saved master flatnorm: {out_path.name}")
-        flat_map[frame_type] = master_flatnorm.astype(np.float32)
-    return flat_map
+    return build_flatnorm_map_chain(
+        cfg=cfg,
+        session=session,
+        paths_ref=paths_ref,
+        tz_offset=tz_offset,
+        master_bias=master_bias,
+        dark_rate=dark_rate,
+        bad_pixel_floor=bad_pixel_floor,
+        use_median_normalization=use_median_normalization,
+        session_groups=_session_groups,
+        session_light_frame_types=_session_light_frame_types,
+        list_image_files=_list_image_files,
+        frame_type_of=_frame_type,
+        ensure_master_root=_ensure_master_root,
+        master_root=_master_root,
+        master_flat_product_paths=_master_flat_product_paths,
+        load_first_existing=_load_first_existing,
+        create_master=create_master,
+        infer_common_exposure=_infer_common_exposure,
+        compute_flat_pure=compute_flat_pure,
+        normalize_flat_pure=normalize_flat_pure,
+        build_master_header=_build_master_header,
+        write_master=_write_master,
+        warn=_warn,
+        info=_info,
+    )
 
 
 def _check_iso_warning(light_meta: Dict[str, object], bias_iso: Optional[int], dark_iso: Optional[int]) -> List[str]:
@@ -1319,8 +1331,7 @@ def run_calibration(config_path: str | Path, *, no_flat: bool = False) -> None:
         )
         if not no_flat and not flat_map:
             raise ValueError(f"no matching flats available for session {session_date}")
-        raw_targets = session.get("targets", session.get("target", "UNKNOWN"))
-        targets = [str(raw_targets)] if isinstance(raw_targets, str) else [str(item) for item in raw_targets]
+        targets = _session_targets(session)
         for target in targets:
             _calibrate_target(
                 cfg,

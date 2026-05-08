@@ -5,14 +5,28 @@ Plate-solving utilities (ASTAP) and WCS helpers.
 """
 from __future__ import annotations
 
+from functools import wraps
 from pathlib import Path
 import shutil
 import subprocess
 
 from astropy.io import fits
 
-# cfg is injected from photometry wrapper
+# cfg may be set directly or supplied through owner-side binding helpers.
 cfg = None
+
+
+def set_cfg(cfg_obj):
+    global cfg
+    cfg = cfg_obj
+    return cfg
+
+
+def _resolve_cfg(cfg_obj=None):
+    active_cfg = cfg_obj if cfg_obj is not None else cfg
+    if active_cfg is None:
+        raise RuntimeError("phot_wcs cfg is not configured")
+    return active_cfg
 
 def _has_wcs(header) -> bool:
 
@@ -46,7 +60,15 @@ def _estimate_fov_deg(path: Path) -> float | None:
 
         return None
 
-def run_astap_plate_solve(in_fits: Path, out_wcs_fits: Path, timeout_sec: int = 180):
+def run_astap_plate_solve(
+    in_fits: Path,
+    out_wcs_fits: Path,
+    timeout_sec: int = 180,
+    *,
+    cfg_obj=None,
+):
+
+    active_cfg = _resolve_cfg(cfg_obj)
 
     out_wcs_fits.parent.mkdir(parents=True, exist_ok=True)
 
@@ -54,25 +76,29 @@ def run_astap_plate_solve(in_fits: Path, out_wcs_fits: Path, timeout_sec: int = 
 
 
 
-    spd = 90.0 + float(cfg.astap_dec_deg)
+    spd = 90.0 + float(active_cfg.astap_dec_deg)
 
-    fov_deg = cfg.astap_fov_override_deg if cfg.astap_fov_override_deg > 0 else _estimate_fov_deg(out_wcs_fits)
+    fov_deg = (
+        active_cfg.astap_fov_override_deg
+        if active_cfg.astap_fov_override_deg > 0
+        else _estimate_fov_deg(out_wcs_fits)
+    )
 
 
 
     cmd = [
 
-        str(cfg.astap_exe),
+        str(active_cfg.astap_exe),
 
         "-f", str(out_wcs_fits),
 
-        "-r", str(cfg.astap_search_radius_deg),
+        "-r", str(active_cfg.astap_search_radius_deg),
 
-        "-z", str(cfg.astap_downsample),
+        "-z", str(active_cfg.astap_downsample),
 
-        "-d", str(cfg.astap_db_path),
+        "-d", str(active_cfg.astap_db_path),
 
-        "-ra", f"{cfg.astap_ra_hours}",
+        "-ra", f"{active_cfg.astap_ra_hours}",
 
         "-spd", f"{spd}",
 
@@ -84,9 +110,9 @@ def run_astap_plate_solve(in_fits: Path, out_wcs_fits: Path, timeout_sec: int = 
 
         cmd += ["-fov", f"{fov_deg:.3f}"]
 
-    if cfg.astap_speed:
+    if active_cfg.astap_speed:
 
-        cmd += ["-speed", cfg.astap_speed]
+        cmd += ["-speed", active_cfg.astap_speed]
 
 
 
@@ -120,9 +146,11 @@ def run_astap_plate_solve(in_fits: Path, out_wcs_fits: Path, timeout_sec: int = 
 
             raise RuntimeError(f"[ASTAP] no WCS keywords in {out_wcs_fits.name}")
 
-def batch_plate_solve_all(timeout_sec: int = 180, force: bool = False):
+def batch_plate_solve_all(timeout_sec: int = 180, force: bool = False, *, cfg_obj=None):
 
-    fits_files = sorted(list(cfg.fits_dir.glob("*.fits")) + list(cfg.fits_dir.glob("*.fit")))
+    active_cfg = _resolve_cfg(cfg_obj)
+
+    fits_files = sorted(list(active_cfg.fits_dir.glob("*.fits")) + list(active_cfg.fits_dir.glob("*.fit")))
 
     ok, fail = 0, 0
 
@@ -132,7 +160,7 @@ def batch_plate_solve_all(timeout_sec: int = 180, force: bool = False):
 
     for f in fits_files:
 
-        out = cfg.wcs_out_dir / (f.stem + "_wcs.fits")
+        out = active_cfg.wcs_out_dir / (f.stem + "_wcs.fits")
 
         if out.exists() and not force:
 
@@ -146,7 +174,7 @@ def batch_plate_solve_all(timeout_sec: int = 180, force: bool = False):
 
         try:
 
-            run_astap_plate_solve(f, out, timeout_sec=timeout_sec)
+            run_astap_plate_solve(f, out, timeout_sec=timeout_sec, cfg_obj=active_cfg)
 
             ok += 1
 
@@ -165,3 +193,26 @@ def batch_plate_solve_all(timeout_sec: int = 180, force: bool = False):
     print(f"ASTAP finished: ok={ok}, fail={fail}, total_wcs={len(out_paths)}")
 
     return out_paths
+
+
+def make_cfg_bound_astap_functions(cfg_getter):
+    @wraps(run_astap_plate_solve)
+    def bound_run_astap_plate_solve(in_fits: Path, out_wcs_fits: Path, timeout_sec: int = 180):
+        active_cfg = set_cfg(cfg_getter())
+        return run_astap_plate_solve(
+            in_fits,
+            out_wcs_fits,
+            timeout_sec=timeout_sec,
+            cfg_obj=active_cfg,
+        )
+
+    @wraps(batch_plate_solve_all)
+    def bound_batch_plate_solve_all(timeout_sec: int = 180, force: bool = False):
+        active_cfg = set_cfg(cfg_getter())
+        return batch_plate_solve_all(
+            timeout_sec=timeout_sec,
+            force=force,
+            cfg_obj=active_cfg,
+        )
+
+    return bound_run_astap_plate_solve, bound_batch_plate_solve_all

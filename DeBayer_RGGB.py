@@ -272,11 +272,22 @@ def run_debayer(config_path: "str | Path", *, raw_mode: bool = False,
 
         data_root = cfg["_data_root"]
 
+        group_targets: dict[str, list[str]] = {}
         for target in targets_list:
             target_cfg = cfg.get("targets", {}).get(target, {})
-            object_name = target_cfg.get("display_name", target)
-
             _group = target_cfg.get("group", target)
+            group_targets.setdefault(_group, []).append(target)
+
+        for _group, group_target_names in group_targets.items():
+            if len(group_target_names) == 1:
+                only_target = group_target_names[0]
+                target_cfg = cfg.get("targets", {}).get(only_target, {})
+                object_name = target_cfg.get("display_name", only_target)
+                session_label = only_target
+            else:
+                object_name = _group
+                session_label = f"{_group} [{', '.join(group_target_names)}]"
+
             _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             field_root = data_root / _date_fmt / _group
             if wcs_subdir:
@@ -292,16 +303,16 @@ def run_debayer(config_path: "str | Path", *, raw_mode: bool = False,
             wcs_files = sorted(wcs_dir.glob("*_wcs.fits"))
             if not wcs_files:
                 _src = "wcs_raw/" if raw_mode else "wcs/"
-                print(f"[SKIP] {target}/{date}：{_src} 目錄裡找不到 *_wcs.fits。")
+                print(f"[SKIP] {session_label}/{date}：{_src} 目錄裡找不到 *_wcs.fits。")
                 continue
 
-            print(f"\n[Session] {target} / {date}  ({len(wcs_files)} 幀)")
+            print(f"\n[Session] {session_label} / {date}  ({len(wcs_files)} 幀)")
 
             for ch in ("R", "G1", "G2", "B"):
                 (split_base / ch).mkdir(parents=True, exist_ok=True)
 
             success = failed = 0
-            for fits_path in tqdm(wcs_files, desc=f"{target} 拆色進度"):
+            for fits_path in tqdm(wcs_files, desc=f"{_group} 拆色進度"):
                 try:
                     with fits.open(fits_path) as hdul:
                         hdu = next((h for h in hdul if h.data is not None), None)
@@ -354,7 +365,7 @@ def run_debayer(config_path: "str | Path", *, raw_mode: bool = False,
                     print(f"\n  [失敗] {fits_path.name}：{exc}")
                     failed += 1
 
-            print(f"\n[完成] {target}/{date}：成功 {success} 幀，失敗 {failed} 幀")
+            print(f"\n[完成] {session_label}/{date}：成功 {success} 幀，失敗 {failed} 幀")
             print(f"       輸出目錄：{split_base}/{{R,G1,G2,B}}/")
 
     print("\n" + "=" * 20)

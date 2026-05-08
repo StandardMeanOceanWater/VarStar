@@ -6,8 +6,9 @@ Configuration dataclass and YAML -> Cfg mapping for photometry.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from datetime import datetime
 from pathlib import Path
+
+from phot_sources.io_paths import build_run_layout
 
 
 @dataclass
@@ -176,8 +177,6 @@ def cfg_from_yaml(
     tgt = yaml_dict.get("targets", {}).get(target, {})
 
     group = tgt.get("group", target)
-    _date_fmt = f"{session_date[:4]}-{session_date[4:6]}-{session_date[6:8]}"
-    field_root = data_root / _date_fmt / group
 
     if "ra_deg" in tgt:
         ra_deg = float(tgt["ra_deg"])
@@ -270,19 +269,22 @@ def cfg_from_yaml(
     _sat_raw = cam_cfg.get("saturation_adu", 11469.0)
     sat_adu = None if _sat_raw is None else float(_sat_raw)
 
+    layout = build_run_layout(
+        project_root=project_root,
+        data_root=data_root,
+        session_date=session_date,
+        group=group,
+        target=target,
+        channel=channel,
+        split_subdir=split_subdir,
+        run_ts=run_ts,
+    )
     channel = str(channel).upper()
-    wcs_dir = field_root / split_subdir / channel
-
-    _run_ts = run_ts or datetime.now().strftime("%Y%m%d_%H%M")
-    run_root = project_root / "output" / _date_fmt / group / target / _run_ts
-    out_dir = run_root / "1_photometry"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    diag_dir = run_root / "2_regression_diag"
-    diag_dir.mkdir(parents=True, exist_ok=True)
-    lc_dir = run_root / "3_light_curve"
-    lc_dir.mkdir(parents=True, exist_ok=True)
-    pa_dir = run_root / "4_period_analysis"
-    pa_dir.mkdir(parents=True, exist_ok=True)
+    wcs_dir = layout["wcs_dir"]
+    run_root = layout["run_root"]
+    out_dir = layout["out_dir"]
+    diag_dir = layout["diag_dir"]
+    lc_dir = layout["lc_dir"]
 
     _band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
     phot_band = _band_map.get(channel.upper(), "V")
@@ -310,8 +312,8 @@ def cfg_from_yaml(
         run_root=run_root,
         wcs_dir=wcs_dir,
         out_dir=out_dir,
-        phot_out_csv=out_dir / f"photometry_{channel}_{session_date}.csv",
-        phot_out_png=lc_dir / f"light_curve_{channel}_{session_date}.png",
+        phot_out_csv=layout["phot_out_csv"],
+        phot_out_png=layout["phot_out_png"],
         regression_diag_dir=diag_dir,
 
         target_name=display,
@@ -378,7 +380,7 @@ def cfg_from_yaml(
         astap_db_path=Path(yaml_dict.get("astrometry", {}).get("astap", {})
                            .get("db_path", "C:/Program Files/astap/d80")),
         wcs_out_dir=wcs_dir,
-        stars_csv=out_dir / "stars_detected.csv",
+        stars_csv=layout["stars_csv"],
     )
     _merged = {**_auto, **_manual}
     return Cfg(**_merged)
