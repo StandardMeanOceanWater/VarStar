@@ -479,7 +479,16 @@ def _compute_shared_ylim(csv_paths: list[Path], mag_col: str = "m_var") -> tuple
     return (ymax, ymin)
 
 
-def _load_cfg_from_csv(csv_path: Path, channel: str | None, obs_date: str | None, tz_offset_hours: float) -> SimpleNamespace:
+def _load_cfg_from_csv(
+    csv_path: Path,
+    channel: str | None,
+    obs_date: str | None,
+    tz_offset_hours: float,
+    cfg_override=None,
+) -> SimpleNamespace:
+    if cfg_override is not None:
+        return cfg_override
+
     from pipeline_config import load_pipeline_config
     from photometry import cfg_from_yaml
 
@@ -504,6 +513,7 @@ def _plot_overlay(
     height_px: int | None = None,
     dpi: int = 360,
     save_jpg: bool = False,
+    cfg_override=None,
 ) -> Path:
     # Overlay style config (集中管理避免魔數)
     style = {
@@ -576,7 +586,13 @@ def _plot_overlay(
 
     # Use first available channel to build cfg for title/coords
     first_ch = next(iter(csv_by_channel.keys()))
-    cfg = _load_cfg_from_csv(csv_by_channel[first_ch], first_ch, obs_date, tz_offset_hours)
+    cfg = _load_cfg_from_csv(
+        csv_by_channel[first_ch],
+        first_ch,
+        obs_date,
+        tz_offset_hours,
+        cfg_override=cfg_override,
+    )
 
     # Collect data and determine time key
     series = []
@@ -827,6 +843,7 @@ def _plot_overlay_with_fourier(
     width_px: int = 2400,
     height_px: int = 800,
     dpi: int = 360,
+    cfg_override=None,
 ) -> Path:
     style = {
         "colors": {
@@ -865,7 +882,13 @@ def _plot_overlay_with_fourier(
         "grid": {"alpha": 0.9, "lw": 0.9},
     }
     first_ch = next(iter(csv_by_channel.keys()))
-    cfg = _load_cfg_from_csv(csv_by_channel[first_ch], first_ch, obs_date, tz_offset_hours)
+    cfg = _load_cfg_from_csv(
+        csv_by_channel[first_ch],
+        first_ch,
+        obs_date,
+        tz_offset_hours,
+        cfg_override=cfg_override,
+    )
 
     series = []
     time_key = None
@@ -1034,6 +1057,7 @@ def _plot_channel_with_fourier(
     width_px: int = 2400,
     height_px: int = 800,
     dpi: int = 360,
+    cfg_override=None,
 ) -> Path:
     fit_payload = _load_fourier_fit(csv_path, channel)
     if fit_payload is None:
@@ -1054,7 +1078,13 @@ def _plot_channel_with_fourier(
     elif "v_err" in df.columns and pd.notna(df["v_err"]).any():
         err_col = "v_err"
 
-    cfg = _load_cfg_from_csv(csv_path, channel, obs_date, tz_offset_hours)
+    cfg = _load_cfg_from_csv(
+        csv_path,
+        channel,
+        obs_date,
+        tz_offset_hours,
+        cfg_override=cfg_override,
+    )
     colors = {
         "data": {"B": "#9CDDEE", "G1": "#22B14C", "G2": "#9CC51A", "R": "#F6A8C2"},
         "err": {"B": "#76A8B5", "G1": "#1A8439", "G2": "#789813", "R": "#CE8CA2"},
@@ -1437,6 +1467,182 @@ def _plot_overlay_fourier_plotly(
     out_path = out_dir / (out_name or f"light_curve_overlay_{date_str}_fourier_norm.html")
     fig.write_html(out_path, include_plotlyjs="cdn", config={"responsive": True})
     return out_path
+
+
+def _project_root_from_run_root(run_root: Path) -> Path | None:
+    for parent in (run_root, *run_root.parents):
+        if parent.name.lower() == "output":
+            return parent.parent
+    return None
+
+
+def _ordered_channel_names(channels=None) -> list[str]:
+    preferred = ["R", "G1", "G2", "B"]
+    seen: list[str] = []
+    for ch in channels or preferred:
+        ch_up = str(ch).upper()
+        if ch_up and ch_up not in seen:
+            seen.append(ch_up)
+    return [ch for ch in preferred if ch in seen] + [ch for ch in seen if ch not in preferred]
+
+
+def _collect_run_channel_csvs(
+    run_root: Path,
+    obs_date: str | None,
+    channels=None,
+) -> dict[str, Path]:
+    phot_dir = run_root / "1_photometry"
+    csv_by_channel: dict[str, Path] = {}
+    for ch in _ordered_channel_names(channels):
+        candidates: list[Path]
+        if obs_date:
+            candidates = [phot_dir / f"photometry_{ch}_{obs_date}.csv"]
+        else:
+            candidates = sorted(phot_dir.glob(f"photometry_{ch}_*.csv"))
+        for path in candidates:
+            if path.exists():
+                csv_by_channel[ch] = path
+                break
+    return csv_by_channel
+
+
+def _cfg_period_days(cfg) -> float | None:
+    if cfg is None:
+        return None
+    for attr_name in ("accepted_period_days", "period_days", "period_d"):
+        val = getattr(cfg, attr_name, None)
+        if val is None:
+            continue
+        try:
+            return float(val)
+        except Exception:
+            continue
+    return None
+
+
+def _default_accepted_period_days(
+    run_root: Path,
+    target_name: str | None,
+    cfg=None,
+) -> tuple[float | None, Path | None]:
+    period_days = _cfg_period_days(cfg)
+    if period_days is not None:
+        return period_days, None
+
+    project_root = _project_root_from_run_root(run_root)
+    if project_root is None:
+        return None, None
+    return _load_known_period_days(project_root, target_name)
+
+
+def write_run_light_curve_products(
+    run_root: Path,
+    target_name: str | None,
+    obs_date: str | None,
+    channels=None,
+    *,
+    cfg=None,
+    tz_offset_hours: float = 8.0,
+    accepted_period_days: float | None = None,
+    include_overlay: bool = True,
+    include_fourier: bool = True,
+    include_channel_fourier: bool = True,
+    include_plotly_html: bool = True,
+) -> dict[str, list[str]]:
+    run_root = Path(run_root)
+    light_dir = run_root / "3_light_curve"
+    period_dir = run_root / "4_period_analysis"
+    result: dict[str, list[str]] = {"outputs": [], "errors": [], "skipped": []}
+
+    csv_by_channel = _collect_run_channel_csvs(run_root, obs_date, channels)
+    if not csv_by_channel:
+        result["skipped"].append(f"no photometry CSVs found under {run_root / '1_photometry'}")
+        return result
+
+    date_str = obs_date or _infer_obs_date_from_csvs(list(csv_by_channel.values())) or "unknown"
+    accepted = accepted_period_days
+    if accepted is None:
+        accepted, _ = _default_accepted_period_days(run_root, target_name, cfg=cfg)
+
+    has_fit = {
+        ch: _load_fourier_fit(csv_path, ch) is not None
+        for ch, csv_path in csv_by_channel.items()
+    }
+
+    if include_overlay and len(csv_by_channel) >= 2:
+        try:
+            out_png = _plot_overlay(
+                csv_by_channel,
+                light_dir,
+                date_str,
+                tz_offset_hours,
+                out_name=f"light_curve_overlay_{date_str}.png",
+                width_px=2400,
+                height_px=800,
+                dpi=360,
+                save_jpg=False,
+                cfg_override=cfg,
+            )
+            result["outputs"].append(str(out_png))
+        except Exception as exc:
+            result["errors"].append(f"overlay png: {exc}")
+
+    if include_fourier and len(csv_by_channel) >= 2 and any(has_fit.values()):
+        try:
+            out_png = _plot_overlay_with_fourier(
+                csv_by_channel,
+                light_dir,
+                date_str,
+                tz_offset_hours,
+                out_name=f"light_curve_overlay_{date_str}_fourier.png",
+                width_px=2400,
+                height_px=800,
+                dpi=360,
+                cfg_override=cfg,
+            )
+            result["outputs"].append(str(out_png))
+        except Exception as exc:
+            result["errors"].append(f"overlay fourier png: {exc}")
+
+    if include_channel_fourier:
+        for ch, csv_path in csv_by_channel.items():
+            if not has_fit.get(ch):
+                continue
+            try:
+                out_png = _plot_channel_with_fourier(
+                    csv_path,
+                    light_dir,
+                    ch,
+                    date_str,
+                    tz_offset_hours,
+                    out_name=f"light_curve_{ch}_{date_str}_fourier.png",
+                    accepted_period_days=accepted,
+                    width_px=2400,
+                    height_px=800,
+                    dpi=360,
+                    cfg_override=cfg,
+                )
+                result["outputs"].append(str(out_png))
+            except Exception as exc:
+                result["errors"].append(f"channel fourier png {ch}: {exc}")
+
+    if include_plotly_html and any(has_fit.values()):
+        try:
+            out_html = _plot_overlay_fourier_plotly(
+                csv_by_channel,
+                period_dir,
+                date_str,
+                out_name=f"light_curve_overlay_{date_str}_fourier_norm.html",
+                accepted_period_days=accepted,
+                width_px=1280,
+                height_px=720,
+                tz_offset_hours=tz_offset_hours,
+            )
+            result["outputs"].append(str(out_html))
+        except Exception as exc:
+            result["errors"].append(f"overlay fourier plotly html: {exc}")
+
+    return result
 
 
 def main() -> int:

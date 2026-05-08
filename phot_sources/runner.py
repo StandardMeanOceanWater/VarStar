@@ -19,7 +19,7 @@ from phot_sources.field import (
     _field_center_from_wcs_fits,
     _resolve_active_field_cache,
 )
-from phot_sources.io_paths import build_target_log_path, get_field_catalog_dir
+from phot_sources.io_paths import build_target_log_path, get_field_catalog_path
 from phot_sources.logging_utils import (
     attach_file_handler,
     build_log_timestamp,
@@ -158,8 +158,7 @@ def _comp_signature(comp_refs: list) -> str:
 def _prepare_target_aperture_state(logger, cfg, wcs_files, active_target):
     _catalog_started = time.perf_counter()
     emit_progress(logger, f"catalog preload start target={active_target}")
-    _field_cat_dir_pre = get_field_catalog_dir(cfg.run_root)
-    _field_cat_path_pre = _field_cat_dir_pre / "field_catalog_unified.csv"
+    _field_cat_path_pre = get_field_catalog_path(cfg.run_root)
     _field_ra_deg, _field_dec_deg = _field_center_from_wcs_fits(wcs_files[0])
     logger.info(
         "[field center] target=%s field_center=(%.6f, %.6f) target_center=(%.6f, %.6f) catalog=%s",
@@ -173,7 +172,7 @@ def _prepare_target_aperture_state(logger, cfg, wcs_files, active_target):
     if not _field_cat_path_pre.exists():
         print(f"[catalog] 預建統一視場星表...")
     _load_or_build_unified_catalog(
-        cfg, _field_ra_deg, _field_dec_deg, _field_cat_dir_pre,
+        cfg, _field_ra_deg, _field_dec_deg, _field_cat_path_pre,
     )
 
     emit_progress_done(logger, f"catalog preload target={active_target}", _catalog_started)

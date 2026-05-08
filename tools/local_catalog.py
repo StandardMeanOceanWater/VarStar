@@ -174,6 +174,8 @@ def query_local_tycho2(ra_deg: float, dec_deg: float, radius_deg: float = 1.0,
         "e_vmag":  e_v[mag_ok],
         "BT":      bt[mag_ok],
         "VT":      vt[mag_ok],
+        "e_BT":    e_bt[mag_ok],
+        "e_VT":    e_vt[mag_ok],
         "source":  "Tycho2",
     })
     print(f"  [local Tycho-2] 查詢={len(cone)}, 通過={len(result)}")

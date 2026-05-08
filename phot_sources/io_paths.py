@@ -57,8 +57,8 @@ def build_target_log_path(run_root: Path, active_date: str, log_ts: str) -> Path
     return run_root / "1_photometry" / f"photometry_{active_date}_{log_ts}.log"
 
 
-def get_field_catalog_dir(run_root: Path) -> Path:
-    return run_root.parent.parent / "catalogs"
+def get_field_catalog_path(run_root: Path) -> Path:
+    return run_root.parent.parent / "catalog.csv"
 
 
 def build_vsx_run_layout(
@@ -94,5 +94,5 @@ __all__ = [
     "build_target_log_path",
     "build_vsx_run_layout",
     "format_session_date",
-    "get_field_catalog_dir",
+    "get_field_catalog_path",
 ]

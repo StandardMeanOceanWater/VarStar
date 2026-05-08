@@ -435,6 +435,8 @@ def fetch_tycho2_cone(
                 "e_vmag":  e_v,
                 "BT":      bt,
                 "VT":      vt,
+                "e_BT":    e_bt,
+                "e_VT":    e_vt,
                 "source":  "Tycho2",
             })
         df_out = pd.DataFrame(rows)

@@ -24,6 +24,7 @@ from phot_sources.core import (
     m_inst_from_flux,
     radec_to_pixel,
 )
+from phot_sources.diagnostics import save_regression_overview
 from phot_sources.logging_utils import emit_progress, emit_progress_done
 from phot_sources.regression import mag_error_from_flux, robust_linear_fit
 from phot_timing import apply_gain_from_header, require_cfg_values, time_from_header
@@ -66,6 +67,24 @@ def _emit_photometry_products(
           f"({n_written} rows written, {n_after_clip} successful "
           f"[{n_before_clip - n_after_clip} sigma-clipped], "
           f"{n_skipped} skipped [airmass > {cfg.alt_min_airmass:.3f}])")
+
+    if getattr(cfg, "save_regression_diagnostic", False):
+        try:
+            save_regression_overview(
+                df=df,
+                out_csv=out_csv,
+                channel=channel,
+                cfg=cfg,
+                time_key=time_key,
+                first_frame_diag_data=first_frame_diag_data,
+            )
+        except Exception as exc:
+            _phot_logger.exception(
+                "regression diagnostic failed target=%s channel=%s",
+                getattr(cfg, "target_name", ""),
+                channel,
+            )
+            print(f"[WARN] regression diagnostic failed: {exc}")
 
     d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
     if len(d) == 0:
@@ -226,6 +245,7 @@ def run_photometry_on_wcs_dir(
     n_low_sharpness  = 0
     n_low_peak_ratio = 0
     n_low_reg_r2      = 0
+    n_insufficient_comps = 0
     rows = []
     _first_frame_diag_data = None   # (comp_m_cat, comp_m_inst, fit) for diag plot
 
@@ -469,8 +489,20 @@ def run_photometry_on_wcs_dir(
 
         comp_m_inst  = np.asarray(comp_m_inst, dtype=float)
         comp_m_cat   = np.asarray(comp_m_cat,  dtype=float)
+        rec["comp_available"] = int(len(comp_m_inst))
 
         if len(comp_m_inst) < cfg_obj.robust_regression_min_points:
+            rec["ok"] = 0
+            rec["ok_flag"] = "insufficient_comps"
+            rec["comp_used"] = 0
+            rec["reg_min_points"] = int(cfg_obj.robust_regression_min_points)
+            n_insufficient_comps += 1
+            if _first_frame_diag_data is None and len(comp_m_cat) > 0:
+                _first_frame_diag_data = (
+                    comp_m_cat.copy(), comp_m_inst.copy(), None,
+                    float(getattr(cfg_obj, "vmag_approx", np.nan)),
+                    float(m_inst_t),
+                )
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
             continue
@@ -879,7 +911,8 @@ def run_photometry_on_wcs_dir(
     _n_qual_filtered = (_n_low_sharpness_val
                         + _n_low_peak_ratio_val + _n_low_reg_r2_val
                         + n_reg_jump + n_reg_resid_rms + n_reg_resid_p90
-                        + n_high_sky + n_low_peak_ratio_adaptive)
+                        + n_high_sky + n_low_peak_ratio_adaptive
+                        + n_insufficient_comps)
     _n_phot_fail   = _n_in_df - _n_ok_final - _n_sigma_clip - _n_qual_filtered
 
     _sep = "-" * 68
@@ -891,6 +924,7 @@ def run_photometry_on_wcs_dir(
     print(f"  {'低 Sharpness 剔除':<24} {_n_low_sharpness_val:>6}    S=flux(r=3)/flux(r=8) < {float(getattr(cfg_obj,'sharpness_min',0.3)):.2f}")
     print(f"  {'低 Peak Ratio 剔除':<24} {_n_low_peak_ratio_val:>6}    peak/flux < {float(getattr(cfg_obj,'peak_ratio_min',0.0)):.3f} (0=停用)")
     print(f"  {'低 reg R2 剔除':<24} {_n_low_reg_r2_val:>6}    reg_r2 < {float(getattr(cfg_obj,'reg_r2_min',0.0)):.2f} (0=停用)")
+    print(f"  {'比較星不足':<24} {n_insufficient_comps:>6}    comp_available < {int(cfg_obj.robust_regression_min_points)}")
     print(f"  {'孔徑/WCS/邊界失敗':<24} {_n_phot_fail:>6}    flux/位置無效")
     print(f"  {'sigma_clip':<24} {_n_sigma_clip:>6}    |m_var - median| > 3 * 1.4826 * MAD")
     print(f"  {'回歸截距突變':<24} {n_reg_jump:>6}    rolling median ± {float(getattr(cfg_obj,'reg_intercept_sigma',0.0)):.1f} MAD (0=停用)")
@@ -915,6 +949,7 @@ def run_photometry_on_wcs_dir(
         {"reason": "低 Sharpness 剔除", "count": _n_low_sharpness_val,   "threshold": f"S < {float(getattr(cfg_obj,'sharpness_min',0.3)):.2f}",                 "config_key": "sharpness_min",       "config_value": float(getattr(cfg_obj, "sharpness_min", 0.3))},
         {"reason": "低 Peak Ratio 剔除","count": _n_low_peak_ratio_val,  "threshold": f"peak/flux < {float(getattr(cfg_obj,'peak_ratio_min',0.0)):.3f}",        "config_key": "peak_ratio_min",      "config_value": float(getattr(cfg_obj, "peak_ratio_min", 0.0))},
         {"reason": "低 reg R2 剔除",    "count": _n_low_reg_r2_val,       "threshold": f"reg_r2 < {float(getattr(cfg_obj,'reg_r2_min',0.0)):.2f}",                 "config_key": "reg_r2_min",           "config_value": float(getattr(cfg_obj, "reg_r2_min", 0.0))},
+        {"reason": "比較星不足",         "count": n_insufficient_comps,    "threshold": f"comp_available < {int(cfg_obj.robust_regression_min_points)}",          "config_key": "robust_regression_min_points", "config_value": int(cfg_obj.robust_regression_min_points)},
         {"reason": "孔徑/WCS/邊界失敗", "count": _n_phot_fail,           "threshold": "flux/位置無效",                                                     "config_key": "—",                   "config_value": "—"},
         {"reason": "sigma_clip",        "count": _n_sigma_clip,          "threshold": "|m_var - median| > 3 * 1.4826 * MAD",                               "config_key": "—",                   "config_value": "—"},
         {"reason": "回歸截距突變",       "count": n_reg_jump,              "threshold": f"rolling |reg_intercept - med| > {float(getattr(cfg_obj,'reg_intercept_sigma',0.0)):.1f} MAD", "config_key": "reg_intercept_sigma", "config_value": float(getattr(cfg_obj, "reg_intercept_sigma", 0.0))},

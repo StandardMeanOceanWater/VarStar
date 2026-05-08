@@ -436,9 +436,9 @@ __main__
 - `read_aavso_seq_csv()` (L1160–1182)
 - `_pick_col()`, `_parse_ra_dec()` (L1136–1157)
 
-### 模組 5：`phot_compsel.py` — 比較星選取（~300 行）
-- `auto_select_comps()` (L1954–2227)
-- `_selection_radius_px()`, `_stars_in_circle()` (L1531–1572)
+### Module 5: comparison-star selection
+- Removed stale root module `phot_compsel.py`.
+- Active code lives in `phot_sources/catalog.py` and `phot_sources/catalog_backend.py`.
 
 ### 模組 6：`phot_ensemble.py` — Ensemble 正規化（~170 行）
 - `ensemble_normalize()` (L2239–2400)

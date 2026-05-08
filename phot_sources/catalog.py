@@ -28,7 +28,7 @@ from phot_sources.core import (
     radec_to_pixel,
 )
 from phot_sources.field import _field_center_from_wcs_fits
-from phot_sources.io_paths import get_field_catalog_dir
+from phot_sources.io_paths import get_field_catalog_path
 
 
 _phot_logger = logging.getLogger("photometry")
@@ -85,7 +85,7 @@ def _load_or_build_unified_catalog(
     cfg,
     ra_center_deg: float,
     dec_center_deg: float,
-    field_cat_dir: Path,
+    field_cat_path: Path,
 ) -> "tuple[pd.DataFrame, list[str]]":
     """
     統一視場星表：查詢所有星表來源一次，合併多波段欄位。
@@ -94,11 +94,10 @@ def _load_or_build_unified_catalog(
     unified_df 欄位：
         ra_deg, dec_deg,
         V_mag, V_err, source_V,   — Johnson V: AAVSO > APASS > Tycho VT→V
-        B_mag, B_err, source_B,   — Johnson B: APASS B > Tycho BT→B (B<13 only)
+        B_mag, B_err, source_B,   — Johnson B: APASS B > Tycho BT→B
         R_mag, R_err, source_R,   — Cousins Rc: Gaia RP→Rc ONLY
         BT, VT, Gmag, BPmag, RPmag  — 原始診斷欄位
     """
-    field_cat_path = field_cat_dir / "field_catalog_unified.csv"
     _sources_used: "list[str]" = []
     _phot_logger.info(
         "[unified catalog] request field_center=(%.6f, %.6f) path=%s",
@@ -106,11 +105,11 @@ def _load_or_build_unified_catalog(
     )
 
     if field_cat_path.exists():
-        unified_df = pd.read_csv(field_cat_path)
-        _stored_ra = unified_df.get("field_center_ra_deg")
-        _stored_dec = unified_df.get("field_center_dec_deg")
+        _candidate_df = pd.read_csv(field_cat_path)
+        _stored_ra = _candidate_df.get("field_center_ra_deg")
+        _stored_dec = _candidate_df.get("field_center_dec_deg")
         _reuse_existing = False
-        if _stored_ra is not None and _stored_dec is not None and len(unified_df) > 0:
+        if _stored_ra is not None and _stored_dec is not None and len(_candidate_df) > 0:
             _stored_center = SkyCoord(
                 ra=float(_stored_ra.iloc[0]) * u.deg,
                 dec=float(_stored_dec.iloc[0]) * u.deg,
@@ -127,27 +126,26 @@ def _load_or_build_unified_catalog(
                     f"rebuild required ({_center_sep_arcsec:.2f} arcsec)"
                 )
                 _phot_logger.info(
-                    "[unified catalog] rebuild reason=center_mismatch sep_arcsec=%.2f",
-                    _center_sep_arcsec,
+                    "[unified catalog] rebuild reason=center_mismatch path=%s sep_arcsec=%.2f",
+                    field_cat_path, _center_sep_arcsec,
                 )
-        if _reuse_existing:
-            print(f"  [unified catalog] read: {field_cat_path.name}")
-            _phot_logger.info("[unified catalog] action=read rows=%d", len(unified_df))
-        else:
+        if not _reuse_existing:
             print("  [unified catalog] existing cache missing valid field center; rebuilding")
-            _phot_logger.info("[unified catalog] action=rebuild existing_cache_invalid=1")
-            unified_df = pd.DataFrame()
+            _phot_logger.info("[unified catalog] action=rebuild existing_cache_invalid=1 path=%s", field_cat_path)
+        else:
+            for _sc in ("source_V", "source_B", "source_R"):
+                if _sc in _candidate_df.columns:
+                    _sources_used.extend(_candidate_df[_sc].dropna().unique().tolist())
+            _sources_used = sorted(set(_sources_used))
+            print(f"  [unified catalog] read: {field_cat_path.name}")
+            print(f"  [unified catalog] {len(_candidate_df)} stars, sources: {'+'.join(_sources_used)}")
+            _phot_logger.info("[unified catalog] action=read rows=%d path=%s", len(_candidate_df), field_cat_path)
+            return _candidate_df, _sources_used
     else:
         _phot_logger.info("[unified catalog] action=rebuild existing_cache_missing=1")
-        unified_df = pd.DataFrame()
 
-    if len(unified_df) > 0:
-        for _sc in ("source_V", "source_B", "source_R"):
-            if _sc in unified_df.columns:
-                _sources_used.extend(unified_df[_sc].dropna().unique().tolist())
-        _sources_used = sorted(set(_sources_used))
-        print(f"  [unified catalog] {len(unified_df)} stars, sources: {'+'.join(_sources_used)}")
-        return unified_df, _sources_used
+    if field_cat_path.exists():
+        _phot_logger.info("[unified catalog] action=rebuild path=%s", field_cat_path)
 
     # ── 查詢各星表（各查一次）─────────────────────────────────────────────────
     # 每個 source 以統一格式收集：ra_deg, dec_deg + 各波段欄位
@@ -243,21 +241,24 @@ def _load_or_build_unified_catalog(
                         row["V_err"] = float(r.get("e_vmag", np.nan))
                         row["source_V"] = "Tycho2"
                         n_v += 1
-                    # B from BT→B conversion: B = BT - 0.240*(BT-VT)
-                    # B < 13 mag 的亮星 APASS 已覆蓋且精度更好，
-                    # Tycho-2 BT→B 只填 B >= 13 的暗星（APASS 沒有的）
+                    # B from BT to Johnson B conversion.
                     _bt = float(r.get("BT", np.nan))
                     _vt = float(r.get("VT", np.nan))
                     if np.isfinite(_bt) and np.isfinite(_vt):
                         _b_mag = _bt - 0.240 * (_bt - _vt)
-                        if _b_mag >= 13.0:
-                            _e_bt = 0.05  # Tycho-2 typical BT error
+                        _e_bt = float(r.get("e_BT", r.get("e_BTmag", np.nan)))
+                        _e_vt = float(r.get("e_VT", r.get("e_VTmag", np.nan)))
+                        if not np.isfinite(_e_bt):
+                            _e_bt = 0.05
+                        if not np.isfinite(_e_vt):
                             _e_vt = 0.05
-                            _e_b = float(np.sqrt(_e_bt**2 * (1 - 0.240)**2 + _e_vt**2 * 0.240**2))
-                            row["B_mag"] = _b_mag
-                            row["B_err"] = _e_b
-                            row["source_B"] = "Tycho2"
-                            n_b += 1
+                        _e_b = float(np.sqrt(_e_bt**2 * (1 - 0.240)**2 + _e_vt**2 * 0.240**2))
+                        row["B_mag"] = _b_mag
+                        row["B_err"] = _e_b
+                        row["source_B"] = "Tycho2"
+                        row["e_BT"] = _e_bt
+                        row["e_VT"] = _e_vt
+                        n_b += 1
                     # 保留原始欄位
                     if np.isfinite(_bt):
                         row["BT"] = _bt
@@ -309,7 +310,8 @@ def _load_or_build_unified_catalog(
     all_df = pd.DataFrame(_source_rows)
     # 確保所有欄位存在
     for _col in ("V_mag", "V_err", "source_V", "B_mag", "B_err", "source_B",
-                 "R_mag", "R_err", "source_R", "BT", "VT", "Gmag", "BPmag", "RPmag"):
+                 "R_mag", "R_err", "source_R", "BT", "VT", "e_BT", "e_VT",
+                 "Gmag", "BPmag", "RPmag"):
         if _col not in all_df.columns:
             all_df[_col] = np.nan if not _col.startswith("source") else None
 
@@ -387,7 +389,7 @@ def _load_or_build_unified_catalog(
                 best_r = (float(_rm), float(r.get("R_err", np.nan)), "GaiaDR3")
 
             # 保留原始診斷欄位
-            for _diag in ("BT", "VT", "Gmag", "BPmag", "RPmag"):
+            for _diag in ("BT", "VT", "e_BT", "e_VT", "Gmag", "BPmag", "RPmag"):
                 _dv = r.get(_diag)
                 if _dv is not None and np.isfinite(float(_dv)):
                     row.setdefault(_diag, float(_dv))
@@ -410,7 +412,7 @@ def _load_or_build_unified_catalog(
                  "V_mag", "V_err", "source_V",
                  "B_mag", "B_err", "source_B",
                  "R_mag", "R_err", "source_R",
-                 "BT", "VT", "Gmag", "BPmag", "RPmag",
+                 "BT", "VT", "e_BT", "e_VT", "Gmag", "BPmag", "RPmag",
                  "field_center_ra_deg", "field_center_dec_deg"]
     for _c in _all_cols:
         if _c not in unified_df.columns:
@@ -420,7 +422,7 @@ def _load_or_build_unified_catalog(
     unified_df = unified_df[_all_cols]
 
     # 儲存快取
-    field_cat_dir.mkdir(parents=True, exist_ok=True)
+    field_cat_path.parent.mkdir(parents=True, exist_ok=True)
     unified_df.to_csv(field_cat_path, index=False, encoding="utf-8-sig")
     print(f"  [unified catalog] saved: {field_cat_path.name} ({len(unified_df)} rows)")
     _phot_logger.info(
@@ -433,9 +435,6 @@ def _load_or_build_unified_catalog(
           f"sources: {'+'.join(_sources_used)}")
 
     return unified_df, _sources_used
-
-
-## _remap_comp_refs_to_band -- REMOVED by unified catalog refactor (v1.7)
 
 def auto_select_comps(
     wcs_fits_path: Path,
@@ -543,19 +542,18 @@ def auto_select_comps(
               f"飽和={n_sat}  測光失敗={n_phot}  通過={len(rows)}")
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # ── 3–5. 統一視場星表（所有波段共用一份快取）────────────────────────────
-    # catalogs 放在 group（星場）層級，同星場多目標共用
-    _field_cat_dir = get_field_catalog_dir(cfg_obj.run_root)
+    # Shared field-level catalog.
+    _field_cat_path = get_field_catalog_path(cfg_obj.run_root)
 
     unified_df, _sources_used = _load_or_build_unified_catalog(
-        cfg_obj, field_ra_deg, field_dec_deg, _field_cat_dir,
+        cfg_obj, field_ra_deg, field_dec_deg, _field_cat_path,
     )
 
     # 篩選此波段有值的星
     if len(unified_df) == 0 or mag_col not in unified_df.columns:
         raise RuntimeError(
             f"統一星表中無 {band} 波段資料。\n"
-            "建議：(1) 刪除 field_catalog_unified.csv 重建；"
+            "建議：(1) 刪除 catalog.csv 重建；"
             "(2) 確認 catalog_priority 設定。"
         )
 

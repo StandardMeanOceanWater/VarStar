@@ -107,7 +107,6 @@ from phot_sources.io_paths import (  # noqa: E402
     build_target_log_path,
     build_vsx_run_layout,
     format_session_date,
-    get_field_catalog_dir,
 )
 from phot_sources.logging_utils import (  # noqa: E402
     attach_file_handler,
@@ -251,10 +250,6 @@ from pathlib import Path
 # [已拆至 phot_catalog.py] _selection_radius_px, _stars_in_circle,
 # _fetch_apass_from_cache, fetch_apass_cone, fetch_tycho2_cone,
 # fetch_gaia_dr3_cone, _match_catalog_to_detected, APASS_SCS_URL
-
-## _remap_comp_refs_to_band — REMOVED by unified catalog refactor (v1.7)
-## 每通道現在直接從 unified catalog 獨立選取比較星，不再需要 remap。
-
 
 # =============================================================================
 # ⏸ 待決定：差分測光 (differential_mag) vs 自由斜率回歸 (ensemble normalization)

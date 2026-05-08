@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from phot_sources.logging_utils import emit_progress, emit_progress_done
-from polt_light_curve import plot_light_curve
+from polt_light_curve import plot_light_curve, write_run_light_curve_products
 
 _phot_logger = logging.getLogger("photometry")
 
@@ -84,6 +84,37 @@ def _stage4_run_period_analysis(active_target, channel_results, stage4_run_root)
 
     if not _pa_any:
         print("[LS] 跳過（所有通道有效幀數 < 10 或分析失敗）")
+
+
+def _stage4_write_light_curve_products(cfg, active_target, active_date, channel_results, stage4_run_root):
+    try:
+        _tz_offset_hours = float(getattr(cfg, "tz_offset_hours", 8.0))
+    except Exception:
+        _tz_offset_hours = 8.0
+
+    try:
+        _plot_result = write_run_light_curve_products(
+            stage4_run_root,
+            active_target,
+            active_date,
+            list(channel_results.keys()),
+            cfg=cfg,
+            tz_offset_hours=_tz_offset_hours,
+            include_overlay=True,
+            include_fourier=True,
+            include_channel_fourier=True,
+            include_plotly_html=True,
+        )
+    except Exception as _e_plot_products:
+        print(f"[PLOT] light-curve products failed: {_e_plot_products}")
+        return
+
+    for _out_path in _plot_result.get("outputs", []):
+        print(f"[PLOT] product -> {_out_path}")
+    for _skip_msg in _plot_result.get("skipped", []):
+        print(f"[PLOT] product skipped: {_skip_msg}")
+    for _err_msg in _plot_result.get("errors", []):
+        print(f"[PLOT] product failed: {_err_msg}")
 
 
 def _stage4_run_g1g2_ratio_products(cfg, active_target, active_date, channel_results, stage4_run_root):
@@ -162,6 +193,9 @@ def _run_stage4_postprocess(cfg, active_target, active_date, channel_results, st
     emit_progress(_phot_logger, f"stage4 postprocess start target={active_target} date={active_date}")
     _stage4_replot_shared_g1g2_ylim(cfg, active_date, channel_results)
     _stage4_run_period_analysis(active_target, channel_results, stage4_run_root)
+    _stage4_write_light_curve_products(
+        cfg, active_target, active_date, channel_results, stage4_run_root
+    )
     _stage4_run_g1g2_ratio_products(
         cfg, active_target, active_date, channel_results, stage4_run_root
     )
@@ -175,4 +209,5 @@ __all__ = [
     "_stage4_replot_shared_g1g2_ylim",
     "_stage4_run_g1g2_ratio_products",
     "_stage4_run_period_analysis",
+    "_stage4_write_light_curve_products",
 ]
