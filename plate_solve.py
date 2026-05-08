@@ -4,7 +4,7 @@ plate_solve.py  —  星圖解算模組
 專案：變星測光管線 v0.99
 描述：對校正後的 FITS 執行 WCS 星圖解算。
       本地環境使用 ASTAP CLI；Colab 環境使用 astrometry.net API。
-      輸出另存副本到 calibrated/wcs/ 子目錄，不覆蓋原始校正幀。
+      輸出 WCS FITS 到 data/{date}/{group}/wcs，不覆蓋原始校正幀。
 
 後端選擇邏輯
 ------------
@@ -173,6 +173,29 @@ def _get_hint_for_target(
     ra_hours = float(ra_h)                # 單位已是小時，直接使用
     spd_deg = 90.0 + float(dec_deg)       # 南極距：SPD = 90 + Dec
     return ra_hours, spd_deg
+
+
+def _session_groups(cfg: dict, target_list: list[str]) -> list[dict[str, object]]:
+    """Group session targets by product group while preserving session order."""
+    grouped: list[dict[str, object]] = []
+    by_group: dict[str, dict[str, object]] = {}
+    for raw_target in target_list:
+        target = str(raw_target)
+        target_cfg = cfg.get("targets", {}).get(target, {})
+        group = str(target_cfg.get("group", target))
+        if group not in by_group:
+            entry: dict[str, object] = {
+                "group": group,
+                "hint_target": target,
+                "targets": [target],
+            }
+            by_group[group] = entry
+            grouped.append(entry)
+        else:
+            targets = by_group[group]["targets"]
+            assert isinstance(targets, list)
+            targets.append(target)
+    return grouped
 
 
 def _relative_offset_arcmin(
@@ -642,9 +665,9 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
     """
     主星圖解算管線入口。
 
-    讀取 observation_config.yaml，對每個 obs_session 的每個 target，
-    處理 calibrated/ 目錄內所有校正 FITS，
-    輸出到 calibrated/wcs/ 子目錄。
+    讀取 observation_config.yaml，對每個 obs_session 的每個 group，
+    處理 data/{date}/{group}/wcs 內尚未解算的校正 FITS，
+    輸出 *_wcs.fits 到同一目錄。
 
     ASTAP hint 機制：
         yaml targets 區段若有 ra_hint_h / dec_hint_deg，
@@ -681,9 +704,10 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
         data_root = cfg["_data_root"]
         project_root = cfg["_project_root"]
 
-        for target in target_list:
-            _tgt_cfg = cfg.get("targets", {}).get(target, {})
-            _group = _tgt_cfg.get("group", target)
+        for group_info in _session_groups(cfg, target_list):
+            _group = str(group_info["group"])
+            hint_target = str(group_info["hint_target"])
+            group_targets = [str(t) for t in group_info["targets"]]
             _date_fmt = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             field_root = data_root / _date_fmt / _group
             output_dir = project_root / "output" / _date_fmt / _group
@@ -697,6 +721,9 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                 cal_dir = field_root / "wcs"
                 wcs_dir = cal_dir  # WCS output to same directory
             wcs_dir.mkdir(parents=True, exist_ok=True)
+            if not cal_dir.exists():
+                print(f"[SKIP] {_group}/{date}: source directory not found: {cal_dir}")
+                continue
 
             # ── 收集 FITS + CR2 檔案清單 ─────────────────────────────
             fits_files = sorted(
@@ -718,21 +745,24 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                 sum(1 for f in fits_files
                     if (wcs_dir / (f.stem + "_wcs.fits")).exists())
 
-            ra_hint, spd_hint = _get_hint_for_target(cfg, target)
+            ra_hint, spd_hint = _get_hint_for_target(cfg, hint_target)
+            targets_text = ", ".join(group_targets)
             if ra_hint is not None:
                 print(
-                    f"\n[Session] {target} / {date}  ({total_count} 幀)"
-                    f"  hint RA={ra_hint:.4f}h SPD={spd_hint:.4f}°"
+                    f"\n[Session] {_group} / {date}  ({total_count} 幀)"
+                    f"  hint target={hint_target} RA={ra_hint:.4f}h SPD={spd_hint:.4f}°"
+                    f"  targets=[{targets_text}]"
                 )
             else:
                 print(
-                    f"\n[Session] {target} / {date}  ({total_count} 幀)"
+                    f"\n[Session] {_group} / {date}  ({total_count} 幀)"
+                    f"  targets=[{targets_text}]"
                     f"  hint 未設定（yaml 無目標座標）"
                 )
 
             if not all_sources and total_count == 0:
                 _src = "raw/" if raw_mode else "wcs/"
-                print(f"[SKIP] {target}/{date}：{_src} 目錄裡找不到 FITS/CR2。")
+                print(f"[SKIP] {_group}/{date}：{_src} 目錄裡找不到 FITS/CR2。")
                 continue
 
             success = failed = skipped = 0
@@ -792,7 +822,7 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                          ) - success
 
             print(
-                f"\n[完成] {target}/{date}：成功 {success}，失敗 {failed}，"
+                f"\n[完成] {_group}/{date}：成功 {success}，失敗 {failed}，"
                 f"已跳過（存在）{skipped}"
             )
             print(f"       WCS 輸出目錄：{wcs_dir}")
@@ -806,7 +836,7 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
 
     print("\n" + "=" * 20)
     print("所有 Session 星圖解算完成。")
-    print("下一步：DeBayer_RGGB.py → Photometry.ipynb")
+    print("Next step: split.py -> Photometry.ipynb")
     print("=" * 20)
 
 

@@ -1,4 +1,4 @@
-"""
+r"""
 VarStar Pipeline 流程圖 — 窄版（適合 A4 直式嵌入），中文大字
 輸出：D:\VarStar\pipeline\pipeline_workflow_notitle.png
 """
@@ -63,7 +63,7 @@ SW = 1.6
 Y1, Y2, Y3, Y4 = 7.8, 5.5, 3.2, 1.1
 
 # 第一列（前處理）
-R1 = {"input":(0.95,Y1), "calib":(2.7,Y1), "solve":(4.45,Y1), "debayer":(6.2,Y1)}
+R1 = {"input":(0.95,Y1), "calib":(2.7,Y1), "solve":(4.45,Y1), "split":(6.2,Y1)}
 # config 右側
 cfg = (8.1, Y1)
 # 第二列（測光）
@@ -77,7 +77,7 @@ OUT = {"csv":(3.8,Y4), "plot":(5.9,Y4), "log":(7.8,Y4)}
 box(ax, *R1["input"],   1.5,  BH, "原始影像", "CR2 / FITS",       C_INPUT,  bold=True)
 box(ax, *R1["calib"],   BW,   BH, "Calibration", "Bias/Dark/Flat", C_STAGE1)
 box(ax, *R1["solve"],   BW,   BH, "Plate Solve", "WCS 星圖解算",   C_STAGE1)
-box(ax, *R1["debayer"], BW,   BH, "DeBayer",     "RGGB 四通道",    C_STAGE1)
+box(ax, *R1["split"],   BW,   BH, "Bayer Split", "RGGB channels", C_STAGE1)
 
 box(ax, *R2["comp"],     SW,  BH, "比較星選取", "AAVSO/APASS/Gaia", C_STAGE2)
 box(ax, *R2["aperture"], SW,  BH, "孔徑測光",   "生長曲線法",       C_STAGE2)
@@ -104,13 +104,13 @@ ax.text(cfg[0], cfg[1]-0.16, "全域參數設定",
 
 # ── 箭頭 ─────────────────────────────────────────────
 # 第一列水平
-for a_, b_ in [("input","calib"),("calib","solve"),("solve","debayer")]:
+for a_, b_ in [("input","calib"),("calib","solve"),("solve","split")]:
     x1 = R1[a_][0] + (0.75 if a_=="input" else BW/2)
     x2 = R1[b_][0] - BW/2
     arrow(ax, x1, Y1, x2, Y1)
 
-# debayer ↓ comp
-arrow(ax, R1["debayer"][0], Y1-BH/2, R2["comp"][0], Y2+BH/2)
+# split down to comp
+arrow(ax, R1["split"][0], Y1-BH/2, R2["comp"][0], Y2+BH/2)
 
 # 第二列水平
 for a_, b_ in [("comp","aperture"),("aperture","ensemble"),("ensemble","timesync")]:

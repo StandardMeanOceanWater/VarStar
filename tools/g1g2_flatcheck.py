@@ -34,8 +34,8 @@ def load_frame(path: Path) -> np.ndarray:
         return h[0].data.astype(np.float32)
 
 
-def debayer_g1g2(frame: np.ndarray):
-    """RGGB Bayer 拆 G1（偶列奇行）和 G2（奇列偶行）"""
+def split_g1g2(frame: np.ndarray):
+    """Split an RGGB Bayer frame into G1 and G2 samples."""
     g1 = frame[0::2, 1::2]  # row=even, col=odd
     g2 = frame[1::2, 0::2]  # row=odd,  col=even
     return g1, g2
@@ -80,12 +80,12 @@ def main():
     fig, axes = plt.subplots(len(FRAMES), 2,
                              figsize=(11, 4 * len(FRAMES)),
                              constrained_layout=True)
-    fig.suptitle("CC And G1/G2 比值空間分布（已校正幀 DeBayer）\n"
+    fig.suptitle("CC And G1/G2 spatial ratio (calibrated-frame Bayer split)\n"
                  f"{BLOCK}×{BLOCK} px 區塊中值比", fontsize=11)
 
     for row_i, (fpath, label) in enumerate(FRAMES):
         frame = load_frame(fpath)
-        g1, g2 = debayer_g1g2(frame)
+        g1, g2 = split_g1g2(frame)
 
         # flat 尺寸判斷
         if flat_raw.shape == g1.shape:

@@ -2,8 +2,8 @@
 """
 Legacy compatibility entry point for the Bayer split stage.
 
-The canonical owner is now `split.py`. This module keeps the old
-`DeBayer_RGGB.py` import path and CLI entry working during the rename period.
+The canonical owner is now `split.py`. This module keeps the transitional
+`split_bayer.py` import path and CLI entry working during the rename period.
 """
 
 from __future__ import annotations
@@ -37,5 +37,5 @@ if __name__ == "__main__":
     else:
         cfg_path = Path(sys.argv[1])
 
-    print("[WARN] DeBayer_RGGB.py is a legacy entry point. Use split.py or run_pipeline.py --step split.")
+    print("[WARN] split_bayer.py is a legacy entry point. Use split.py or run_pipeline.py --step split.")
     run_split(cfg_path)

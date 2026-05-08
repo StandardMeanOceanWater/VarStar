@@ -8,7 +8,7 @@ run_pipeline.py  —  變星測光管線整合入口
 依序執行管線的步驟：
     Step 1  calibration      — Bias/Dark/Flat 校正（Calibration.py）
     Step 2  plate_solve      — 星圖解算，寫入 WCS（plate_solve.py）
-    Step 3  debayer          — Bayer 拆色，傳遞 WCS（DeBayer_RGGB.py）
+    Step 3  split            — Bayer split，傳遞 WCS（split.py）
     Step 4  photometry       — 差分測光，輸出光變曲線（Photometry.ipynb）
     Step 5  period_analysis  — 進階週期分析（period_analysis.py）【選用】
     Step 6  report           — 品質報告（quality_report.py，預留介面）
@@ -23,7 +23,7 @@ run_pipeline.py  —  變星測光管線整合入口
         --steps calibration plate_solve
 
     # 從第 N 步開始執行到底
-    python run_pipeline.py --config observation_config.yaml --from-step debayer
+    python run_pipeline.py --config observation_config.yaml --from-step split
 
     # 執行進階週期分析（需先完成 photometry，output/photometry_*.csv 存在）
     python run_pipeline.py --config observation_config.yaml \\
@@ -83,12 +83,12 @@ _STEPS: list[tuple[str, str, bool]] = [
     ),
     (
         "plate_solve",
-        "星圖解算（ASTAP/astrometry.net）  →  calibrated/wcs/*_wcs.fits",
+        "星圖解算（ASTAP/astrometry.net）  →  data/{date}/{group}/wcs/*_wcs.fits",
         True,
     ),
     (
-        "debayer",
-        "Bayer 拆色，傳遞 WCS  →  split/{R,G1,G2,B}/*.fits",
+        "split",
+        "Bayer split，傳遞 WCS  →  splits/{R,G1,G2,B}/*.fits",
         True,
     ),
     (
@@ -109,6 +109,10 @@ _STEPS: list[tuple[str, str, bool]] = [
 ]
 _STEP_NAMES: list[str] = [s[0] for s in _STEPS]
 _STEP_DEFAULTS: list[str] = [s[0] for s in _STEPS if s[2]]
+_STEP_ALIASES: dict[str, str] = {
+    "debayer": "split",
+}
+_STEP_CHOICES: list[str] = _STEP_NAMES + sorted(_STEP_ALIASES)
 
 
 # =============================================================================
@@ -371,22 +375,22 @@ def _vsx_append_targets(
     print(f"[VSX] {len(new_blocks)} 筆目標已寫入 {config_path.name}（標注 auto_added）")
 
 
-def _run_debayer(config_path: Path, raw_mode: bool = False,
-                 wcs_subdir: str = "", splits_subdir: str = "") -> bool:
-    """呼叫 DeBayer_RGGB.run_debayer()。"""
+def _run_split(config_path: Path, raw_mode: bool = False,
+               wcs_subdir: str = "", splits_subdir: str = "") -> bool:
+    """呼叫 split.run_split()。"""
     try:
-        from DeBayer_RGGB import run_debayer
-        run_debayer(config_path, raw_mode=raw_mode,
-                    wcs_subdir=wcs_subdir, splits_subdir=splits_subdir)
+        from split import run_split
+        run_split(config_path, raw_mode=raw_mode,
+                  wcs_subdir=wcs_subdir, splits_subdir=splits_subdir)
         return True
     except ImportError as exc:
         print(
-            f"[ERROR] 無法匯入 DeBayer_RGGB.py：{exc}\n"
-            "        請確認 DeBayer_RGGB.py 與本腳本在同一目錄。"
+            f"[ERROR] 無法匯入 split.py：{exc}\n"
+            "        請確認 split.py 與本腳本在同一目錄。"
         )
         return False
     except Exception as exc:
-        print(f"[ERROR] debayer 步驟失敗：{exc}")
+        print(f"[ERROR] split 步驟失敗：{exc}")
         return False
 
 
@@ -549,7 +553,7 @@ def _run_report(config_path: Path) -> bool:  # noqa: ARG001
 _STEP_RUNNERS: dict[str, object] = {
     "calibration":     _run_calibration,
     "plate_solve":     _run_plate_solve,
-    "debayer":         _run_debayer,
+    "split":           _run_split,
     "photometry":      _run_photometry,
     "period_analysis": _run_period_analysis,
     "report":          _run_report,
@@ -613,7 +617,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=(
             "變星測光管線整合入口。\n"
             "不指定 --steps 則執行標準步驟（calibration → plate_solve → "
-            "debayer → photometry → report）。\n"
+            "split → photometry → report）。\n"
             "進階週期分析需明確指定：--steps period_analysis"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -623,10 +627,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  python run_pipeline.py --config observation_config.yaml\n\n"
             "  # 只執行前三步\n"
             "  python run_pipeline.py --config observation_config.yaml "
-            "--steps calibration plate_solve debayer\n\n"
+            "--steps calibration plate_solve split\n\n"
             "  # 從拆色開始\n"
             "  python run_pipeline.py --config observation_config.yaml "
-            "--from-step debayer\n\n"
+            "--from-step split\n\n"
             "  # 執行進階週期分析（需先完成 photometry）\n"
             "  python run_pipeline.py --config observation_config.yaml "
             "--steps period_analysis\n\n"
@@ -646,17 +650,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--steps",
         nargs="+",
-        choices=_STEP_NAMES,
+        choices=_STEP_CHOICES,
         metavar="STEP",
         default=None,
         help=(
             f"指定步驟（可多選）。可用值：{', '.join(_STEP_NAMES)}。"
+            " legacy alias: debayer=split。"
             "不指定則執行標準步驟（period_analysis 除外）。"
         ),
     )
     parser.add_argument(
         "--from-step",
-        choices=_STEP_NAMES,
+        choices=_STEP_CHOICES,
         metavar="STEP",
         default=None,
         dest="from_step",
@@ -716,21 +721,26 @@ def _select_steps(args: argparse.Namespace) -> list[str]:
     - --steps 與 --from-step 互斥
 
     保持 _STEP_NAMES 的固定執行順序，使用者亂序指定時自動排序。
+    Legacy aliases are canonicalized before selection, e.g. debayer -> split.
     """
     if args.steps and args.from_step:
         raise ValueError("--steps 與 --from-step 互斥，請擇一使用。")
 
+    def _canonical_step(step: str) -> str:
+        return _STEP_ALIASES.get(step, step)
+
     if args.steps:
-        requested = set(args.steps)
+        requested = {_canonical_step(s) for s in args.steps}
         return [s for s in _STEP_NAMES if s in requested]
 
     if args.from_step:
-        start = _STEP_NAMES.index(args.from_step)
+        from_step = _canonical_step(args.from_step)
+        start = _STEP_NAMES.index(from_step)
         candidates = _STEP_NAMES[start:]
         # period_analysis 仍需明確指定，除非它就是起始步驟
         return [
             s for s in candidates
-            if s != "period_analysis" or s == args.from_step
+            if s != "period_analysis" or s == from_step
         ]
 
     return list(_STEP_DEFAULTS)
@@ -758,6 +768,11 @@ def main(argv: list[str] | None = None) -> int:
             tag = "（預設執行）" if default else "【進階選用，需明確指定】"
             print(f"  {name:<18}  {tag}")
             print(f"  {'':<18}  {desc}")
+            print()
+        if _STEP_ALIASES:
+            print("Legacy aliases:")
+            for old_name, new_name in sorted(_STEP_ALIASES.items()):
+                print(f"  {old_name} -> {new_name}")
             print()
         return 0
 
@@ -816,7 +831,7 @@ def main(argv: list[str] | None = None) -> int:
                 ok = True
             else:
                 ok = runner(config_path, no_flat=args.no_flat)
-        elif step in ("debayer",):
+        elif step in ("split",):
             if args.no_flat:
                 ok: bool = runner(config_path, wcs_subdir="wcs_darkonly",
                                   splits_subdir="splits_darkonly")

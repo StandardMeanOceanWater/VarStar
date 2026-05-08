@@ -1237,7 +1237,10 @@ def _calibrate_target(
     use_median_normalization: bool,
 ) -> None:
     paths = resolve_session_paths(cfg, {**session, "target": target})
-    output_dir = _legacy_output_dir(cfg, session, target).parent / output_subdir
+    if output_subdir in ("", "wcs"):
+        output_dir = paths["calibrated_dir"]
+    else:
+        output_dir = _legacy_output_dir(cfg, session, target).parent / output_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
     light_files = _list_image_files(paths["light_dir"])
     if not light_files:
@@ -1246,10 +1249,16 @@ def _calibrate_target(
     tz_offset = int(cfg.get("calibration", {}).get("tz_offset_hours", 8))
     gain_e, read_noise_e, saturation_adu = _sensor_db_for_session(cfg, session)
     success = 0
+    skipped = 0
     failed = 0
     print(f"\n[Target] {target}")
     print(f"  [INFO] output dir: {output_dir}")
     for index, light_path in enumerate(tqdm(light_files, desc=f"{target} calibrate")):
+        out_name = f"Cal_{light_path.stem}_{index + 1:04d}.fits"
+        out_path = output_dir / out_name
+        if out_path.exists():
+            skipped += 1
+            continue
         try:
             light_data, header = _read_frame_data(light_path, session, tz_offset, gain_e, read_noise_e, saturation_adu)
             light_meta = read_frame_metadata(light_path, str(session["date"]))
@@ -1279,14 +1288,14 @@ def _calibrate_target(
                 for warning in warnings:
                     _warn(f"{light_path.name}: {warning}")
                     header["HISTORY"] = f"WARNING: {warning}"
-            out_name = f"Cal_{light_path.stem}_{index + 1:04d}.fits"
-            out_path = output_dir / out_name
             fits.writeto(out_path, calibrated.astype(np.float32), header=header, overwrite=True)
             success += 1
         except Exception as exc:
             failed += 1
             _warn(f"{light_path.name}: {exc}")
-    print(f"  [INFO] calibrated: success={success}, failed={failed}")
+    print(f"  [INFO] calibrated: success={success}, skipped={skipped}, failed={failed}")
+    if success + skipped == 0 and failed > 0:
+        raise RuntimeError(f"calibration produced no usable frames for {target}")
 
 
 def run_calibration(config_path: str | Path, *, no_flat: bool = False) -> None:
@@ -1300,7 +1309,7 @@ def run_calibration(config_path: str | Path, *, no_flat: bool = False) -> None:
     use_bias = bool(cal_cfg.get("use_bias", True))
     use_dark = bool(cal_cfg.get("use_dark", True))
     use_median_normalization = bool(cal_cfg.get("flat_normalize_median", True))
-    output_subdir = str(cal_cfg.get("output_subdir", "calibrate"))
+    output_subdir = str(cal_cfg.get("output_subdir", "wcs"))
     print("=" * 60)
     print("Calibration rewrite start")
     print("=" * 60)

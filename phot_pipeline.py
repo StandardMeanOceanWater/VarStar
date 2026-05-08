@@ -246,7 +246,7 @@ def run_photometry_on_wcs_dir(cfg,
     if not wcs_files_sorted:
         raise FileNotFoundError(
             f"No split/{channel} FITS found in: {wcs_dir}\n"
-            "Check that debayer step completed successfully."
+            "Check that split stage completed successfully."
         )
 
     check_coord  = (SkyCoord(ra=check_star[0] * u.deg, dec=check_star[1] * u.deg)

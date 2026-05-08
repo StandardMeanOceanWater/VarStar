@@ -212,8 +212,9 @@ vsx:
   auto_add_types: []            # 空白=全部，或指定如 [DSCT, HADS, RR]
 
 # -----------------------------------------------------------------------------
-# 9. Bayer 拆色 (DeBayer)
+# 9. Bayer split (legacy config key: debayer)
 # -----------------------------------------------------------------------------
+# Kept as a legacy compatibility surface; current split output behavior is unchanged.
 debayer:
   channels_output: ["R", "G1", "B"]   # G2 只做驗證，不輸出獨立光變曲線
   use_g2_as_independent: false
