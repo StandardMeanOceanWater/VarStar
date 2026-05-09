@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import time
+from pathlib import Path
 
 from phot_aperture import estimate_aperture_radius
 from phot_config import cfg_from_yaml
@@ -59,6 +60,8 @@ def _parse_cli_args(argv=None):
                          help="目標星（例如 V1162Ori）")
     _parser.add_argument("--date", default=None,
                          help="觀測日期（例如 20251220）")
+    _parser.add_argument("--config", default=None, type=Path,
+                         help="observation_config.yaml path")
     _parser.add_argument("--channels", default=None, nargs="+",
                          help="通道列表（例如 --channels R G1 B）")
     _parser.add_argument("--split_subdir", default="splits",
@@ -86,8 +89,8 @@ def _init_summary_logger(args):
     return _logger, _log_ts
 
 
-def _load_pipeline_yaml():
-    return load_pipeline_config()
+def _load_pipeline_yaml(config_path: Path | None = None):
+    return load_pipeline_config(config_path)
 
 
 def _session_targets(session: dict) -> "list[str]":
@@ -488,7 +491,7 @@ def run_main(
     _args = _parse_cli_args(argv)
     _logger, _log_ts = _init_summary_logger(_args)
 
-    _yaml = _load_pipeline_yaml()
+    _yaml = _load_pipeline_yaml(_args.config)
 
     CHANNELS = _resolve_channels(_args, _yaml)
     _targets_list = _build_targets_list(_args, _yaml)

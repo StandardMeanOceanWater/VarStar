@@ -9,7 +9,7 @@ run_pipeline.py  —  變星測光管線整合入口
     Step 1  calibration      — Bias/Dark/Flat 校正（Calibration.py）
     Step 2  plate_solve      — 星圖解算，寫入 WCS（plate_solve.py）
     Step 3  split            — Bayer split，傳遞 WCS（split.py）
-    Step 4  photometry       — 差分測光，輸出光變曲線（Photometry.ipynb）
+    Step 4  photometry       — 差分測光，輸出光變曲線（photometry.py）
     Step 5  period_analysis  — 進階週期分析（period_analysis.py）【選用】
     Step 6  report           — 品質報告（quality_report.py，預留介面）
 
@@ -25,7 +25,7 @@ run_pipeline.py  —  變星測光管線整合入口
     # 從第 N 步開始執行到底
     python run_pipeline.py --config observation_config.yaml --from-step split
 
-    # 執行進階週期分析（需先完成 photometry，output/photometry_*.csv 存在）
+    # 執行進階週期分析（需先完成 photometry）
     python run_pipeline.py --config observation_config.yaml \\
         --steps period_analysis
 
@@ -37,14 +37,13 @@ run_pipeline.py  —  變星測光管線整合入口
 
 限制
 ----
-Step 4（photometry）必須在 Jupyter 環境中互動執行（生長曲線診斷、
-零點散佈圖需要人工確認）。此腳本輸出提示後跳過，不強制執行。
+Step 4（photometry）使用 photometry.py 批次入口執行。
 
 Step 5（period_analysis）為選用進階模組，預設不在全流程中執行。
 需透過 --steps period_analysis 明確指定。
-前置條件：Step 4 已完成，output/photometry_*.csv 存在。
-輸入：output/photometry_*.csv
-輸出：output/period_analysis_*.{csv,png}
+前置條件：Step 4 已完成，且新格式 1_photometry CSV 存在。
+輸入：output/<date>/<group>/<target>/<run>/1_photometry/photometry_*.csv
+輸出：output/<date>/<group>/<target>/<run>/4_period_analysis/
 
 Step 6（report）為預留介面，目前輸出 [SKIP] 提示。
 
@@ -57,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -66,14 +66,15 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
+from types import SimpleNamespace
 
 
 # ── 步驟定義（名稱, 說明, 是否預設執行）─────────────────────────────────────
 #
 # period_analysis 標記 default=False：
 #   執行「全部步驟」時自動排除，必須透過 --steps 或 --from-step 明確指定。
-#   理由：此步驟依賴 Step 4 的 CSV 輸出，而全自動執行時 Step 4 被跳過（需
-#   人工互動）。若 CSV 不存在，步驟會以前置條件不符的方式失敗並說明原因。
+#   理由：此步驟依賴 Step 4 的新格式 run output。若 CSV 不存在，
+#   步驟會以前置條件不符的方式失敗並說明原因。
 #
 _STEPS: list[tuple[str, str, bool]] = [
     (
@@ -93,12 +94,12 @@ _STEPS: list[tuple[str, str, bool]] = [
     ),
     (
         "photometry",
-        "差分測光，光變曲線  →  output/photometry_*.csv",
+        "差分測光，光變曲線  →  output/<date>/<group>/<target>/<run>/",
         True,
     ),
     (
         "period_analysis",
-        "【進階選用】週期分析（LS + DFT + 預白化）  →  output/period_analysis_*",
+        "【進階選用】週期分析（LS + DFT + 預白化）  →  4_period_analysis/",
         False,   # 預設不執行，需明確指定
     ),
     (
@@ -394,146 +395,310 @@ def _run_split(config_path: Path, raw_mode: bool = False,
         return False
 
 
-def _run_photometry(config_path: Path) -> bool:  # noqa: ARG001
-    """
-    Step 4 為 Jupyter notebook，需人工互動執行。
+def _run_photometry(
+    config_path: Path,
+    raw_mode: bool = False,
+    split_subdir: str | None = None,
+    out_tag: str | None = None,
+) -> bool:
+    """Run Step 4 through the batch photometry entrypoint."""
+    argv = ["--config", str(config_path), "--all"]
+    if raw_mode:
+        argv.append("--raw")
+    if split_subdir:
+        argv.extend(["--split_subdir", split_subdir])
+    if out_tag:
+        argv.extend(["--out-tag", out_tag])
 
-    原因：生長曲線診斷圖和零點散佈圖需要人工確認比較星選取
-    結果是否合理，無法安全地全自動化（DESIGN_DECISIONS_v5.md §3.6）。
+    old_env = os.environ.get("VARSTAR_CONFIG")
+    os.environ["VARSTAR_CONFIG"] = str(config_path)
+    try:
+        from photometry import main as photometry_main
 
-    若確認比較星已驗證，可改為批次執行：
-        jupyter nbconvert --to notebook --execute \\
-            photometry/Photometry.ipynb
-    """
-    print()
-    print("  ╔══════════════════════════════════════════════════════════╗")
-    print("  ║  Step 4 photometry 需在 Jupyter 中互動執行               ║")
-    print("  ║                                                          ║")
-    print("  ║  本機：                                                  ║")
-    print("  ║    jupyter notebook photometry/Photometry.ipynb          ║")
-    print("  ║                                                          ║")
-    print("  ║  Colab：掛載 Drive 後開啟 Photometry.ipynb               ║")
-    print("  ║                                                          ║")
-    print("  ║  強制批次（比較星已事先驗證）：                          ║")
-    print("  ║    jupyter nbconvert --to notebook --execute \\           ║")
-    print("  ║      photometry/Photometry.ipynb                         ║")
-    print("  ╚══════════════════════════════════════════════════════════╝")
-    print()
-    return True   # 跳過不算失敗
+        result = photometry_main(argv)
+        return result in (None, 0, True)
+    except ImportError as exc:
+        print(
+            f"[ERROR] cannot import photometry.py: {exc}\n"
+            "        Check that photometry.py is beside run_pipeline.py."
+        )
+        return False
+    except SystemExit as exc:
+        return int(exc.code or 0) == 0
+    except Exception as exc:
+        print(f"[ERROR] photometry step failed: {exc}")
+        return False
+    finally:
+        if old_env is None:
+            os.environ.pop("VARSTAR_CONFIG", None)
+        else:
+            os.environ["VARSTAR_CONFIG"] = old_env
+
+
+def _session_targets(session: dict) -> list[str]:
+    raw = session.get("targets")
+    if raw is None:
+        raw = session.get("target")
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    item = str(raw).strip()
+    return [item] if item else []
+
+
+def _iter_config_target_runs(cfg: dict, project_root: Path):
+    from phot_sources.io_paths import format_session_date
+
+    targets_cfg = cfg.get("targets") or {}
+    for session in cfg.get("obs_sessions", []):
+        session_date = str(session.get("date", "")).strip()
+        if not session_date:
+            continue
+        date_fmt = format_session_date(session_date)
+        for target in _session_targets(session):
+            group = (targets_cfg.get(target) or {}).get("group", target)
+            target_root = project_root / "output" / date_fmt / group / target
+            yield session, target, group, session_date, target_root
+
+
+def _latest_run_root(target_root: Path, session_date: str) -> Path | None:
+    if not target_root.exists():
+        return None
+    run_roots = {
+        csv_path.parents[1]
+        for csv_path in target_root.glob(
+            f"*/1_photometry/photometry_*_{session_date}.csv"
+        )
+    }
+    if not run_roots:
+        return None
+    return sorted(run_roots, key=lambda p: p.name)[-1]
+
+
+def _channel_from_photometry_csv(csv_path: Path) -> str | None:
+    match = re.match(r"photometry_([A-Za-z0-9]+)_(\d{8})\.csv$", csv_path.name)
+    return match.group(1).upper() if match else None
+
+
+def _float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_light_curve_cfg(cfg: dict, session: dict, target: str) -> SimpleNamespace:
+    targets_cfg = cfg.get("targets") or {}
+    target_cfg = targets_cfg.get(target) or {}
+    obs_cfg = cfg.get("observatory") or {}
+    phot_cfg = cfg.get("photometry") or {}
+    display = target_cfg.get("display_name", target)
+    return SimpleNamespace(
+        target_name=display,
+        display_name=display,
+        tz_offset_hours=float(phot_cfg.get("tz_offset_hours", 8.0)),
+        obs_lat_deg=(
+            _float_or_none(session.get("obs_lat_deg"))
+            if "obs_lat_deg" in session
+            else _float_or_none(obs_cfg.get("latitude_deg"))
+        ),
+        obs_lon_deg=(
+            _float_or_none(session.get("obs_lon_deg"))
+            if "obs_lon_deg" in session
+            else _float_or_none(obs_cfg.get("longitude_deg"))
+        ),
+    )
+
+
+def _period_min_data_points(cfg: dict) -> int:
+    period_cfg = cfg.get("period_analysis") or {}
+    fit_cfg = period_cfg.get("fourier_fit") or {}
+    return int(fit_cfg.get("min_data_points", 50))
+
+
+def _prepare_period_analysis_df(df, min_pts: int, pd_module):
+    mag_col = "m_var_norm" if "m_var_norm" in df.columns else "m_var"
+    required_base = {"ok", "bjd_tdb", mag_col}
+    missing_base = required_base - set(df.columns)
+    if missing_base:
+        return "error", f"missing required columns: {sorted(missing_base)}", df, 0
+
+    ok_mask = pd_module.to_numeric(df["ok"], errors="coerce").eq(1)
+    bjd = pd_module.to_numeric(df["bjd_tdb"], errors="coerce")
+    mag = pd_module.to_numeric(df[mag_col], errors="coerce")
+    base_mask = ok_mask & bjd.notna() & mag.notna()
+    base_valid = int(base_mask.sum())
+    ok_count = int(ok_mask.sum())
+
+    if base_valid == 0:
+        return (
+            "skip",
+            f"no valid photometry rows (ok={ok_count}, finite_time_mag={base_valid})",
+            df,
+            0,
+        )
+
+    if "v_err" not in df.columns:
+        if "t_sigma_mag" in df.columns:
+            df = df.copy()
+            df["v_err"] = df["t_sigma_mag"]
+        else:
+            return (
+                "error",
+                f"missing uncertainty column v_err/t_sigma_mag with {base_valid} valid rows",
+                df,
+                base_valid,
+            )
+
+    err = pd_module.to_numeric(df["v_err"], errors="coerce")
+    valid = int((base_mask & err.notna()).sum())
+    if valid == 0:
+        return "skip", "no valid rows after uncertainty filter", df, 0
+    if valid < min_pts:
+        return "skip", f"insufficient valid points ({valid} < {min_pts})", df, valid
+    return "ready", f"valid points={valid}", df, valid
 
 
 def _run_period_analysis(config_path: Path) -> bool:
-    """
-    Step 5【進階選用】呼叫 period_analysis.run_period_analysis()。
-
-    前置條件
-    --------
-    Step 4（photometry）必須已完成，且 output/photometry_*.csv 存在。
-    此步驟預設不在全流程中執行，需透過 --steps period_analysis 明確指定。
-
-    學理說明
-    --------
-    本模組執行比 photometry.py 內建 LS 更完整的週期分析流程：
-      - Lomb-Scargle 週期圖（astropy），bootstrap FAP 收斂迭代
-      - DFT 交叉驗證
-      - Fourier 擬合（BIC 自動選階，上限由 yaml 設定）
-      - Pre-whitening 迭代（停止條件：S/N < 4，Breger et al., 1993）
-      - 週期不確定度：傅立葉擬合殘差（非 LS 殘差）
-    詳見 DESIGN_DECISIONS_v5.md §4.5。
-
-    Returns
-    -------
-    bool
-        True = 成功，False = 例外或前置條件不符。
-    """
-    # ── 前置條件：讀取設定檔，確認 photometry CSV 存在 ────────────────────
+    """Run Step 5 against the current output/<date>/<group>/<target>/<run>/ layout."""
     try:
-        import yaml
-        with config_path.open("r", encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh)
-    except FileNotFoundError:
-        print(f"[ERROR] 找不到設定檔：{config_path}")
-        return False
-    except yaml.YAMLError as exc:
-        print(f"[ERROR] 設定檔 YAML 格式錯誤：{exc}")
+        from pipeline_config import load_pipeline_config
+
+        cfg = load_pipeline_config(config_path)
+    except Exception as exc:
+        print(f"[ERROR] cannot load config for period_analysis: {exc}")
         return False
 
     try:
-        import google.colab  # noqa: F401
-        project_root = Path(cfg["paths"]["colab"]["project_root"])
-    except ImportError:
-        project_root = Path(cfg["paths"]["local"]["project_root"])
-
-    output_csvs = list(
-        (project_root / "data" / "targets").glob(
-            "*/output/photometry_*.csv"
-        )
-    )
-    if not output_csvs:
-        print()
-        print("  ╔══════════════════════════════════════════════════════════╗")
-        print("  ║  [SKIP] Step 5 period_analysis：前置條件不符             ║")
-        print("  ║                                                          ║")
-        print("  ║  找不到 output/photometry_*.csv。                        ║")
-        print("  ║  請先完成 Step 4（photometry），再執行此步驟。           ║")
-        print("  ║                                                          ║")
-        print("  ║  確認測光完成後，執行：                                  ║")
-        print("  ║    python run_pipeline.py --steps period_analysis        ║")
-        print("  ╚══════════════════════════════════════════════════════════╝")
-        print()
-        return False
-
-    print(f"  找到 {len(output_csvs)} 個測光 CSV，開始週期分析。")
-
-    # ── 呼叫模組：逐 CSV 執行 run_period_analysis ────────────────────────────
-    try:
-        import yaml as _yaml
         import pandas as _pd
         from period_analysis import run_period_analysis
+        from polt_light_curve import write_run_light_curve_products
+    except ImportError as exc:
+        print(
+            f"[ERROR] cannot import period analysis helpers: {exc}\n"
+            "        Check that period_analysis.py and polt_light_curve.py are available."
+        )
+        return False
 
-        any_ok = False
-        for csv_path in sorted(output_csvs):
-            # 從路徑解析 target / channel
-            # 路徑格式：.../targets/{TARGET}/output/photometry_{CH}_{DATE}.csv
-            parts = csv_path.parts
-            try:
-                tgt_idx = parts.index("targets") + 1
-                target_name = parts[tgt_idx]
-            except (ValueError, IndexError):
-                target_name = csv_path.parent.parent.name
-            stem = csv_path.stem  # photometry_G1_20251220
-            channel = stem.split("_")[1] if "_" in stem else "G1"
-            out_dir = csv_path.parent
+    project_root = Path(cfg["_project_root"])
+    min_pts = _period_min_data_points(cfg)
+    any_ok = False
+    any_input = False
+    hard_error = False
+    skipped_channels: list[str] = []
 
+    for session, target, group, session_date, target_root in _iter_config_target_runs(
+        cfg, project_root
+    ):
+        run_root = _latest_run_root(target_root, session_date)
+        if run_root is None:
+            print(
+                f"  [SKIP] no photometry run for {target} {session_date}: "
+                f"{target_root}\\*/1_photometry/photometry_*_{session_date}.csv"
+            )
+            continue
+
+        phot_dir = run_root / "1_photometry"
+        out_dir = run_root / "4_period_analysis"
+        output_csvs = sorted(phot_dir.glob(f"photometry_*_{session_date}.csv"))
+        if not output_csvs:
+            print(f"  [SKIP] no photometry CSVs in {phot_dir}")
+            continue
+
+        any_input = True
+        ok_channels: list[str] = []
+        print(
+            f"  period_analysis target={target} group={group} date={session_date} "
+            f"run={run_root.name} csv={len(output_csvs)}"
+        )
+
+        for csv_path in output_csvs:
+            channel = _channel_from_photometry_csv(csv_path)
+            if channel is None:
+                print(f"  [SKIP] unrecognized photometry CSV name: {csv_path.name}")
+                continue
             df = _pd.read_csv(csv_path)
-            # 欄位對映：photometry CSV → period_analysis 所需欄位名稱
-            # ok 欄已存在（1=通過，0=被篩除），直接使用；只需補 v_err
-            if "t_sigma_mag" in df.columns and "v_err" not in df.columns:
-                df = df.rename(columns={"t_sigma_mag": "v_err"})
-            print(f"  週期分析：{target_name} [{channel}]  ({len(df)} 幀)")
+            print(f"    channel={channel} rows={len(df)} csv={csv_path.name}")
+            status, reason, df, valid_count = _prepare_period_analysis_df(
+                df,
+                min_pts,
+                _pd,
+            )
+            if status == "skip":
+                skipped_channels.append(f"{target}/{channel}")
+                print(f"    [SKIP] {target}/{channel}: {reason}")
+                continue
+            if status == "error":
+                hard_error = True
+                print(f"    [ERROR] {target}/{channel}: {reason}")
+                continue
+
             try:
+                print(f"    [RUN] {target}/{channel}: {reason}")
                 run_period_analysis(
                     df=df,
-                    target_name=target_name,
+                    target_name=target,
                     channel=channel,
                     out_dir=out_dir,
                     config_path=config_path,
+                    obs_date=session_date,
                 )
                 any_ok = True
+                ok_channels.append(channel)
             except Exception as exc_inner:
-                print(f"  [WARN] {target_name}/{channel} 週期分析失敗：{exc_inner}")
+                print(f"    [WARN] {target}/{channel} period_analysis failed: {exc_inner}")
 
-        return any_ok
+        if ok_channels:
+            plot_cfg = _build_light_curve_cfg(cfg, session, target)
+            try:
+                product_result = write_run_light_curve_products(
+                    run_root,
+                    target,
+                    session_date,
+                    ok_channels,
+                    cfg=plot_cfg,
+                    tz_offset_hours=float(getattr(plot_cfg, "tz_offset_hours", 8.0)),
+                    include_overlay=True,
+                    include_fourier=True,
+                    include_channel_fourier=True,
+                    include_plotly_html=True,
+                )
+                for out_path in product_result.get("outputs", []):
+                    print(f"    [PLOT] product -> {out_path}")
+                for skipped in product_result.get("skipped", []):
+                    print(f"    [PLOT] skipped: {skipped}")
+                for err_msg in product_result.get("errors", []):
+                    print(f"    [PLOT] failed: {err_msg}")
+            except Exception as exc_plot:
+                print(f"    [WARN] light-curve products failed: {exc_plot}")
 
-    except ImportError as exc:
+    if not any_input:
+        print()
+        print("  [SKIP] Step 5 period_analysis: no new-layout photometry CSVs found.")
+        print("         Expected: output/<date>/<group>/<target>/<run>/1_photometry/photometry_<ch>_<date>.csv")
+        print("         Run Step 4 photometry first, then rerun period_analysis.")
+        print()
+        return False
+
+    if any_ok:
+        return True
+    if hard_error:
+        return False
+    print()
+    if skipped_channels:
         print(
-            f"[ERROR] 無法匯入 period_analysis.py：{exc}\n"
-            "        請確認 period_analysis.py 與本腳本在同一目錄。"
+            "  [SKIP] Step 5 period_analysis: no analyzable channels "
+            f"(min_data_points={min_pts})."
         )
-        return False
-    except Exception as exc:
-        print(f"[ERROR] period_analysis 步驟失敗：{exc}")
-        return False
+        print("         Skipped: " + ", ".join(skipped_channels))
+        print("         This is a data-quality/short-sequence condition, not a pipeline error.")
+        print()
+        return True
+
+    return False
 
 
 def _run_report(config_path: Path) -> bool:  # noqa: ARG001
@@ -837,6 +1002,15 @@ def main(argv: list[str] | None = None) -> int:
                                   splits_subdir="splits_darkonly")
             else:
                 ok: bool = runner(config_path, raw_mode=args.raw)
+        elif step == "photometry":
+            if args.no_flat:
+                ok: bool = runner(
+                    config_path,
+                    split_subdir="splits_darkonly",
+                    out_tag="darkonly",
+                )
+            else:
+                ok: bool = runner(config_path, raw_mode=args.raw)
         else:
             ok: bool = runner(config_path)
         elapsed = time.monotonic() - step_start
@@ -880,8 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
     print("\n[OK] 所有步驟完成。")
     if "photometry" in steps_to_run and "period_analysis" not in steps_to_run:
         print("   下一步：")
-        print("     1. 開啟 photometry/Photometry.ipynb 執行測光分析（Step 4）")
-        print("     2. 測光完成後，執行進階週期分析（選用）：")
+        print("     1. 檢查 Step 4 輸出的 1_photometry / 3_light_curve / 4_period_analysis")
+        print("     2. 若需重新執行進階週期分析（選用）：")
         print("        python run_pipeline.py --steps period_analysis")
     return 0
 

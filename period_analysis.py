@@ -1221,7 +1221,8 @@ def run_period_analysis(
 
     Parameters
     ----------
-    df              : 測光 DataFrame，需含欄位 ok, bjd_tdb, m_var, v_err。
+    df              : 測光 DataFrame，需含欄位 ok, bjd_tdb, m_var,
+                      plus v_err or t_sigma_mag.
     target_name     : 目標星名稱（用於圖標題和檔名）。
     channel         : 波段（"R" / "G1" / "B"）。
     out_dir         : 輸出目錄（圖片存放位置）。
@@ -1250,10 +1251,25 @@ def run_period_analysis(
     mag_col = "m_var_norm" if "m_var_norm" in df.columns else "m_var"
     logger.info("週期分析使用欄位：%s", mag_col)
 
-    valid_cols = {"ok", "bjd_tdb", mag_col, "v_err"}
+    valid_cols = {"ok", "bjd_tdb", mag_col}
     missing = valid_cols - set(df.columns)
     if missing:
         raise ValueError(f"DataFrame 缺少必要欄位：{missing}")
+
+    base_valid = df[
+        (df["ok"] == 1)
+        & np.isfinite(df["bjd_tdb"])
+        & np.isfinite(df[mag_col])
+    ].copy()
+    if base_valid.empty:
+        raise ValueError("沒有有效測光資料（ok=1 且時間/星等有限），略過週期分析。")
+
+    if "v_err" not in df.columns:
+        if "t_sigma_mag" in df.columns:
+            df = df.copy()
+            df["v_err"] = df["t_sigma_mag"]
+        else:
+            raise ValueError("DataFrame 缺少測光誤差欄位：需要 v_err 或 t_sigma_mag")
 
     d = df[
         (df["ok"] == 1)
