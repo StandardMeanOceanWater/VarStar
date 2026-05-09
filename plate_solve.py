@@ -35,6 +35,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -70,6 +72,12 @@ def detect_backend(cfg: dict) -> str:
         3. 否則                               → "astap"
     """
     backend = cfg.get("astrometry", {}).get("backend", "auto")
+    allowed = {"auto", "", "astap", "astrometry_net"}
+    if backend not in allowed:
+        raise ValueError(
+            f"Unsupported astrometry backend: {backend!r}. "
+            "Allowed values: auto, astap, astrometry_net."
+        )
     if backend not in ("auto", ""):
         return backend
 
@@ -133,6 +141,251 @@ def _scale_wcs_to_original(
     return h
 
 
+_WCS_REQUIRED_KEYS = ("CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2")
+_WCS_COPY_KEYS = (
+    "CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2",
+    "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1", "CD2_2",
+    "CDELT1", "CDELT2", "CROTA2", "EQUINOX", "RADESYS",
+)
+
+
+def _angular_sep_deg(
+    ra1_deg: float,
+    dec1_deg: float,
+    ra2_deg: float,
+    dec2_deg: float,
+) -> float:
+    ra1 = np.deg2rad(ra1_deg)
+    dec1 = np.deg2rad(dec1_deg)
+    ra2 = np.deg2rad(ra2_deg)
+    dec2 = np.deg2rad(dec2_deg)
+    sin_ddec = np.sin((dec2 - dec1) / 2.0)
+    sin_dra = np.sin((ra2 - ra1) / 2.0)
+    a = sin_ddec * sin_ddec + np.cos(dec1) * np.cos(dec2) * sin_dra * sin_dra
+    return float(np.rad2deg(2.0 * np.arcsin(min(1.0, np.sqrt(max(0.0, a))))))
+
+
+def _hint_world_center(
+    ra_hint_h: Optional[float],
+    spd_hint_deg: Optional[float],
+) -> Optional[tuple[float, float]]:
+    if ra_hint_h is None or spd_hint_deg is None:
+        return None
+    return (float(ra_hint_h) * 15.0) % 360.0, float(spd_hint_deg) - 90.0
+
+
+def _validation_max_offset_deg(
+    astap_cfg: dict,
+    ra_hint_h: Optional[float],
+    spd_hint_deg: Optional[float],
+) -> Optional[float]:
+    if _hint_world_center(ra_hint_h, spd_hint_deg) is None:
+        return None
+    search_radius = float(astap_cfg.get("search_radius_deg", 5.0))
+    default_limit = max(2.0, search_radius * 1.25)
+    return float(astap_cfg.get("validation_max_center_offset_deg", default_limit))
+
+
+def _validate_wcs_header(
+    header: fits.Header,
+    data_shape: tuple[int, ...],
+    *,
+    ra_hint_h: Optional[float] = None,
+    spd_hint_deg: Optional[float] = None,
+    max_offset_deg: Optional[float] = None,
+) -> tuple[bool, str]:
+    if len(data_shape) != 2:
+        return False, f"data is not 2D: shape={data_shape}"
+
+    missing = [key for key in _WCS_REQUIRED_KEYS if key not in header]
+    if missing:
+        return False, "missing WCS keys: " + ", ".join(missing)
+
+    has_cd = "CD1_1" in header and "CD2_2" in header
+    has_cdelt = "CDELT1" in header and "CDELT2" in header
+    if not has_cd and not has_cdelt:
+        return False, "missing WCS scale matrix"
+
+    try:
+        wcs = WCS(header)
+    except Exception as exc:
+        return False, f"WCS construction failed: {exc}"
+
+    if not wcs.has_celestial:
+        return False, "WCS has no celestial axes"
+
+    try:
+        matrix = np.asarray(wcs.pixel_scale_matrix, dtype=float)
+        determinant = float(np.linalg.det(matrix))
+    except Exception as exc:
+        return False, f"WCS pixel scale check failed: {exc}"
+    if matrix.shape != (2, 2) or not np.all(np.isfinite(matrix)):
+        return False, "WCS pixel scale matrix is not finite"
+    if abs(determinant) < 1.0e-16:
+        return False, "WCS pixel scale matrix is singular"
+
+    height, width = data_shape
+    center_x = (float(width) - 1.0) / 2.0
+    center_y = (float(height) - 1.0) / 2.0
+    try:
+        ra_deg, dec_deg = wcs.wcs_pix2world([[center_x, center_y]], 0)[0]
+        ra_deg = float(ra_deg)
+        dec_deg = float(dec_deg)
+    except Exception as exc:
+        return False, f"WCS center projection failed: {exc}"
+
+    if not np.isfinite(ra_deg) or not np.isfinite(dec_deg):
+        return False, "WCS center is not finite"
+    if dec_deg < -90.0 or dec_deg > 90.0:
+        return False, f"WCS center Dec out of range: {dec_deg:.6f}"
+
+    hint_center = _hint_world_center(ra_hint_h, spd_hint_deg)
+    if hint_center is not None and max_offset_deg is not None:
+        hint_ra_deg, hint_dec_deg = hint_center
+        offset_deg = _angular_sep_deg(ra_deg, dec_deg, hint_ra_deg, hint_dec_deg)
+        if offset_deg > max_offset_deg:
+            return (
+                False,
+                f"WCS center offset {offset_deg:.3f} deg exceeds "
+                f"limit {max_offset_deg:.3f} deg",
+            )
+
+    return True, "ok"
+
+
+def _validate_wcs_file(
+    fits_path: Path,
+    *,
+    ra_hint_h: Optional[float] = None,
+    spd_hint_deg: Optional[float] = None,
+    max_offset_deg: Optional[float] = None,
+) -> tuple[bool, str]:
+    try:
+        with fits.open(fits_path, ignore_missing_end=True, memmap=False) as hdul:
+            hdu = next((item for item in hdul if item.data is not None), None)
+            if hdu is None:
+                return False, "FITS contains no image data"
+            data_shape = tuple(hdu.data.shape)
+            header = hdu.header.copy()
+    except Exception as exc:
+        return False, f"cannot read FITS: {exc}"
+
+    return _validate_wcs_header(
+        header,
+        data_shape,
+        ra_hint_h=ra_hint_h,
+        spd_hint_deg=spd_hint_deg,
+        max_offset_deg=max_offset_deg,
+    )
+
+
+def _write_fits_with_wcs_header(
+    src_fits: Path,
+    wcs_path: Path,
+    out_fits: Path,
+    *,
+    ra_hint_h: Optional[float] = None,
+    spd_hint_deg: Optional[float] = None,
+    max_offset_deg: Optional[float] = None,
+) -> tuple[bool, str]:
+    try:
+        with fits.open(src_fits, ignore_missing_end=True, memmap=False) as hdul:
+            hdu = next((item for item in hdul if item.data is not None), None)
+            if hdu is None:
+                return False, "source FITS contains no image data"
+            data = np.asarray(hdu.data).copy()
+            header = hdu.header.copy()
+    except Exception as exc:
+        return False, f"cannot read ASTAP WCS output: {exc}"
+    try:
+        wcs_header = fits.getheader(wcs_path)
+    except Exception:
+        try:
+            wcs_text = wcs_path.read_text(encoding="ascii", errors="ignore")
+            wcs_header = fits.Header.fromstring(wcs_text, sep="\n")
+        except Exception as exc:
+            return False, f"cannot parse ASTAP WCS header: {exc}"
+
+    for key in _WCS_COPY_KEYS:
+        if key in header:
+            del header[key]
+        if key in wcs_header:
+            header[key] = wcs_header[key]
+    header["HISTORY"] = f"WCS solved by ASTAP using {wcs_path.name}"
+
+    valid, reason = _validate_wcs_header(
+        header,
+        data.shape,
+        ra_hint_h=ra_hint_h,
+        spd_hint_deg=spd_hint_deg,
+        max_offset_deg=max_offset_deg,
+    )
+    if not valid:
+        return False, reason
+
+    try:
+        out_fits.parent.mkdir(parents=True, exist_ok=True)
+        fits.PrimaryHDU(data=data, header=header).writeto(out_fits, overwrite=True)
+        _set_writable(out_fits)
+    except OSError as exc:
+        return False, f"cannot write merged WCS FITS: {exc}"
+    return True, "ok"
+
+
+def _subprocess_tail(text: str, limit: int = 500) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return "..." + text[-limit:]
+
+
+def _resolve_astap_tmp_root(project_root: Path, astap_cfg: dict) -> Path:
+    configured = astap_cfg.get("tmp_dir") or astap_cfg.get("work_dir") or ""
+    if configured:
+        tmp_root = Path(str(configured))
+        if not tmp_root.is_absolute():
+            tmp_root = project_root / tmp_root
+        return tmp_root
+    return project_root / "TEMP" / "plate_solve_tmp"
+
+
+def _set_writable(path: Path) -> None:
+    try:
+        mode = stat.S_IREAD | stat.S_IWRITE
+        if path.is_dir():
+            mode |= stat.S_IEXEC
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _cleanup_astap_work_dir(work_dir: Path) -> None:
+    if not work_dir.exists():
+        return
+
+    for root, dirs, files in os.walk(work_dir, topdown=False):
+        for name in files:
+            _set_writable(Path(root) / name)
+        for name in dirs:
+            _set_writable(Path(root) / name)
+    _set_writable(work_dir)
+
+    def _onerror(func, raw_path, _exc_info) -> None:
+        path = Path(raw_path)
+        _set_writable(path)
+        func(raw_path)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(8):
+        try:
+            shutil.rmtree(work_dir, onerror=_onerror)
+            return
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.5)
+    print(f"  [WARN] ASTAP temp cleanup failed: {work_dir} ({last_exc})")
+
+
 # =============================================================================
 # ASTAP hint 解析工具
 # =============================================================================
@@ -170,8 +423,23 @@ def _get_hint_for_target(
     if ra_h is None or dec_deg is None:
         return None, None
 
-    ra_hours = float(ra_h)                # 單位已是小時，直接使用
-    spd_deg = 90.0 + float(dec_deg)       # 南極距：SPD = 90 + Dec
+    try:
+        ra_hours = float(ra_h)            # 單位已是小時，直接使用
+        dec_value = float(dec_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid astrometry hint for target {target_name}: "
+            f"ra_hint_h={ra_h!r}, dec_hint_deg={dec_deg!r}"
+        ) from exc
+    if not 0.0 <= ra_hours < 24.0:
+        raise ValueError(
+            f"Invalid ra_hint_h for target {target_name}: {ra_hours!r}"
+        )
+    if not -90.0 <= dec_value <= 90.0:
+        raise ValueError(
+            f"Invalid dec_hint_deg for target {target_name}: {dec_value!r}"
+        )
+    spd_deg = 90.0 + dec_value            # 南極距：SPD = 90 + Dec
     return ra_hours, spd_deg
 
 
@@ -263,7 +531,8 @@ def _collect_drift_entries(wcs_files: list[Path]) -> list[dict]:
             if data.ndim != 2:
                 continue
             header = hdu.header.copy()
-        if "CRVAL1" not in header or "CRVAL2" not in header:
+        valid, _reason = _validate_wcs_header(header, data.shape)
+        if not valid:
             continue
         wcs = WCS(header)
         height, width = data.shape
@@ -365,19 +634,21 @@ def _run_astap(
     astap_cfg: dict,
     ra_hint_h: Optional[float] = None,
     spd_hint_deg: Optional[float] = None,
+    max_offset_deg: Optional[float] = None,
+    tmp_root: Optional[Path] = None,
 ) -> bool:
     """
     呼叫 ASTAP CLI 對單張 FITS 執行星圖解算，輸出到 out_path。
 
     ASTAP 解算流程：
-        1. 複製 fits_path 到臨時目錄（避免 ASTAP 直接覆蓋來源）
-        2. 執行 ASTAP CLI（-update 旗標讓 ASTAP 把 WCS 寫回副本）
+        1. 建立顯式 ASTAP 工作目錄，正式 FITS 只讀不複製
+        2. 執行 ASTAP CLI，將 .wcs/.ini 輸出寫到工作目錄
            傳入 -ra（小時）/ -spd（南極距）hint，修正 NINA 標頭
            RA/DEC 不可靠（實測為北極點座標）導致 ASTAP 搜尋範圍
            偏離目標天區的問題。不縮減 search_radius，避免影響
            ASTAP 內部搜尋格網的步驟起點計算。
         3. 驗證 WCS 中心在合理天區內
-        4. 複製已解算 FITS 到 out_path
+        4. 將 .wcs 合併回 FITS data/header，寫到 out_path
 
     Parameters
     ----------
@@ -397,23 +668,35 @@ def _run_astap(
     executable = astap_cfg.get("executable", "astap_cli")
     db_path = astap_cfg.get("db_path", "")
     search_radius = float(astap_cfg.get("search_radius_deg", 5.0))
-    downsample = int(astap_cfg.get("downsample", 2))
+    downsample = max(1, int(astap_cfg.get("downsample", 2)))
     fov = float(astap_cfg.get("fov_override_deg", 0.0))
     timeout = int(astap_cfg.get("timeout_sec", 180))
-    max_retries = int(astap_cfg.get("max_retries", 2))
+    max_retries = max(1, int(astap_cfg.get("max_retries", 2)))
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_fits = Path(tmpdir) / fits_path.name
-        import shutil
-        shutil.copy2(fits_path, tmp_fits)
+    if tmp_root is None:
+        tmp_root = Path.cwd() / "TEMP" / "plate_solve_tmp"
+    try:
+        tmp_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"  [ERROR] ASTAP temp root create failed: {tmp_root} ({exc})")
+        return False
 
+    work_dir = tmp_root / f"astap_{os.getpid()}_{time.time_ns()}"
+    try:
+        work_dir.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        print(f"  [ERROR] ASTAP temp workdir create failed: {work_dir} ({exc})")
+        return False
+
+    try:
+        astap_out_base = work_dir / fits_path.name
+        print(f"  [TMP] ASTAP workdir: {work_dir}")
         cmd = [
             executable,
-            "-f", str(tmp_fits),
+            "-f", str(fits_path),
             "-r", str(search_radius),
             "-d", db_path,
-            "-update",
-            "-o", str(tmp_fits),
+            "-o", str(astap_out_base),
         ]
         if downsample > 1:
             cmd += ["-z", str(downsample)]
@@ -433,19 +716,59 @@ def _run_astap(
                     capture_output=True,
                     text=True,
                     timeout=timeout,
+                    cwd=str(work_dir),
                 )
-                if result.returncode == 0 and tmp_fits.exists():
-                    with fits.open(tmp_fits) as hdul:
-                        hdr = hdul[0].header
-                        if "CRVAL1" not in hdr and "CD1_1" not in hdr:
+                if result.returncode == 0:
+                    solved_fits = fits_path
+                    valid, reason = _validate_wcs_file(
+                        fits_path,
+                        ra_hint_h=ra_hint_h,
+                        spd_hint_deg=spd_hint_deg,
+                        max_offset_deg=max_offset_deg,
+                    )
+                    if not valid:
+                        wcs_path = astap_out_base.with_suffix(".wcs")
+                        merged_fits = work_dir / f"{fits_path.stem}_merged.fits"
+                        if not wcs_path.exists():
                             print(
-                                f"  [WARN] ASTAP 回傳 0 但 WCS 標頭缺失："
-                                f"{fits_path.name}"
+                                f"  [WARN] ASTAP returned 0 but no usable WCS was found: "
+                                f"{fits_path.name} ({reason})"
                             )
                             continue
-                    shutil.copy2(tmp_fits, out_path)
+                        valid, reason = _write_fits_with_wcs_header(
+                            fits_path,
+                            wcs_path,
+                            merged_fits,
+                            ra_hint_h=ra_hint_h,
+                            spd_hint_deg=spd_hint_deg,
+                            max_offset_deg=max_offset_deg,
+                        )
+                        if not valid:
+                            print(
+                                f"  [WARN] ASTAP .wcs merge failed: "
+                                f"{fits_path.name} ({reason})"
+                            )
+                            continue
+                        solved_fits = merged_fits
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        shutil.copyfile(solved_fits, out_path)
+                        _set_writable(out_path)
+                    except OSError as exc:
+                        print(
+                            f"  [ERROR] ASTAP output copy failed: "
+                            f"{solved_fits} -> {out_path} ({exc})"
+                        )
+                        return False
                     return True
                 else:
+                    if attempt == max_retries - 1:
+                        stderr_tail = _subprocess_tail(result.stderr)
+                        stdout_tail = _subprocess_tail(result.stdout)
+                        if stderr_tail:
+                            print(f"  [ASTAP stderr] {stderr_tail}")
+                        if stdout_tail:
+                            print(f"  [ASTAP stdout] {stdout_tail}")
                     if attempt < max_retries - 1:
                         print(f"  [WARN] ASTAP 第 {attempt + 1} 次解算失敗，重試…")
                         time.sleep(2)
@@ -456,8 +779,10 @@ def _run_astap(
                 print(f"  [錯誤] 找不到 ASTAP 執行檔：{executable}")
                 return False
 
-    print(f"  [失敗] ASTAP 解算失敗：{fits_path.name}")
-    return False
+        print(f"  [失敗] ASTAP 解算失敗：{fits_path.name}")
+        return False
+    finally:
+        _cleanup_astap_work_dir(work_dir)
 
 
 # =============================================================================
@@ -582,6 +907,9 @@ def _run_astrometry_net(
     fits_path: Path,
     out_path: Path,
     anet_cfg: dict,
+    ra_hint_h: Optional[float] = None,
+    spd_hint_deg: Optional[float] = None,
+    max_offset_deg: Optional[float] = None,
 ) -> bool:
     """
     使用 astrometry.net API 解算，結果寫入 out_path。
@@ -648,6 +976,16 @@ def _run_astrometry_net(
         f"WCS solved by astrometry.net job {job_id} "
         f"(upload downsample={upload_downsample}x)"
     )
+    valid, reason = _validate_wcs_header(
+        header_orig,
+        data_orig.shape,
+        ra_hint_h=ra_hint_h,
+        spd_hint_deg=spd_hint_deg,
+        max_offset_deg=max_offset_deg,
+    )
+    if not valid:
+        print(f"  [ERROR] astrometry.net returned invalid WCS: {reason}")
+        return False
 
     hdu = fits.PrimaryHDU(data=data_orig, header=header_orig)
     hdu.verify("silentfix")
@@ -703,6 +1041,7 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
         date = str(session["date"])
         data_root = cfg["_data_root"]
         project_root = cfg["_project_root"]
+        astap_tmp_root = _resolve_astap_tmp_root(project_root, astap_cfg)
 
         for group_info in _session_groups(cfg, target_list):
             _group = str(group_info["group"])
@@ -733,7 +1072,6 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
             cr2_files = sorted(
                 f for f in cal_dir.iterdir()
                 if f.is_file() and f.suffix.lower() == ".cr2"
-                and not (wcs_dir / (f.stem + "_wcs.fits")).exists()
             )
             if cr2_files:
                 print(f"  [CR2] 偵測到 {len(cr2_files)} 個 CR2 待解算")
@@ -741,11 +1079,14 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
             # 合併 FITS 和 CR2（CR2 需逐檔暫存轉換）
             all_sources = [(f, False) for f in fits_files] + \
                           [(f, True) for f in cr2_files]
-            total_count = len(fits_files) + len(cr2_files) + \
-                sum(1 for f in fits_files
-                    if (wcs_dir / (f.stem + "_wcs.fits")).exists())
+            total_count = len(all_sources)
 
             ra_hint, spd_hint = _get_hint_for_target(cfg, hint_target)
+            max_offset_deg = _validation_max_offset_deg(
+                astap_cfg,
+                ra_hint,
+                spd_hint,
+            )
             targets_text = ", ".join(group_targets)
             if ra_hint is not None:
                 print(
@@ -760,7 +1101,7 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                     f"  hint 未設定（yaml 無目標座標）"
                 )
 
-            if not all_sources and total_count == 0:
+            if not all_sources:
                 _src = "raw/" if raw_mode else "wcs/"
                 print(f"[SKIP] {_group}/{date}：{_src} 目錄裡找不到 FITS/CR2。")
                 continue
@@ -770,8 +1111,19 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                 out_path = wcs_dir / (src_path.stem + "_wcs.fits")
 
                 if out_path.exists():
-                    skipped += 1
-                    continue
+                    valid, reason = _validate_wcs_file(
+                        out_path,
+                        ra_hint_h=ra_hint,
+                        spd_hint_deg=spd_hint,
+                        max_offset_deg=max_offset_deg,
+                    )
+                    if valid:
+                        skipped += 1
+                        continue
+                    print(
+                        f"  [WARN] 既有 WCS 驗證失敗，將重解："
+                        f"{out_path.name} ({reason})"
+                    )
 
                 # CR2：逐檔轉暫存 FITS，解算後刪除
                 tmp_fits = None
@@ -798,9 +1150,20 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                         astap_cfg,
                         ra_hint_h=ra_hint,
                         spd_hint_deg=spd_hint,
+                        max_offset_deg=max_offset_deg,
+                        tmp_root=astap_tmp_root,
+                    )
+                elif backend == "astrometry_net":
+                    ok = _run_astrometry_net(
+                        solve_path,
+                        out_path,
+                        anet_cfg,
+                        ra_hint_h=ra_hint,
+                        spd_hint_deg=spd_hint,
+                        max_offset_deg=max_offset_deg,
                     )
                 else:
-                    ok = _run_astrometry_net(solve_path, out_path, anet_cfg)
+                    raise ValueError(f"Unsupported astrometry backend: {backend!r}")
 
                 # 清理暫存
                 if tmp_fits is not None and tmp_fits.exists():
@@ -812,14 +1175,6 @@ def run_plate_solve(config_path: str | Path, *, raw_mode: bool = False,
                 else:
                     print("FAIL")
                     failed += 1
-
-            # 統計已跳過的 WCS 檔案
-            skipped = sum(1 for f in cal_dir.iterdir()
-                         if f.suffix.lower() in (".fits", ".cr2")
-                         and "wcs" not in f.stem.lower()
-                         and "_tmp" not in f.stem
-                         and (wcs_dir / (f.stem + "_wcs.fits")).exists()
-                         ) - success
 
             print(
                 f"\n[完成] {_group}/{date}：成功 {success}，失敗 {failed}，"

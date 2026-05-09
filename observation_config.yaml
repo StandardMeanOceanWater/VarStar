@@ -188,7 +188,7 @@ astrometry:
 
   astap:
     executable: "C:/Program Files/astap/astap_cli.exe"
-    db_path: "C:/Program Files/astap/d80"
+    db_path: "C:/Program Files/astap"  # contains d80_*.1476 database files
     search_radius_deg: 30
     downsample: 2
     fov_override_deg: 0
