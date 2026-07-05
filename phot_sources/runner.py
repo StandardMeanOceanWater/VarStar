@@ -33,23 +33,28 @@ from phot_sources.logging_utils import (
 from pipeline_config import load_pipeline_config
 
 
+def _normalize_channels(raw_channels) -> "list[str]":
+    channels: list[str] = []
+    for raw in raw_channels or []:
+        ch = str(raw).strip().upper()
+        if ch and ch not in channels:
+            channels.append(ch)
+    if "G1" in channels and "G2" not in channels:
+        channels.insert(channels.index("G1") + 1, "G2")
+    if not channels:
+        raise ValueError("photometry channels are empty")
+    return channels
+
+
 def _resolve_channels(args, yaml_cfg) -> "list[str]":
     if args.channels:
-        channels = [str(ch).upper() for ch in args.channels]
-        if "G1" in channels and "G2" not in channels:
-            _g1_idx = channels.index("G1")
-            channels.insert(_g1_idx + 1, "G2")
-    else:
-        _ch_raw = yaml_cfg.get("photometry", {}).get(
-            "channels", yaml_cfg.get("photometry", {}).get("channel", ["B"])
-        )
-        if isinstance(_ch_raw, str):
-            _ch_raw = [_ch_raw]
-        channels = [str(ch).upper() for ch in _ch_raw]
-        if "G1" in channels and "G2" not in channels:
-            _g1_idx = channels.index("G1")
-            channels.insert(_g1_idx + 1, "G2")
-    return channels
+        return _normalize_channels(args.channels)
+    _ch_raw = yaml_cfg.get("photometry", {}).get(
+        "channels", yaml_cfg.get("photometry", {}).get("channel", ["B"])
+    )
+    if isinstance(_ch_raw, str):
+        _ch_raw = [_ch_raw]
+    return _normalize_channels(_ch_raw)
 
 
 def _parse_cli_args(argv=None):
@@ -127,12 +132,21 @@ def _build_targets_list(args, yaml_cfg) -> "list[tuple[str, str]]":
                 for _t in _sess_targets:
                     _targets_list.append((str(_t), str(args.date)))
         if not _targets_list:
-            print(f"[WARN] yaml 中找不到日期 {args.date} 的場次，試圖直接推測單一目標")
-            _targets_list = [("V1162Ori", args.date)]
+            print(f"[WARN] yaml 中找不到日期 {args.date} 的場次")
         return _targets_list
     if args.target is None and args.date is None:
-        return [("V1162Ori", "20251220")]
-    return [(args.target or "V1162Ori", args.date or "20251220")]
+        for _sess in yaml_cfg.get("obs_sessions", []):
+            _sess_targets = _session_targets(_sess)
+            if _sess_targets:
+                return [(str(_sess_targets[0]), str(_sess["date"]))]
+        return []
+    if args.target is not None and args.date is None:
+        for _sess in yaml_cfg.get("obs_sessions", []):
+            if str(args.target) in _session_targets(_sess):
+                return [(str(args.target), str(_sess["date"]))]
+        print(f"[WARN] yaml 中找不到目標 {args.target} 的場次")
+        return []
+    return [(str(args.target), str(args.date))]
 
 
 def _summarize_field_key(field_key) -> str:
@@ -270,6 +284,7 @@ def _open_target_run(logger, yaml_cfg, args, log_ts, active_target, active_date,
     if not wcs_files:
         logger.warning(f"[SKIP] no split FITS for channel={_ch0} dir={cfg.wcs_dir}")
         print(f"[SKIP] 找不到 split/{_ch0} FITS：{cfg.wcs_dir}，跳過此目標")
+        detach_file_handlers(logger)
         return None
     print(f"找到 split/{_ch0} FITS：{len(wcs_files)} 張")
 
@@ -293,6 +308,7 @@ def _prepare_target_run_state(logger, yaml_cfg, args, log_ts, active_target, act
 
     _prep_state = _prepare_target_aperture_state(logger, cfg, wcs_files, active_target)
     if _prep_state is None:
+        detach_file_handlers(logger)
         return None
     _shared_aperture_radius, check_star, _vsx_field, ap_r_in, ap_r_out = _prep_state
     emit_progress_done(logger, f"main target setup target={active_target}", _target_started)
@@ -497,6 +513,9 @@ def run_main(
     _targets_list = _build_targets_list(_args, _yaml)
 
     print(f"[photometry] 待處理目標：{_targets_list}  通道：{CHANNELS}")
+    if not _targets_list:
+        print("[ERROR] no photometry targets resolved from CLI/config")
+        return 1
 
     _logger.info(f"[photometry] targets={_targets_list} channels={CHANNELS}")
     _field_groups, _field_caches = _build_shared_field_caches(
@@ -507,6 +526,9 @@ def run_main(
         _logger.info(f"[photometry] shared_field_groups={_multi_fields}")
         print(f"[photometry] 偵測到 {_multi_fields} 個多目標視野，啟用共用比較星快取")
 
+    _processed_targets = 0
+    _processed_channels = 0
+
     for (ACTIVE_TARGET, ACTIVE_DATE) in _targets_list:
         _main_target_started = time.perf_counter()
         _target_state = _prepare_target_run_state(
@@ -516,39 +538,53 @@ def run_main(
             continue
         cfg, _shared_aperture_radius, check_star, _vsx_field, ap_r_in, ap_r_out = _target_state
 
-        channel_results, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch, _active_cache, _stage4_run_root = (
-            _run_channels_for_target(
-                _logger, _yaml, _args, _log_ts, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS,
-                cfg, _shared_aperture_radius, _field_caches,
-                photometry_func,
-            )
-        )
-        if _stage4_run_root is None:
-            _stage4_run_root = cfg.run_root
-
-        stage4_postprocess_func(
-            cfg, ACTIVE_TARGET, ACTIVE_DATE, channel_results, _stage4_run_root
-        )
-
-        _logger.info(f"[target] base target complete target={ACTIVE_TARGET} date={ACTIVE_DATE}")
-        _vsx_shell = prepare_vsx_candidates_func(_logger, _args, _vsx_field, cfg)
-        if _vsx_shell is not None:
-            _vsx_cand, _VSX_MAG_MIN, _VSX_MAG_MAX = _vsx_shell
-            if len(_vsx_cand) > 0:
-                print(f"\n{'='*55}")
-                print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 ({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)")
-                print(f"{'='*55}")
-                run_vsx_targets_func(
-                    _logger, _yaml, ACTIVE_TARGET, ACTIVE_DATE, _log_ts, CHANNELS,
-                    cfg, _vsx_cand, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
-                    _shared_aperture_radius, _active_cache, check_star,
+        try:
+            channel_results, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch, _active_cache, _stage4_run_root = (
+                _run_channels_for_target(
+                    _logger, _yaml, _args, _log_ts, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS,
+                    cfg, _shared_aperture_radius, _field_caches,
+                    photometry_func,
                 )
-                emit_progress(_logger, f"VSX done target={ACTIVE_TARGET} count={len(_vsx_cand)}")
-        emit_progress_done(
-            _logger,
-            f"main target target={ACTIVE_TARGET} date={ACTIVE_DATE}",
-            _main_target_started,
+            )
+            _processed_targets += 1
+            _processed_channels += len(channel_results)
+            if _stage4_run_root is None:
+                _stage4_run_root = cfg.run_root
+
+            stage4_postprocess_func(
+                cfg, ACTIVE_TARGET, ACTIVE_DATE, channel_results, _stage4_run_root
+            )
+
+            _logger.info(f"[target] base target complete target={ACTIVE_TARGET} date={ACTIVE_DATE}")
+            _vsx_shell = prepare_vsx_candidates_func(_logger, _args, _vsx_field, cfg)
+            if _vsx_shell is not None:
+                _vsx_cand, _VSX_MAG_MIN, _VSX_MAG_MAX = _vsx_shell
+                if len(_vsx_cand) > 0:
+                    print(f"\n{'='*55}")
+                    print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 ({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)")
+                    print(f"{'='*55}")
+                    run_vsx_targets_func(
+                        _logger, _yaml, ACTIVE_TARGET, ACTIVE_DATE, _log_ts, CHANNELS,
+                        cfg, _vsx_cand, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
+                        _shared_aperture_radius, _active_cache, check_star,
+                    )
+                    emit_progress(_logger, f"VSX done target={ACTIVE_TARGET} count={len(_vsx_cand)}")
+            emit_progress_done(
+                _logger,
+                f"main target target={ACTIVE_TARGET} date={ACTIVE_DATE}",
+                _main_target_started,
+            )
+        finally:
+            detach_file_handlers(_logger)
+
+    if _processed_channels == 0:
+        print(
+            "[ERROR] photometry produced no channel outputs "
+            f"(targets_processed={_processed_targets})"
         )
+        return 1
+
+    return 0
 
 
 __all__ = [
@@ -557,6 +593,7 @@ __all__ = [
     "_comp_signature",
     "_init_summary_logger",
     "_load_pipeline_yaml",
+    "_normalize_channels",
     "_open_target_run",
     "_parse_cli_args",
     "_prepare_channel_fits_inputs",

@@ -15,7 +15,6 @@ from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 
-from phot_ensemble import ensemble_normalize
 from phot_sources.core import (
     aperture_photometry,
     compute_annulus_radii,
@@ -33,12 +32,14 @@ from polt_light_curve import plot_light_curve
 _phot_logger = logging.getLogger("photometry")
 
 
-def _emit_progress(logger, message):
-    emit_progress(logger, message)
-
-
-def _emit_progress_done(logger, stage_label, started_at):
-    emit_progress_done(logger, stage_label, started_at)
+def _ensure_output_schema(df: pd.DataFrame) -> pd.DataFrame:
+    if "m_var_norm" not in df.columns:
+        df["m_var_norm"] = df["m_var"] if "m_var" in df.columns else np.nan
+    if "delta_ensemble" not in df.columns:
+        df["delta_ensemble"] = np.nan
+    if "v_err" not in df.columns:
+        df["v_err"] = df["t_sigma_mag"] if "t_sigma_mag" in df.columns else np.nan
+    return df
 
 
 def _emit_photometry_products(
@@ -59,7 +60,7 @@ def _emit_photometry_products(
     first_frame_diag_data,
 ) -> bool:
     """Write post-run artifacts after the science dataframe is finalized."""
-    # 第一次寫入（ensemble normalize 後會再寫一次，更新 m_var_norm/delta_ensemble）
+    df = _ensure_output_schema(df)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
     n_written = len(df)
@@ -89,8 +90,6 @@ def _emit_photometry_products(
     d = df[(df["ok"] == 1) & np.isfinite(df[time_key]) & np.isfinite(df["m_var"])].copy()
     if len(d) == 0:
         print("[PLOT] No valid photometry points to plot.")
-        df["m_var_norm"] = df["m_var"]
-        df["delta_ensemble"] = np.nan
         return False
 
     _lc_obs_date = str(out_csv.stem).split("_")[-1]
@@ -103,9 +102,6 @@ def _emit_photometry_products(
             flag = " [!] EXCEEDS THRESHOLD" if sigma_k > cfg.check_star_max_sigma else ""
             print(f"[CHECK] K-C sigma = {sigma_k:.5f} mag "
                   f"(threshold = {cfg.check_star_max_sigma}){flag}")
-
-    df["m_var_norm"] = df["m_var"]
-    df["delta_ensemble"] = np.nan
 
     plot_light_curve(df, out_png, channel, cfg, obs_date=_lc_obs_date)
 
@@ -210,24 +206,13 @@ def run_photometry_on_wcs_dir(
     Returns
     -------
     df               : 每幀測光結果 DataFrame（含 m_var、m_var_norm 等欄位）。
-    comp_lightcurves : {star_id: Series(bjd_tdb → m_inst)}，每顆比較星的
-                       儀器星等時間序列。僅在 cfg.ensemble_normalize=True 且
-                       比較星數 ≥ cfg.ensemble_min_comp 時填充；否則回傳空 dict。
-                       star_id 格式："{ra_deg:.6f}_{dec_deg:.6f}"。
+    comp_lightcurves : reserved return slot; currently always an empty dict.
     """
     ra_t, dec_t = cfg_obj.target_radec_deg
     if ap_radius is None:
         ap_radius = cfg_obj.aperture_radius
     r_in, r_out = compute_annulus_radii(ap_radius, cfg_obj.annulus_r_in, cfg_obj.annulus_r_out)
     margin = int(np.ceil(r_out + 2))
-
-    # ── ⏸ Ensemble 正規化設定（已停用，保留供未來重啟）────────────────────────────
-    # 原本邏輯：_ensemble_on=True 時調用 ensemble_normalize() 迭代計算 Δ(t)。
-    # 現況：簡化版本已跳過呼叫，直接使用回歸結果（見下文 3659-3700 之簡化版）。
-    _ensemble_on = bool(getattr(cfg_obj, "ensemble_normalize", False))
-    _ensemble_min_comp = int(getattr(cfg_obj, "ensemble_min_comp", 3))
-    _ensemble_max_iter = int(getattr(cfg_obj, "ensemble_max_iter", 10))
-    _ensemble_tol = float(getattr(cfg_obj, "ensemble_convergence_tol", 1e-4))
 
     # split/{channel}/ 的 FITS 命名規則：*_{channel}.fits
     wcs_files_sorted = sorted(wcs_dir.glob(f"*_{channel}.fits"))
@@ -249,14 +234,6 @@ def run_photometry_on_wcs_dir(
     rows = []
     _first_frame_diag_data = None   # (comp_m_cat, comp_m_inst, fit) for diag plot
 
-    # ── comp_lightcurves 累積結構：{star_id: {t_val: m_inst}} ────────────────
-    # star_id = "{ra_deg:.6f}_{dec_deg:.6f}"
-    # 每幀測光後，把該幀所有有效比較星的 (t, m_inst) 追加進去。
-    # 幀迴圈結束後轉為 pd.Series 供 ensemble_normalize 使用。
-    _comp_lc_buf: "dict[str, dict]" = {}
-    # 對應 star_id → 初始權重（來自幀迴圈中計算的距離＋誤差複合權重）
-    # 只取第一次出現的值（各幀理論上相同，因為距離和 m_err 不隨時間變化）
-    _comp_init_weights: "dict[str, float]" = {}
     _frame_stage_started = time.perf_counter()
     _cache_label = f"{cfg_obj.target_name}:{channel}"
     _frame_total_times: "list[float]" = []
@@ -271,7 +248,7 @@ def run_photometry_on_wcs_dir(
     _check_total_times: "list[float]" = []
     _comp_phot_calls = 0
     _cached_comp_hits = 0
-    _emit_progress(
+    emit_progress(
         _phot_logger,
         f"channel {channel} frame loop start total={len(wcs_files_sorted)}"
     )
@@ -281,7 +258,7 @@ def run_photometry_on_wcs_dir(
         _frame_started = time.perf_counter()
         _now = time.perf_counter()
         if (_frame_idx % 25 == 0) or (_now - _last_heartbeat_at >= 30.0):
-            _emit_progress(
+            emit_progress(
                 _phot_logger,
                 f"channel {channel} heartbeat frames={_frame_idx}/{len(wcs_files_sorted)} "
                 f"elapsed={_now - _frame_stage_started:.1f}s"
@@ -476,15 +453,6 @@ def run_photometry_on_wcs_dir(
             comp_m_cat.append(float(m_cat))
             comp_weights.append(weight)
 
-            # ── ⏸ 累積 comp_lightcurves（ensemble 正規化用，已停用）──────────────
-            # 原本用途：ensemble_normalize() 需要所有比較星的 m_inst 時間序列。
-            # 現況：_ensemble_on 永遠 False，此段無法執行，保留作參考。
-            if _ensemble_on:
-                _sid = f"{ra_c:.6f}_{dec_c:.6f}"
-                if _sid not in _comp_lc_buf:
-                    _comp_lc_buf[_sid] = {}
-                    _comp_init_weights[_sid] = weight
-                _comp_lc_buf[_sid][bjd_tdb if np.isfinite(bjd_tdb) else mjd] = m_inst_c
         _comp_loop_times.append(time.perf_counter() - _comp_loop_started)
 
         comp_m_inst  = np.asarray(comp_m_inst, dtype=float)
@@ -673,7 +641,7 @@ def run_photometry_on_wcs_dir(
         rows.append(rec)
         _frame_total_times.append(time.perf_counter() - _frame_started)
 
-    _emit_progress_done(_phot_logger, f"channel {channel} frame loop", _frame_stage_started)
+    emit_progress_done(_phot_logger, f"channel {channel} frame loop", _frame_stage_started)
     _frame_total_arr = np.asarray(_frame_total_times, dtype=float)
     _target_ap_arr = np.asarray(_target_ap_times, dtype=float)
     _comp_ap_arr = np.asarray(_comp_ap_times, dtype=float)
@@ -728,7 +696,8 @@ def run_photometry_on_wcs_dir(
     if len(df) == 0:
         print("[WARN] 所有幀均被跳過（airmass），無任何資料列。")
         df = pd.DataFrame(columns=["file", "mjd", "bjd_tdb", "airmass", "ok", "m_var",
-                                    "m_var_norm", "delta_ensemble"])
+                                    "m_var_norm", "delta_ensemble", "v_err"])
+        df = _ensure_output_schema(df)
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(out_csv, index=False, encoding="utf-8-sig")
         return df, {}
@@ -993,6 +962,7 @@ def run_photometry_on_wcs_dir(
 
 
 __all__ = [
+    "_ensure_output_schema",
     "_emit_photometry_products",
     "run_photometry_on_wcs_dir",
 ]

@@ -79,11 +79,13 @@ def _stage4_run_period_analysis(active_target, channel_results, stage4_run_root)
                     print(f"[Fourier] 擬合失敗或跳過")
             else:
                 print(f"[LS] {_ls_ch} run_period_analysis 回傳空結果")
+        except ValueError as _e_ls:
+            print(f"[LS] {_ls_ch} 跳過：{_e_ls}")
         except Exception as _e_ls:
             print(f"[LS] {_ls_ch} 失敗：{_e_ls}")
 
     if not _pa_any:
-        print("[LS] 跳過（所有通道有效幀數 < 10 或分析失敗）")
+        print("[LS] 跳過（沒有通道產生週期分析結果）")
 
 
 def _stage4_write_light_curve_products(cfg, active_target, active_date, channel_results, stage4_run_root):
@@ -189,6 +191,9 @@ def _stage4_run_g1g2_ratio_products(cfg, active_target, active_date, channel_res
 
 
 def _run_stage4_postprocess(cfg, active_target, active_date, channel_results, stage4_run_root):
+    if not channel_results:
+        print(f"[stage4] {active_target} {active_date}: no channel results; skip postprocess")
+        return
     _stage4_started = time.perf_counter()
     emit_progress(_phot_logger, f"stage4 postprocess start target={active_target} date={active_date}")
     _stage4_replot_shared_g1g2_ylim(cfg, active_date, channel_results)
@@ -201,7 +206,7 @@ def _run_stage4_postprocess(cfg, active_target, active_date, channel_results, st
     )
 
     emit_progress_done(_phot_logger, f"stage4 postprocess target={active_target} date={active_date}", _stage4_started)
-    print(f"\n[完成] {active_target} {active_date} 全部通道週期分析完成")
+    print(f"\n[完成] {active_target} {active_date} photometry postprocess complete")
 
 
 __all__ = [
