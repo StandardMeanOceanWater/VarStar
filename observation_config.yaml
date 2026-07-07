@@ -322,6 +322,7 @@ period_analysis:
     period_min_hr: 0.5              # 搜尋週期下限（小時）
     period_max_hours: 8.0           # LS 搜尋週期上限（小時）
     detrend_order: 1                # LS 前線性趨勢扣除（0=關，1=線性，2=二次）
+                                    # 基線 < 2×period_max_hours 時自動關閉（趨勢與訊號簡併）
     oversampling: 10                # 頻率格網 oversampling 因子
 
     # FAP 計算：bootstrap 迭代至收斂或上限，取先到者

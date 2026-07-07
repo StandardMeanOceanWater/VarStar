@@ -414,7 +414,16 @@ def run_ls_and_dft(
     max_freq = 1.0 / period_min_days
 
     # ── 趨勢扣除（線性 detrend，去除大氣漂移） ────────────────────────────
+    # 基線 < 2× 搜尋範圍內最長週期時自動關閉：此時線性趨勢與訊號本身
+    # 簡併，detrend 會咬掉訊號並把峰值往短週期推
     detrend_order = int(_get(cfg, "period_analysis", "lomb_scargle", "detrend_order", default=0))
+    _baseline_d = float(np.max(t) - np.min(t))
+    if detrend_order > 0 and _baseline_d < 2.0 * period_max_days:
+        logger.info(
+            "[detrend] 基線 %.3f d < 2×period_max %.3f d，自動關閉趨勢扣除。",
+            _baseline_d, period_max_days,
+        )
+        detrend_order = 0
     if detrend_order > 0:
         _t_c = t - np.mean(t)
         _poly = np.polyfit(_t_c, mag, detrend_order)
