@@ -9,7 +9,7 @@ import warnings
 from functools import partial
 
 
-VERSION = "1.78"
+VERSION = "1.79"
 
 warnings.filterwarnings("ignore", message=".*datfix.*")
 

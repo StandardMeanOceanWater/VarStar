@@ -331,6 +331,34 @@ period_analysis:
     fap_bootstrap_converge_tol: 0.05     # 相鄰視窗 FAP 相對變化 < 5% 視為收斂
     fap_threshold: 0.001            # FAP < 0.1% 視為顯著週期
 
+  # LS 前 N 峰候選挑選（VanderPlas 2018：最高峰不保證為真週期）
+  # 每個候選各自折疊 + Breger 傅立葉擬合比 BIC；P > 基線的候選排除；
+  # 候選需贏過主峰 ΔBIC > delta_bic_margin 才取代，否則保留主峰
+  candidate_selection:
+    enabled: true
+    n_candidates: 5            # 取 LS 前 N 個獨立峰（頻率間隔 >= 1/T）
+    delta_bic_margin: 10.0     # 取代主峰所需的最小 BIC 優勢
+    min_phase_coverage: 0.9    # 折疊後相位覆蓋率下限（20 bins），不足者排除
+
+  # P vs 2P 判別（W UMa 型食雙星：兩極小近似等深，LS 峰常落在半週期）
+  # 以 P 與 2P 各做傅立葉擬合比 BIC；基線不足 2P 的 min_cycles 個週期時跳過
+  double_period_check:
+    enabled: true
+    min_cycles: 1.0            # 基線需涵蓋 2P 的最少週期數
+    delta_bic_threshold: 10.0  # BIC(P) - BIC(2P) 超過此值才改用 2P
+    min_phase_coverage: 0.9    # 2P 折疊相位覆蓋率下限，不足則跳過判別
+
+  # ΔBIC 掃描區間（誠實的週期不確定度；共變異誤差在平坦地形會低估）
+  bic_interval:
+    delta: 2.0                 # ΔBIC < delta 定義的週期區間
+
+  # 多通道聯合週期仲裁（單通道 BIC 平坦時，各通道共享週期、碗深相加）
+  # 2026-07-06 評測：合成單夜回收 RMSE 0.035h vs 單通道 0.238h；
+  # PDM / String Length / 條件熵 / CV 均不優於 BIC，未採用
+  joint_period:
+    enabled: true
+    min_channels: 2            # 少於此通道數不做聯合仲裁
+
   # 傅立葉擬合
   fourier_fit:
     max_harmonics: 8                # 諧波數上限（Delta Scuti 建議 4–8）

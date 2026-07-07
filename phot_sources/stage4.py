@@ -36,11 +36,64 @@ def _stage4_replot_shared_g1g2_ylim(cfg, active_date, channel_results):
             print(f"[PLOT] G1/G2 Y 軸已鎖定：{_ymin:.3f} – {_ymax:.3f} mag")
 
 
+def _stage4_run_joint_period(active_target, channel_results, stage4_run_root, per_ch_periods):
+    """多通道聯合週期仲裁：單通道 BIC 地形平坦時，四通道碗深相加才有決定性。"""
+    import json
+
+    from period_analysis import _load_config, joint_period_scan
+
+    _cfg = _load_config(None)
+    _channels = {}
+    for _ch, _df in channel_results.items():
+        if _df is None:
+            continue
+        _mag_col = "m_var_norm" if "m_var_norm" in _df.columns else "m_var"
+        _err_col = "v_err" if "v_err" in _df.columns else "t_sigma_mag"
+        if _err_col not in _df.columns:
+            continue
+        _d = _df[(_df["ok"] == 1) & np.isfinite(_df["bjd_tdb"])
+                 & np.isfinite(_df[_mag_col]) & np.isfinite(_df[_err_col])]
+        if len(_d) >= 10:
+            _channels[_ch] = (_d["bjd_tdb"].values, _d[_mag_col].values, _d[_err_col].values)
+
+    _valid_periods = [p for p in per_ch_periods.values() if np.isfinite(p)]
+    if len(_channels) < 2 or not _valid_periods:
+        print("[聯合週期] 可用通道 < 2 或無單通道結果，跳過")
+        return
+    _center = float(np.median(_valid_periods))
+    _joint = joint_period_scan(_channels, _center, _cfg)
+    if _joint is None:
+        print("[聯合週期] 掃描失敗，跳過")
+        return
+
+    _pj = _joint["period_d"]
+    print(f"\n[聯合週期] {_joint['n_channels']} 通道（{'/'.join(_joint['channels'])}）"
+          f"聯合 BIC 仲裁：")
+    print(f"[聯合週期] P = {_pj:.6f} d ({_pj * 24:.4f} h)  "
+          f"區間 [{_joint['period_lo_d'] * 24:.4f}, {_joint['period_hi_d'] * 24:.4f}] h"
+          f"（ΔBIC<{_joint['delta']:.0f}）  對比度 ΔBIC={_joint['delta_bic_contrast']:.1f}"
+          f"{'  ⚠ 觸及掃描邊界' if _joint['touches_edge'] else ''}")
+    for _ch, _p in sorted(per_ch_periods.items()):
+        if np.isfinite(_p):
+            print(f"[聯合週期]   {_ch}: 單通道 {_p * 24:.4f} h"
+                  f"（偏離聯合值 {(_p - _pj) * 24 * 60:+.1f} min）")
+
+    _payload = dict(_joint)
+    _payload["per_channel_period_d"] = {
+        k: (float(v) if np.isfinite(v) else None) for k, v in per_ch_periods.items()
+    }
+    _out = stage4_run_root / "4_period_analysis" / f"period_joint_{active_target.replace(' ', '')}.json"
+    _out.parent.mkdir(parents=True, exist_ok=True)
+    _out.write_text(json.dumps(_payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    print(f"[聯合週期] -> {_out}")
+
+
 def _stage4_run_period_analysis(active_target, channel_results, stage4_run_root):
     # ── 週期分析（統一使用 period_analysis.py）─────────────────────────
     from period_analysis import run_period_analysis
 
     _pa_any = False
+    _per_ch_periods = {}
     for _ls_ch, _ls_df in channel_results.items():
         if _ls_df is None:
             continue
@@ -67,7 +120,13 @@ def _stage4_run_period_analysis(active_target, channel_results, stage4_run_root)
                 _bp = _ls_r.get("best_period", np.nan)
                 _fap = _ls_r.get("fap", np.nan)
                 if np.isfinite(_bp):
+                    _per_ch_periods[_ls_ch] = float(_bp)
                     print(f"[LS] Best period = {_bp:.6f} d  ({_bp * 24:.4f} h)")
+                    _itv = _ls_r.get("bic_interval")
+                    if _itv:
+                        print(f"[LS] 區間        = [{_itv['period_lo_d'] * 24:.4f}, "
+                              f"{_itv['period_hi_d'] * 24:.4f}] h（ΔBIC<{_itv['delta']:.0f}）"
+                              f"{'  ⚠ 觸及邊界' if _itv['touches_edge'] else ''}")
                     print(f"[LS] FAP         = {_fap:.2e}")
                 else:
                     print(f"[LS] {_ls_ch} 週期分析無有效結果（keys: {list(_pa_result.keys())}）")
@@ -86,6 +145,14 @@ def _stage4_run_period_analysis(active_target, channel_results, stage4_run_root)
 
     if not _pa_any:
         print("[LS] 跳過（沒有通道產生週期分析結果）")
+        return
+
+    try:
+        _stage4_run_joint_period(
+            active_target, channel_results, stage4_run_root, _per_ch_periods
+        )
+    except Exception as _e_jp:
+        print(f"[聯合週期] 失敗：{_e_jp}")
 
 
 def _stage4_write_light_curve_products(cfg, active_target, active_date, channel_results, stage4_run_root):

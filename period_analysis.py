@@ -477,6 +477,527 @@ def run_ls_and_dft(
     }
 
 
+def _phase_coverage(phase: np.ndarray, n_bins: int = 20) -> float:
+    """折疊後相位覆蓋率：有資料點的相位 bin 比例。"""
+    hist, _ = np.histogram(phase, bins=n_bins, range=(0.0, 1.0))
+    return float(np.count_nonzero(hist)) / n_bins
+
+
+def _bic_over_harmonics(
+    phase: np.ndarray,
+    mag: np.ndarray,
+    err: np.ndarray,
+    max_harmonics: int,
+) -> Tuple[float, int]:
+    """
+    掃 N=1..max_harmonics 全部擬合，回傳 (最小 BIC, 對應 N)。
+
+    候選週期比較必須用此法而非 Breger 貪婪停階：Breger 對不同候選
+    停在不同 N（路徑相依），χ² 比較會失真；BIC 取全域最小則對每個
+    候選一視同仁，參數量懲罰由 BIC 自身承擔。
+    """
+    best_bic = np.inf
+    best_n = 0
+    for n in range(1, max_harmonics + 1):
+        try:
+            popt, _ = _fit_fourier(phase, mag, err, n)
+        except (RuntimeError, ValueError):
+            break
+        mag_pred = _fourier_series(phase, *popt)
+        bic = _compute_bic(mag, mag_pred, 2 * n + 1, err)
+        if bic < best_bic:
+            best_bic = bic
+            best_n = n
+    if best_n == 0:
+        raise RuntimeError("所有諧波數均擬合失敗")
+    return best_bic, best_n
+
+
+def _refine_period(
+    t: np.ndarray,
+    mag: np.ndarray,
+    err: np.ndarray,
+    period: float,
+    max_harmonics: int,
+) -> Optional[Tuple[float, float]]:
+    """
+    以週期為自由參數的傅立葉擬合精修。
+
+    LS 候選週期為頻率格網值，與真值的微小偏差在折疊多個週期後累積
+    相位漂移，會讓 2P 模型的半頻項假性吸收殘差（P/2P 判別失真）。
+    精修範圍限制在頻率 ±1/(2T) 內（半個自然峰寬），不會跳至其他峰。
+
+    Returns
+    -------
+    (refined_period, period_err) 或 None（擬合失敗/撞到邊界時）。
+    """
+    t0 = float(t[0])
+    baseline = float(np.max(t) - np.min(t))
+    if baseline <= 0:
+        return None
+    phase = ((t - t0) / period) % 1.0
+    try:
+        _, n_h = _bic_over_harmonics(phase, mag, err, max_harmonics)
+        popt_fixed, _ = _fit_fourier(phase, mag, err, n_h)
+    except (RuntimeError, ValueError):
+        return None
+
+    f0 = 1.0 / period
+    df = 0.5 / baseline
+    p_lo = 1.0 / (f0 + df)
+    p_hi = 1.0 / (f0 - df) if f0 > df else period * 2.0
+
+    def _model(tt, period_, *coef):
+        ph = ((tt - t0) / period_) % 1.0
+        return _fourier_series(ph, *coef)
+
+    n_coef = len(popt_fixed)
+    p0 = [period] + [float(v) for v in popt_fixed]
+    lb = [p_lo] + [-np.inf] * n_coef
+    ub = [p_hi] + [np.inf] * n_coef
+    sigma = err if (np.isfinite(err).all() and np.any(err > 0)) else None
+    try:
+        popt, pcov = curve_fit(
+            _model, t, mag, p0=p0, sigma=sigma, absolute_sigma=True,
+            bounds=(lb, ub), maxfev=100_000,
+        )
+    except (RuntimeError, ValueError):
+        return None
+
+    refined = float(popt[0])
+    # 撞邊界視為失敗（峰形異常，不信任）
+    _edge = 0.02 * (p_hi - p_lo)
+    if refined <= p_lo + _edge or refined >= p_hi - _edge:
+        return None
+    period_err = float(np.sqrt(pcov[0, 0])) if np.isfinite(pcov[0, 0]) else float("nan")
+    return refined, period_err
+
+
+def scan_bic_interval(
+    t: np.ndarray,
+    mag: np.ndarray,
+    err: np.ndarray,
+    period: float,
+    cfg: Dict,
+    n_grid: int = 121,
+) -> Optional[Dict]:
+    """
+    ΔBIC 掃描區間：以週期掃描 BIC 地形，回報 ΔBIC < delta 的週期區間。
+
+    共變異矩陣誤差在 BIC 地形平坦（基線 ≈ 週期）時嚴重低估不確定度；
+    此掃描把「碗有多平」誠實寫進結果。掃描範圍 = 頻率 ±1/(2T)（半個
+    自然峰寬），與 _refine_period 一致。
+
+    Returns
+    -------
+    dict: {period_lo_d, period_hi_d, err_half_width_d, delta, n_valid}
+          或 None（掃描失敗）。
+    """
+    delta = float(_get(cfg, "period_analysis", "bic_interval", "delta", default=2.0))
+    fit_cfg = _get(cfg, "period_analysis", "fourier_fit", default={})
+    max_harmonics = int(_get(fit_cfg, "max_harmonics", default=8))
+
+    baseline = float(np.max(t) - np.min(t))
+    if baseline <= 0 or period <= 0:
+        return None
+    f0 = 1.0 / period
+    df = 0.5 / baseline
+    f_grid = np.linspace(max(f0 - df, 1e-9), f0 + df, n_grid)
+    t0 = float(t[0])
+
+    bics = np.full(n_grid, np.inf)
+    for i, f in enumerate(f_grid):
+        p = 1.0 / f
+        phase = ((t - t0) / p) % 1.0
+        if _phase_coverage(phase) < 0.5:
+            continue
+        try:
+            bics[i], _ = _bic_over_harmonics(phase, mag, err, max_harmonics)
+        except RuntimeError:
+            continue
+
+    valid = np.isfinite(bics)
+    if valid.sum() < 5:
+        return None
+    bic_min = float(np.min(bics[valid]))
+    in_band = valid & (bics <= bic_min + delta)
+    p_in = 1.0 / f_grid[in_band]
+    period_lo, period_hi = float(np.min(p_in)), float(np.max(p_in))
+    # 區間頂到掃描邊界 = 碗底延伸出視窗，區間為下限
+    touches_edge = bool(in_band[0] or in_band[-1])
+    return {
+        "period_lo_d": period_lo,
+        "period_hi_d": period_hi,
+        "err_half_width_d": 0.5 * (period_hi - period_lo),
+        "delta": delta,
+        "touches_edge": touches_edge,
+        "n_valid": int(valid.sum()),
+    }
+
+
+def joint_period_scan(
+    channels: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    center_period: float,
+    cfg: Dict,
+    n_grid: int = 161,
+) -> Optional[Dict]:
+    """
+    多通道聯合週期仲裁：各通道共享試驗週期、各自傅立葉係數，BIC 相加。
+
+    單通道 BIC 地形在基線 ≈ 週期時平坦（ΔBIC < 5，無決定性）；四通道
+    聯合讓碗深相加，是唯一真正增加資訊量的判別方案（2026-07-06 評測：
+    合成單夜回收 RMSE 0.035h vs 單通道 0.238h；真實 CCAnd 聯合谷底
+    3.00h vs VSX 3.008h，對比度 ΔBIC=22）。
+
+    Parameters
+    ----------
+    channels : {channel: (t, mag, err)}，各通道已篩選的有效資料。
+    center_period : 掃描中心週期（days），通常取各通道結果的中位數。
+
+    Returns
+    -------
+    dict: {period_d, period_lo_d, period_hi_d, delta_bic_contrast,
+           n_channels, channels, per_point_valid} 或 None。
+    """
+    jp_cfg = _get(cfg, "period_analysis", "joint_period", default={})
+    if not bool(_get(jp_cfg, "enabled", default=True)):
+        return None
+    delta = float(_get(cfg, "period_analysis", "bic_interval", "delta", default=2.0))
+    min_channels = int(_get(jp_cfg, "min_channels", default=2))
+    fit_cfg = _get(cfg, "period_analysis", "fourier_fit", default={})
+    max_harmonics = int(_get(fit_cfg, "max_harmonics", default=8))
+
+    usable = {ch: arr for ch, arr in channels.items() if len(arr[0]) >= 10}
+    if len(usable) < min_channels:
+        return None
+
+    baseline = max(float(np.max(t) - np.min(t)) for (t, _, _) in usable.values())
+    if baseline <= 0 or center_period <= 0:
+        return None
+    f0 = 1.0 / center_period
+    df = 0.5 / baseline
+    f_grid = np.linspace(max(f0 - df, 1e-9), f0 + df, n_grid)
+
+    joint = np.full(n_grid, np.inf)
+    for i, f in enumerate(f_grid):
+        p = 1.0 / f
+        total = 0.0
+        ok = True
+        for (t, mag, err) in usable.values():
+            phase = ((t - float(t[0])) / p) % 1.0
+            if _phase_coverage(phase) < 0.5:
+                ok = False
+                break
+            try:
+                bic, _ = _bic_over_harmonics(phase, mag, err, max_harmonics)
+            except RuntimeError:
+                ok = False
+                break
+            total += bic
+        if ok:
+            joint[i] = total
+
+    valid = np.isfinite(joint)
+    if valid.sum() < 5:
+        return None
+    i_min = int(np.argmin(np.where(valid, joint, np.inf)))
+    bic_min = float(joint[i_min])
+    in_band = valid & (joint <= bic_min + delta)
+    p_in = 1.0 / f_grid[in_band]
+    # 對比度：區間外最接近谷底的 BIC 差（衡量決定性）
+    out_band = valid & ~in_band
+    contrast = float(np.min(joint[out_band]) - bic_min) if out_band.any() else float("nan")
+    return {
+        "period_d": float(1.0 / f_grid[i_min]),
+        "period_lo_d": float(np.min(p_in)),
+        "period_hi_d": float(np.max(p_in)),
+        "delta": delta,
+        "delta_bic_contrast": contrast,
+        "touches_edge": bool(in_band[0] or in_band[-1]),
+        "n_channels": len(usable),
+        "channels": sorted(usable.keys()),
+    }
+
+
+def select_best_period_candidate(
+    t: np.ndarray,
+    mag: np.ndarray,
+    err: np.ndarray,
+    freqs: np.ndarray,
+    ls_power: np.ndarray,
+    cfg: Dict,
+) -> Dict:
+    """
+    LS 前 N 峰候選週期挑選（VanderPlas 2018：最高峰不保證為真週期）。
+
+    方法：取 LS 週期圖前 n_candidates 個局部極大（頻率間隔 >= 1/T 視為
+    獨立峰），每個候選各自折疊 + Breger 選階傅立葉擬合，比較 BIC——
+    即 multi-harmonic AoV（Schwarzenberg-Czerny 1996）的 BIC 版本。
+
+    誠實性約束：
+    1. 折不滿一個完整週期的候選（P > 基線）直接排除，不參與比較。
+    2. 候選需贏過 LS 主峰 ΔBIC > delta_bic_margin 才取代之；
+       否則保留主峰並標記 decisive=False（資料不足以區分）。
+
+    Returns
+    -------
+    dict:
+        period     : 採用的週期（days）
+        switched   : True 表示採用了非主峰候選
+        decisive   : ΔBIC 是否具決定性
+        candidates : 各候選明細 list（period_d/power/n_harmonics/bic/delta_bic）
+        status     : "selected" | "kept" | "skipped_disabled" | "no_candidates"
+    """
+    cs_cfg = _get(cfg, "period_analysis", "candidate_selection", default={})
+    enabled = bool(_get(cs_cfg, "enabled", default=True))
+    n_candidates = int(_get(cs_cfg, "n_candidates", default=5))
+    delta_bic_margin = float(_get(cs_cfg, "delta_bic_margin", default=10.0))
+    min_phase_coverage = float(_get(cs_cfg, "min_phase_coverage", default=0.9))
+
+    best_idx = int(np.argmax(ls_power))
+    result = {
+        "period": float(1.0 / freqs[best_idx]),
+        "switched": False,
+        "decisive": False,
+        "candidates": [],
+        "status": "kept",
+    }
+    if not enabled:
+        result["status"] = "skipped_disabled"
+        return result
+
+    baseline = float(np.max(t) - np.min(t))
+    min_freq_sep = 1.0 / baseline if baseline > 0 else 0.0
+
+    # 局部極大：power[i] 高於左右鄰點
+    _p = np.asarray(ls_power, dtype=float)
+    _local_max = np.flatnonzero(
+        (_p[1:-1] > _p[:-2]) & (_p[1:-1] >= _p[2:])
+    ) + 1
+    # 端點也可能是峰（頻率窗邊界）
+    if _p.size >= 2 and _p[0] > _p[1]:
+        _local_max = np.concatenate(([0], _local_max))
+    if _p.size >= 2 and _p[-1] > _p[-2]:
+        _local_max = np.concatenate((_local_max, [_p.size - 1]))
+    if _local_max.size == 0:
+        result["status"] = "no_candidates"
+        return result
+
+    # 依功率排序，貪婪選取頻率間隔 >= 1/T 的獨立峰
+    _order = _local_max[np.argsort(_p[_local_max])[::-1]]
+    picked: list = []
+    for _i in _order:
+        if len(picked) >= n_candidates:
+            break
+        if all(abs(freqs[_i] - freqs[_j]) >= min_freq_sep for _j in picked):
+            picked.append(int(_i))
+
+    fit_cfg = _get(cfg, "period_analysis", "fourier_fit", default={})
+    max_harmonics = int(_get(fit_cfg, "max_harmonics", default=8))
+    t0 = float(t[0])
+
+    candidates = []
+    for _i in picked:
+        period = float(1.0 / freqs[_i])
+        entry = {
+            "period_d": period,
+            "period_hr": period * 24.0,
+            "power": float(_p[_i]),
+            "is_ls_peak": bool(_i == best_idx),
+            "n_harmonics": None,
+            "bic": None,
+            "phase_coverage": None,
+            "excluded": None,
+        }
+        if period > baseline:
+            entry["excluded"] = "period_exceeds_baseline"
+            candidates.append(entry)
+            continue
+        phase = ((t - t0) / period) % 1.0
+        coverage = _phase_coverage(phase)
+        entry["phase_coverage"] = coverage
+        if coverage < min_phase_coverage:
+            # 相位缺口讓傅立葉模型有免費自由度，BIC 比較會失真
+            entry["excluded"] = f"phase_coverage {coverage:.2f} < {min_phase_coverage}"
+            candidates.append(entry)
+            continue
+        try:
+            bic, n_h = _bic_over_harmonics(phase, mag, err, max_harmonics)
+            entry["n_harmonics"] = int(n_h)
+            entry["bic"] = float(bic)
+        except RuntimeError as exc:
+            entry["excluded"] = f"fit_failed: {exc}"
+        candidates.append(entry)
+
+    scored = [c for c in candidates if c["bic"] is not None]
+    if not scored:
+        result["status"] = "no_candidates"
+        result["candidates"] = candidates
+        logger.warning("[候選] 無可評分候選（全部超出基線或擬合失敗），保留 LS 主峰。")
+        return result
+
+    bic_min = min(c["bic"] for c in scored)
+    for c in candidates:
+        c["delta_bic"] = (c["bic"] - bic_min) if c["bic"] is not None else None
+    result["candidates"] = candidates
+
+    for c in scored:
+        logger.info(
+            "[候選] P=%.4f h  power=%.3f  N=%d  BIC=%.1f  ΔBIC=%.1f%s",
+            c["period_hr"], c["power"], c["n_harmonics"], c["bic"],
+            c["delta_bic"], "  ←LS主峰" if c["is_ls_peak"] else "",
+        )
+    for c in candidates:
+        if c["excluded"]:
+            logger.info(
+                "[候選] P=%.4f h  排除：%s", c["period_hr"], c["excluded"]
+            )
+
+    winner = min(scored, key=lambda c: c["bic"])
+    ls_peak_entry = next((c for c in scored if c["is_ls_peak"]), None)
+
+    if ls_peak_entry is None:
+        # LS 主峰本身被排除（超出基線）：直接採用可評分候選中最佳者
+        result["period"] = winner["period_d"]
+        result["switched"] = True
+        result["decisive"] = True
+        result["status"] = "selected"
+        logger.warning(
+            "[候選] LS 主峰折不滿一個週期，改用候選 P=%.4f h。", winner["period_hr"]
+        )
+        return result
+
+    if winner is not ls_peak_entry:
+        gain = ls_peak_entry["bic"] - winner["bic"]
+        if gain > delta_bic_margin:
+            result["period"] = winner["period_d"]
+            result["switched"] = True
+            result["decisive"] = True
+            result["status"] = "selected"
+            logger.warning(
+                "[候選] BIC 判別：P=%.4f h 顯著優於 LS 主峰 %.4f h"
+                "（ΔBIC=%.1f > %.1f），採用之。",
+                winner["period_hr"], ls_peak_entry["period_hr"],
+                gain, delta_bic_margin,
+            )
+        else:
+            result["decisive"] = False
+            logger.info(
+                "[候選] P=%.4f h BIC 略優但未達決定性（ΔBIC=%.1f ≤ %.1f），"
+                "保留 LS 主峰。",
+                winner["period_hr"], gain, delta_bic_margin,
+            )
+    else:
+        result["decisive"] = all(
+            (c is ls_peak_entry) or (c["delta_bic"] > delta_bic_margin)
+            for c in scored
+        )
+        logger.info(
+            "[候選] LS 主峰即最佳候選（decisive=%s）。", result["decisive"]
+        )
+    return result
+
+
+def resolve_half_period_ambiguity(
+    t: np.ndarray,
+    mag: np.ndarray,
+    err: np.ndarray,
+    best_period: float,
+    cfg: Dict,
+) -> Dict:
+    """
+    P vs 2P 判別（W UMa 型食雙星防護）。
+
+    W UMa / 橢球變星一個軌道週期有兩個近似等深的極小，LS（正弦基底）
+    最高峰常落在真週期的一半。判別方法：分別以 P 與 2P 折疊做傅立葉擬合
+    （Breger 選階），比較 BIC。2P 模型的偶數諧波已完全涵蓋 P 模型，
+    唯有奇數諧波（兩極小深度差）帶顯著振幅時 BIC 才會勝出——此即食雙星
+    特徵，對 delta Sct 等單極大脈動星不會誤觸發。
+
+    Returns
+    -------
+    dict:
+        period    : 採用的週期（days）
+        doubled   : True 表示改用 2P
+        delta_bic : BIC(P) - BIC(2P)；未執行比較時為 nan
+        status    : "doubled" | "kept" | "skipped_disabled"
+                    | "skipped_baseline" | "skipped_coverage" | "fit_failed"
+    """
+    dp_cfg = _get(cfg, "period_analysis", "double_period_check", default={})
+    enabled = bool(_get(dp_cfg, "enabled", default=True))
+    min_cycles = float(_get(dp_cfg, "min_cycles", default=1.0))
+    delta_bic_threshold = float(_get(dp_cfg, "delta_bic_threshold", default=10.0))
+
+    result = {
+        "period": float(best_period),
+        "doubled": False,
+        "delta_bic": float("nan"),
+        "status": "kept",
+    }
+    if not enabled:
+        result["status"] = "skipped_disabled"
+        return result
+
+    double_period = 2.0 * best_period
+    baseline = float(np.max(t) - np.min(t))
+    if baseline < min_cycles * double_period:
+        logger.info(
+            "[P/2P] 基線 %.3f d 不足 2P 的 %.1f 個週期（2P=%.3f d），跳過判別。",
+            baseline, min_cycles, double_period,
+        )
+        result["status"] = "skipped_baseline"
+        return result
+
+    fit_cfg = _get(cfg, "period_analysis", "fourier_fit", default={})
+    max_harmonics = int(_get(fit_cfg, "max_harmonics", default=8))
+    min_phase_coverage = float(
+        _get(dp_cfg, "min_phase_coverage", default=0.9)
+    )
+
+    t0 = float(t[0])
+    _phase_2p = ((t - t0) / double_period) % 1.0
+    _cov_2p = _phase_coverage(_phase_2p)
+    if _cov_2p < min_phase_coverage:
+        logger.info(
+            "[P/2P] 2P 折疊相位覆蓋率 %.2f < %.2f（缺口使 BIC 失真），跳過判別。",
+            _cov_2p, min_phase_coverage,
+        )
+        result["status"] = "skipped_coverage"
+        return result
+
+    try:
+        bics = {}
+        for label, period in (("P", best_period), ("2P", double_period)):
+            phase = ((t - t0) / period) % 1.0
+            bic, n_h = _bic_over_harmonics(phase, mag, err, max_harmonics)
+            bics[label] = bic
+            logger.info(
+                "[P/2P] %s=%.6f d  N=%d  BIC=%.1f", label, period, n_h, bics[label]
+            )
+    except RuntimeError as exc:
+        logger.warning("[P/2P] 傅立葉擬合失敗，保留 LS 週期：%s", exc)
+        result["status"] = "fit_failed"
+        return result
+
+    delta_bic = bics["P"] - bics["2P"]
+    result["delta_bic"] = float(delta_bic)
+    if delta_bic > delta_bic_threshold:
+        logger.warning(
+            "[P/2P] BIC 判別：2P 顯著較優（ΔBIC=%.1f > %.1f），"
+            "週期改用 %.6f d——疑似食雙星（W UMa 型）半週期混淆。",
+            delta_bic, delta_bic_threshold, double_period,
+        )
+        result["period"] = float(double_period)
+        result["doubled"] = True
+        result["status"] = "doubled"
+    else:
+        logger.info(
+            "[P/2P] BIC 判別：保留 LS 週期（ΔBIC=%.1f ≤ %.1f）。",
+            delta_bic, delta_bic_threshold,
+        )
+    return result
+
+
 def _safe_stem(text: str) -> str:
     return str(text).replace(" ", "")
 
@@ -545,6 +1066,44 @@ def _write_fourier_fit_json(
         "rms_residuals": float(fit_result["rms_residuals"]),
         "coefficients": [float(v) for v in np.asarray(fit_result["popt"], dtype=float)],
     }
+    _interval = ls_result.get("bic_interval")
+    if _interval:
+        payload["period_interval_dbic"] = {
+            "period_lo_d": _interval["period_lo_d"],
+            "period_hi_d": _interval["period_hi_d"],
+            "err_half_width_d": _interval["err_half_width_d"],
+            "delta": _interval["delta"],
+            "touches_edge": _interval["touches_edge"],
+        }
+    cand_sel = ls_result.get("candidate_selection")
+    if cand_sel:
+        payload["candidate_selection"] = {
+            "status": cand_sel["status"],
+            "switched": bool(cand_sel["switched"]),
+            "decisive": bool(cand_sel["decisive"]),
+            "candidates": [
+                {
+                    "period_hr": float(c["period_hr"]),
+                    "power": float(c["power"]),
+                    "n_harmonics": c["n_harmonics"],
+                    "bic": c["bic"],
+                    "delta_bic": c.get("delta_bic"),
+                    "is_ls_peak": bool(c["is_ls_peak"]),
+                    "excluded": c["excluded"],
+                }
+                for c in cand_sel["candidates"]
+            ],
+        }
+    dp_check = ls_result.get("double_period_check")
+    if dp_check:
+        payload["double_period_check"] = {
+            "status": dp_check["status"],
+            "doubled": bool(dp_check["doubled"]),
+            "delta_bic": (
+                float(dp_check["delta_bic"])
+                if np.isfinite(dp_check["delta_bic"]) else None
+            ),
+        }
     out_path = out_dir / f"period_fourier_fit_{_safe_stem(target_name)}_{channel}.json"
     out_path.write_text(
         json.dumps(payload, ensure_ascii=True, indent=2),
@@ -1296,6 +1855,54 @@ def run_period_analysis(
 
     # LS + DFT
     ls_result = run_ls_and_dft(t, mag, err, cfg)
+
+    # LS 前 N 峰候選挑選（最高峰不保證為真週期）
+    cand_sel = select_best_period_candidate(
+        t, mag, err, ls_result["freqs"], ls_result["ls_power"], cfg
+    )
+    ls_result["candidate_selection"] = cand_sel
+    if cand_sel["switched"]:
+        ls_result["ls_peak_period"] = ls_result["best_period"]
+        ls_result["best_period"] = cand_sel["period"]
+        ls_result["best_freq"] = 1.0 / cand_sel["period"]
+
+    # 週期精修（週期為自由參數；消除 LS 格網偏差，避免 P/2P 判別失真）
+    _mh = int(_get(fit_cfg, "max_harmonics", default=8))
+    _ref = _refine_period(t, mag, err, ls_result["best_period"], _mh)
+    if _ref is not None:
+        logger.info(
+            "[精修] 週期 %.6f d -> %.6f d（±%.2e d）",
+            ls_result["best_period"], _ref[0], _ref[1],
+        )
+        ls_result["best_period"] = _ref[0]
+        ls_result["best_freq"] = 1.0 / _ref[0]
+        ls_result["refined_period_err"] = _ref[1]
+
+    # P vs 2P 判別（W UMa 型食雙星的 LS 峰常落在半週期）
+    dp_check = resolve_half_period_ambiguity(
+        t, mag, err, ls_result["best_period"], cfg
+    )
+    ls_result["double_period_check"] = dp_check
+    if dp_check["doubled"]:
+        ls_result["ls_peak_period"] = ls_result["best_period"]
+        ls_result["best_period"] = dp_check["period"]
+        ls_result["best_freq"] = 1.0 / dp_check["period"]
+        _ref2 = _refine_period(t, mag, err, dp_check["period"], _mh)
+        if _ref2 is not None:
+            ls_result["best_period"] = _ref2[0]
+            ls_result["best_freq"] = 1.0 / _ref2[0]
+            ls_result["refined_period_err"] = _ref2[1]
+
+    # ΔBIC 掃描區間（誠實的週期不確定度；共變異誤差在平坦地形會低估）
+    _interval = scan_bic_interval(t, mag, err, ls_result["best_period"], cfg)
+    if _interval is not None:
+        ls_result["bic_interval"] = _interval
+        logger.info(
+            "[區間] P ∈ [%.4f, %.4f] h（ΔBIC<%.1f）±%.4f h%s",
+            _interval["period_lo_d"] * 24.0, _interval["period_hi_d"] * 24.0,
+            _interval["delta"], _interval["err_half_width_d"] * 24.0,
+            "；觸及掃描邊界，區間為下限" if _interval["touches_edge"] else "",
+        )
 
     # 傅立葉擬合（BIC 選階 + 相位零點驗證）
     # ValueError 在此不捕捉，讓呼叫端看到完整錯誤訊息（含 t0_final）
