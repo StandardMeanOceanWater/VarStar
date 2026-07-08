@@ -555,6 +555,11 @@ def _refine_period(
     df = 0.5 / baseline
     p_lo = 1.0 / (f0 + df)
     p_hi = 1.0 / (f0 - df) if f0 > df else period * 2.0
+    # 上界鎖在基線內：P > 基線折不滿一週期，擬合退化為趨勢，
+    # 未扣除的慢漂移會把自由週期往長端拉（2026-07-08 CCAnd 3.67h 事故）
+    p_hi = min(p_hi, baseline)
+    if p_lo >= p_hi:
+        return None
 
     def _model(tt, period_, *coef):
         ph = ((tt - t0) / period_) % 1.0
@@ -617,8 +622,10 @@ def scan_bic_interval(
     bics = np.full(n_grid, np.inf)
     for i, f in enumerate(f_grid):
         p = 1.0 / f
+        if p > baseline:
+            continue
         phase = ((t - t0) / p) % 1.0
-        if _phase_coverage(phase) < 0.5:
+        if _phase_coverage(phase) < 0.9:
             continue
         try:
             bics[i], _ = _bic_over_harmonics(phase, mag, err, max_harmonics)
@@ -690,11 +697,13 @@ def joint_period_scan(
     joint = np.full(n_grid, np.inf)
     for i, f in enumerate(f_grid):
         p = 1.0 / f
+        if p > baseline:
+            continue
         total = 0.0
         ok = True
         for (t, mag, err) in usable.values():
             phase = ((t - float(t[0])) / p) % 1.0
-            if _phase_coverage(phase) < 0.5:
+            if _phase_coverage(phase) < 0.9:
                 ok = False
                 break
             try:
@@ -778,8 +787,25 @@ def select_best_period_candidate(
     baseline = float(np.max(t) - np.min(t))
     min_freq_sep = 1.0 / baseline if baseline > 0 else 0.0
 
-    # 局部極大：power[i] 高於左右鄰點
-    _p = np.asarray(ls_power, dtype=float)
+    # 候選只在可折疊區（P <= 基線）內尋找：P > 基線折不滿一週期無法評分，
+    # 且若 argmax 落在該區被排除，同峰內可折疊的真週期區域會連帶消失，
+    # fallback 會跳去遠處垃圾候選（2026-07-08 CCAnd 0.5h 事故）
+    _p = np.asarray(ls_power, dtype=float).copy()
+    _foldable = (1.0 / np.asarray(freqs, dtype=float)) <= baseline
+    if not _foldable.any():
+        result["status"] = "no_candidates"
+        return result
+    _p[~_foldable] = -np.inf
+    _fold_best_idx = int(np.argmax(_p))
+    if not _foldable[best_idx]:
+        logger.info(
+            "[候選] LS 全域主峰 P=%.4f h 超出基線 %.4f h，改以可折疊區主峰 "
+            "P=%.4f h 為錨點。",
+            (1.0 / freqs[best_idx]) * 24.0, baseline * 24.0,
+            (1.0 / freqs[_fold_best_idx]) * 24.0,
+        )
+    best_idx = _fold_best_idx
+    result["period"] = float(1.0 / freqs[best_idx])
     _local_max = np.flatnonzero(
         (_p[1:-1] > _p[:-2]) & (_p[1:-1] >= _p[2:])
     ) + 1
