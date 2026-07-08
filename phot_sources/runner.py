@@ -528,6 +528,8 @@ def run_main(
 
     _processed_targets = 0
     _processed_channels = 0
+    # 視野級 VSX 去重：同視野的額外目標只在首顆主目標時跑一次
+    _vsx_done_fields: "dict[tuple, str]" = {}
 
     for (ACTIVE_TARGET, ACTIVE_DATE) in _targets_list:
         _main_target_started = time.perf_counter()
@@ -560,15 +562,33 @@ def run_main(
             if _vsx_shell is not None:
                 _vsx_cand, _VSX_MAG_MIN, _VSX_MAG_MAX = _vsx_shell
                 if len(_vsx_cand) > 0:
-                    print(f"\n{'='*55}")
-                    print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 ({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)")
-                    print(f"{'='*55}")
-                    run_vsx_targets_func(
-                        _logger, _yaml, ACTIVE_TARGET, ACTIVE_DATE, _log_ts, CHANNELS,
-                        cfg, _vsx_cand, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
-                        _shared_aperture_radius, _active_cache, check_star,
+                    _vsx_field_key = _compute_field_key(
+                        _yaml, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS[0], _args.split_subdir
                     )
-                    emit_progress(_logger, f"VSX done target={ACTIVE_TARGET} count={len(_vsx_cand)}")
+                    _vsx_done_by = (
+                        _vsx_done_fields.get(_vsx_field_key)
+                        if _vsx_field_key is not None else None
+                    )
+                    if _vsx_done_by is not None:
+                        _logger.info(
+                            f"[VSX] field dedup: skip target={ACTIVE_TARGET} "
+                            f"already_run_by={_vsx_done_by} "
+                            f"field={_summarize_field_key(_vsx_field_key)}"
+                        )
+                        print(f"[VSX 額外目標] 同視野已由 {_vsx_done_by} 跑過，跳過 "
+                              f"{len(_vsx_cand)} 顆額外目標")
+                    else:
+                        print(f"\n{'='*55}")
+                        print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 ({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)")
+                        print(f"{'='*55}")
+                        run_vsx_targets_func(
+                            _logger, _yaml, ACTIVE_TARGET, ACTIVE_DATE, _log_ts, CHANNELS,
+                            cfg, _vsx_cand, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
+                            _shared_aperture_radius, _active_cache, check_star,
+                        )
+                        if _vsx_field_key is not None:
+                            _vsx_done_fields[_vsx_field_key] = ACTIVE_TARGET
+                        emit_progress(_logger, f"VSX done target={ACTIVE_TARGET} count={len(_vsx_cand)}")
             emit_progress_done(
                 _logger,
                 f"main target target={ACTIVE_TARGET} date={ACTIVE_DATE}",
