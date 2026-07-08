@@ -1,9 +1,16 @@
-"""VSX candidate discovery and VSX target runners."""
+"""VSX candidate discovery and per-channel subtarget spec builders.
+
+v1.80：VSX 額外目標不再各自跑獨立幀迴圈，改為併入主目標的多子目標
+單趟測光（run_photometry_multi_on_wcs_dir）。本模組負責：
+  1. _prepare_vsx_candidates：從視野 VSX 表挑出額外目標候選
+  2. build_vsx_channel_subtargets：為單一通道建構額外目標的 subtarget 規格
+  3. log_vsx_channel_result：額外目標單通道結果摘要輸出
+"""
 
 from __future__ import annotations
 
+import copy
 import re as _re
-import time
 from pathlib import Path
 
 import astropy.units as u
@@ -71,173 +78,107 @@ def _vsx_short_name(raw: str) -> str:
     return s.replace(" ", "")
 
 
-def _get_vsx_ready_channels(channels, comp_refs_per_ch, split_dir_per_ch):
-    return [
-        _vch for _vch in channels
-        if _vch in comp_refs_per_ch
-        and _vch in split_dir_per_ch
-        and any(split_dir_per_ch[_vch].glob(f"*_{_vch}.fits"))
-    ]
+# 額外目標各通道使用的星表波段（沿用 v1.79 前 _run_single_vsx_channel 的映射）
+_VSX_BAND_MAP = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
 
 
-def _run_single_vsx_channel(
-    logger, cfg, vsx_name, vsx_ra, vsx_dec, vsx_run_root, active_date, vch,
-    comp_refs_per_ch, check_star_per_ch, check_star, split_dir_per_ch,
-    shared_aperture_radius, active_cache,
-    photometry_func,
+def print_vsx_candidate_listing(vsx_cand) -> None:
+    """主目標開跑前列出本視野額外目標（原獨立 VSX 階段的逐目標抬頭）。"""
+    for _vi, _vr in vsx_cand.iterrows():
+        _name_raw = str(_vr.get("Name", f"VSX_{_vi}")).strip()
+        _type = str(_vr.get("Type", "?"))
+        _per = _vr.get("Period", "?")
+        _mag = float(_vr["_mag"])
+        print(f"  ── {_name_raw}  ({_type})  mag={_mag:.2f}  P={_per}d  "
+              f"RA={float(_vr['ra_deg']):.4f}  Dec={float(_vr['dec_deg']):.4f}")
+
+
+def build_vsx_channel_subtargets(
+    logger, yaml_cfg, active_target, active_date, log_ts, channel,
+    cfg_ch, vsx_cand, comp_refs_ch, check_star_ch, shared_aperture_radius,
 ):
-    _vsx_csv = (vsx_run_root / "1_photometry" / f"photometry_{vch}_{active_date}.csv")
-    _vsx_png = (vsx_run_root / "3_light_curve" / f"light_curve_{vch}_{active_date}.png")
-    try:
-        # 暫存並覆寫全域 cfg
-        _cfg_backup_radec = cfg.target_radec_deg
-        _cfg_backup_name = cfg.target_name
-        _cfg_backup_band = cfg.phot_band
-        _cfg_backup_regdir = cfg.regression_diag_dir
-        _vsx_band_map = {"R": "r", "G1": "V", "G2": "V", "B": "B"}
-        cfg.target_radec_deg = (vsx_ra, vsx_dec)
-        cfg.target_name = vsx_name
-        cfg.phot_band = _vsx_band_map.get(vch.upper(), "V")
-        # 回歸診斷圖存到 VSX 目標自己的目錄，避免覆蓋主目標
-        _vsx_reg_dir = vsx_run_root / "2_regression_diag"
-        _vsx_reg_dir.mkdir(parents=True, exist_ok=True)
-        cfg.regression_diag_dir = _vsx_reg_dir
+    """為單一通道建構 VSX 額外目標的 subtarget 規格列表。
 
-        _vsx_df, _ = photometry_func(
-            split_dir_per_ch[vch],
-            _vsx_csv,
-            _vsx_png,
-            comp_refs=comp_refs_per_ch[vch],
-            cfg_obj=cfg,
-            check_star=check_star_per_ch.get(vch, check_star),
-            ap_radius=shared_aperture_radius,
-            channel=vch,
-            shared_cache=active_cache,
-        )
-        _n_ok = int(_vsx_df["ok"].sum()) if "ok" in _vsx_df.columns else 0
-        if _n_ok > 0 and "m_var" in _vsx_df.columns:
-            _ok_rows = _vsx_df[_vsx_df["ok"] == 1]
-            _med = float(_ok_rows["m_var"].median())
-            _amp = float(_ok_rows["m_var"].max() - _ok_rows["m_var"].min())
-            logger.info(
-                f"[vsx] target={vsx_name} channel={vch} ok={_n_ok}/{len(_vsx_df)} "
-                f"median={_med:.3f} amp={_amp:.3f}"
-            )
-            print(f"    {vch}: ok={_n_ok}/{len(_vsx_df)}  "
-                  f"median={_med:.3f}  amp={_amp:.3f}")
-        else:
-            logger.info(
-                f"[vsx] target={vsx_name} channel={vch} ok={_n_ok}/{len(_vsx_df)}"
-            )
-            print(f"    {vch}: ok={_n_ok}/{len(_vsx_df)}")
-        return _vsx_df
-    except Exception as _e_vsx_phot:
-        logger.warning(
-            f"[vsx] target={vsx_name} channel={vch} error: {_e_vsx_phot}"
-        )
-        print(f"    {vch}: 測光失敗 — {_e_vsx_phot}")
-        return None
-    finally:
-        cfg.target_radec_deg = _cfg_backup_radec
-        cfg.target_name = _cfg_backup_name
-        cfg.phot_band = _cfg_backup_band
-        cfg.regression_diag_dir = _cfg_backup_regdir
-
-
-def _run_single_vsx_target(
-    logger, cfg, channels, active_date, log_ts, vsx_group, vsx_project_root, vsx_date_fmt,
-    vsx_row, vsx_idx, comp_refs_per_ch, check_star_per_ch, split_dir_per_ch,
-    shared_aperture_radius, active_cache, check_star,
-    photometry_func,
-):
-    _vsx_name_raw = str(vsx_row.get("Name", f"VSX_{vsx_idx}")).strip()
-    _vsx_name = _vsx_short_name(_vsx_name_raw)
-    _vsx_ra = float(vsx_row["ra_deg"])
-    _vsx_dec = float(vsx_row["dec_deg"])
-    _vsx_type = str(vsx_row.get("Type", "?"))
-    _vsx_per = vsx_row.get("Period", "?")
-    _vsx_mag = float(vsx_row["_mag"])
-    _vsx_ready_channels = _get_vsx_ready_channels(
-        channels, comp_refs_per_ch, split_dir_per_ch
-    )
-    if not _vsx_ready_channels:
-        logger.warning(
-            f"[VSX SKIP] name={_vsx_name} no ready channel before target tree creation"
-        )
-        return
-    logger.info(
-        f"[vsx] target={_vsx_name} mag={_vsx_mag:.2f} ready_channels={_vsx_ready_channels}"
-    )
-    print(f"\n  ── {_vsx_name_raw}  ({_vsx_type})  "
-          f"mag={_vsx_mag:.2f}  P={_vsx_per}d  "
-          f"RA={_vsx_ra:.4f}  Dec={_vsx_dec:.4f}")
-
-    # 輸出路徑：與 YAML 目標相同層級
-    # output/{date}/{group}/{VSXname}/{timestamp}/
-    _vsx_layout = build_vsx_run_layout(
-        project_root=vsx_project_root,
-        date_fmt=vsx_date_fmt,
-        group=vsx_group,
-        target=_vsx_name,
-        run_ts=log_ts,
-    )
-    _vsx_run_root = _vsx_layout["run_root"]
-
-    _vsx_ch_results = {}
-    for _vch in channels:
-        if _vch not in comp_refs_per_ch:
-            logger.warning(f"[VSX SKIP] target={_vsx_name} channel={_vch} missing comp refs")
-            print(f"    {_vch}: 跳過（主目標該通道無比較星）")
-            continue
-        _vsx_df = _run_single_vsx_channel(
-            logger, cfg, _vsx_name, _vsx_ra, _vsx_dec, _vsx_run_root, active_date, _vch,
-            comp_refs_per_ch, check_star_per_ch, check_star, split_dir_per_ch,
-            shared_aperture_radius, active_cache,
-            photometry_func,
-        )
-        if _vsx_df is not None:
-            _vsx_ch_results[_vch] = _vsx_df
-
-
-def _run_vsx_targets_for_target(
-    logger, yaml_cfg, active_target, active_date, log_ts, channels,
-    cfg, vsx_cand, comp_refs_per_ch, check_star_per_ch, split_dir_per_ch,
-    shared_aperture_radius, active_cache, check_star,
-    photometry_func,
-):
-    _vsx_started = time.perf_counter()
-    emit_progress(logger, f"VSX start target={active_target} count={len(vsx_cand)}")
-    # 取得主目標的 group 和 project_root（用於建構輸出路徑）
+    回傳 (specs, metas)：
+      specs : run_photometry_multi_on_wcs_dir 的 subtarget dict 列表
+      metas : 對應的 {name, name_raw, mag} 摘要資訊（供結果輸出）
+    每個額外目標用 cfg_ch 的淺複本（不再覆寫共用 cfg），輸出路徑與主目標
+    同層級：output/{date}/{group}/{VSXname}/{timestamp}/。
+    """
     _main_tgt_yaml = yaml_cfg.get("targets", {}).get(active_target, {})
-    _vsx_group = _main_tgt_yaml.get("group", active_target)
-    _vsx_project_root = Path(yaml_cfg["_project_root"])
-    _vsx_date_fmt = format_session_date(active_date)
-    _last_vsx_heartbeat_at = _vsx_started
+    _group = _main_tgt_yaml.get("group", active_target)
+    _project_root = Path(yaml_cfg["_project_root"])
+    _date_fmt = format_session_date(active_date)
 
-    for _loop_idx, (_vi, _vr) in enumerate(vsx_cand.iterrows(), start=1):
-        _now = time.perf_counter()
-        if (_loop_idx % 25 == 0) or (_now - _last_vsx_heartbeat_at >= 30.0):
-            emit_progress(
-                logger,
-                f"VSX heartbeat target={active_target} processed={_loop_idx}/{len(vsx_cand)} "
-                f"elapsed={_now - _vsx_started:.1f}s"
-            )
-            _last_vsx_heartbeat_at = _now
-        _run_single_vsx_target(
-            logger, cfg, channels, active_date, log_ts, _vsx_group, _vsx_project_root, _vsx_date_fmt,
-            _vr, _vi, comp_refs_per_ch, check_star_per_ch, split_dir_per_ch,
-            shared_aperture_radius, active_cache, check_star,
-            photometry_func,
+    specs: list = []
+    metas: list = []
+    for _vi, _vr in vsx_cand.iterrows():
+        _name_raw = str(_vr.get("Name", f"VSX_{_vi}")).strip()
+        _name = _vsx_short_name(_name_raw)
+        _ra = float(_vr["ra_deg"])
+        _dec = float(_vr["dec_deg"])
+        _layout = build_vsx_run_layout(
+            project_root=_project_root,
+            date_fmt=_date_fmt,
+            group=_group,
+            target=_name,
+            run_ts=log_ts,
         )
+        _run_root = _layout["run_root"]
+        _reg_dir = _run_root / "2_regression_diag"
+        _reg_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n  [VSX 額外目標] 全部完成")
+        _cfg_v = copy.copy(cfg_ch)
+        _cfg_v.target_radec_deg = (_ra, _dec)
+        _cfg_v.target_name = _name
+        _cfg_v.phot_band = _VSX_BAND_MAP.get(str(channel).upper(), "V")
+        _cfg_v.regression_diag_dir = _reg_dir
+
+        specs.append(dict(
+            cfg_obj=_cfg_v,
+            out_csv=_run_root / "1_photometry" / f"photometry_{channel}_{active_date}.csv",
+            out_png=_run_root / "3_light_curve" / f"light_curve_{channel}_{active_date}.png",
+            comp_refs=comp_refs_ch,
+            check_star=check_star_ch,
+            ap_radius=shared_aperture_radius,
+        ))
+        metas.append(dict(name=_name, name_raw=_name_raw, mag=float(_vr["_mag"])))
+        logger.info(
+            f"[vsx] subtarget queued target={_name} channel={channel} "
+            f"mag={float(_vr['_mag']):.2f}"
+        )
+    return specs, metas
+
+
+def log_vsx_channel_result(logger, meta, channel, vsx_df) -> None:
+    """額外目標單通道結果摘要（原 _run_single_vsx_channel 的輸出部分）。"""
+    _name = meta["name"]
+    if vsx_df is None:
+        logger.warning(f"[vsx] target={_name} channel={channel} failed; see log")
+        print(f"    [VSX] {_name} {channel}: 測光失敗（見 log）")
+        return
+    _n_ok = int(vsx_df["ok"].sum()) if "ok" in vsx_df.columns else 0
+    if _n_ok > 0 and "m_var" in vsx_df.columns:
+        _ok_rows = vsx_df[vsx_df["ok"] == 1]
+        _med = float(_ok_rows["m_var"].median())
+        _amp = float(_ok_rows["m_var"].max() - _ok_rows["m_var"].min())
+        logger.info(
+            f"[vsx] target={_name} channel={channel} ok={_n_ok}/{len(vsx_df)} "
+            f"median={_med:.3f} amp={_amp:.3f}"
+        )
+        print(f"    [VSX] {_name} {channel}: ok={_n_ok}/{len(vsx_df)}  "
+              f"median={_med:.3f}  amp={_amp:.3f}")
+    else:
+        logger.info(
+            f"[vsx] target={_name} channel={channel} ok={_n_ok}/{len(vsx_df)}"
+        )
+        print(f"    [VSX] {_name} {channel}: ok={_n_ok}/{len(vsx_df)}")
 
 
 __all__ = [
-    "_get_vsx_ready_channels",
     "_prepare_vsx_candidates",
-    "_run_single_vsx_channel",
-    "_run_single_vsx_target",
-    "_run_vsx_targets_for_target",
     "_vsx_short_name",
+    "build_vsx_channel_subtargets",
+    "log_vsx_channel_result",
+    "print_vsx_candidate_listing",
 ]

@@ -30,6 +30,11 @@ from phot_sources.logging_utils import (
     init_summary_logger,
     redirect_warnings_to_logger,
 )
+from phot_sources.vsx import (
+    build_vsx_channel_subtargets,
+    log_vsx_channel_result,
+    print_vsx_candidate_listing,
+)
 from pipeline_config import load_pipeline_config
 
 
@@ -374,32 +379,44 @@ def _prepare_channel_fits_inputs(logger, channel, cfg_ch):
 
 def _run_channel_photometry(
     logger, channel, split_dir, cfg_ch, comp_refs_ch, check_star_ch, active_cache,
-    photometry_func,
+    photometry_multi_func, vsx_specs=None, vsx_metas=None,
 ):
-    # 同視野多目標：傳入共用比較星快取
-    df_ch, _comp_lc_ch = photometry_func(
-        split_dir,
-        cfg_ch.phot_out_csv,
-        cfg_ch.phot_out_png,
-        comp_refs=comp_refs_ch,
+    # 多子目標單趟：主目標（首位）+ 同視野 VSX 額外目標，每幀只載入一次
+    _subtargets = [dict(
         cfg_obj=cfg_ch,
+        out_csv=cfg_ch.phot_out_csv,
+        out_png=cfg_ch.phot_out_png,
+        comp_refs=comp_refs_ch,
         check_star=check_star_ch,
         ap_radius=cfg_ch.aperture_radius,
+    )]
+    if vsx_specs:
+        _subtargets.extend(vsx_specs)
+    _dfs = photometry_multi_func(
+        split_dir,
+        _subtargets,
         channel=channel,
         shared_cache=active_cache,
     )
+    df_ch = _dfs[0]
+    if df_ch is None:
+        logger.warning(f"[SKIP] channel={channel} main-target photometry failed; see log")
+        print(f"  [SKIP] {channel} 主目標測光失敗（見 log），跳過此通道")
+        return None
     if active_cache:
         print(f"  [快取] 比較星快取 {len(active_cache)} 筆")
     _ok_cnt = int(df_ch['ok'].sum()) if 'ok' in df_ch.columns else 0
     logger.info(f"[channel] done channel={channel} ok={_ok_cnt}/{len(df_ch)}")
     print(f"  [完成] {channel}：ok={_ok_cnt} / {len(df_ch)} 幀")
+    for _meta, _vdf in zip(vsx_metas or [], _dfs[1:]):
+        log_vsx_channel_result(logger, _meta, channel, _vdf)
     return df_ch
 
 
 def _run_single_channel(
     logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
     base_cfg, shared_aperture_radius, channel, active_cache,
-    photometry_func,
+    photometry_multi_func, vsx_cand=None,
 ):
     logger.info(f"[channel] start channel={channel} shared_aperture={shared_aperture_radius:.2f}")
     _channel_started = time.perf_counter()
@@ -421,19 +438,30 @@ def _run_single_channel(
         return cfg_ch.run_root, _split_dir, None
     _comp_refs_ch, _check_star_ch = _comp_pick
 
+    _vsx_specs, _vsx_metas = [], []
+    if vsx_cand is not None and len(vsx_cand) > 0:
+        _vsx_specs, _vsx_metas = build_vsx_channel_subtargets(
+            logger, yaml_cfg, active_target, active_date, log_ts, channel,
+            cfg_ch, vsx_cand, _comp_refs_ch, _check_star_ch,
+            shared_aperture_radius,
+        )
+        print(f"  [VSX] 併入本通道額外目標：{len(_vsx_specs)} 顆")
+
     df_ch = _run_channel_photometry(
         logger, channel, _split_dir, cfg_ch,
         _comp_refs_ch, _check_star_ch, active_cache,
-        photometry_func,
+        photometry_multi_func, _vsx_specs, _vsx_metas,
     )
     emit_progress_done(logger, f"channel target={active_target} channel={channel}", _channel_started)
+    if df_ch is None:
+        return cfg_ch.run_root, _split_dir, None
     return cfg_ch.run_root, _split_dir, (df_ch, _comp_refs_ch, _check_star_ch)
 
 
 def _run_channel_loop(
     logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
     cfg, shared_aperture_radius, active_cache,
-    photometry_func,
+    photometry_multi_func, vsx_cand=None,
 ):
     channel_results: dict = {}
     _comp_refs_per_ch: dict = {}
@@ -445,7 +473,7 @@ def _run_channel_loop(
         _run_root_ch, _split_dir, _single_result = _run_single_channel(
             logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
             cfg, shared_aperture_radius, _ch, active_cache,
-            photometry_func,
+            photometry_multi_func, vsx_cand,
         )
         _stage4_run_root = _run_root_ch
         _split_dir_per_ch[_ch] = _split_dir
@@ -465,7 +493,7 @@ def _run_channel_loop(
 def _run_channels_for_target(
     logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
     cfg, shared_aperture_radius, field_caches,
-    photometry_func,
+    photometry_multi_func, vsx_cand=None,
 ):
     _active_field_key = _compute_field_key(
         yaml_cfg, active_target, active_date, channels[0], args.split_subdir
@@ -486,7 +514,7 @@ def _run_channels_for_target(
     ) = _run_channel_loop(
         logger, yaml_cfg, args, log_ts, active_target, active_date, channels,
         cfg, shared_aperture_radius, _active_cache,
-        photometry_func,
+        photometry_multi_func, vsx_cand,
     )
 
     print(f"\n所有通道完成：{list(channel_results.keys())}")
@@ -499,10 +527,9 @@ def _run_channels_for_target(
 def run_main(
     argv=None,
     *,
-    photometry_func,
+    photometry_multi_func,
     stage4_postprocess_func,
     prepare_vsx_candidates_func,
-    run_vsx_targets_func,
 ):
     _args = _parse_cli_args(argv)
     _logger, _log_ts = _init_summary_logger(_args)
@@ -540,12 +567,44 @@ def run_main(
             continue
         cfg, _shared_aperture_radius, check_star, _vsx_field, ap_r_in, ap_r_out = _target_state
 
+        # ── VSX 額外目標：通道迴圈前備妥候選，視野級去重 ─────────────────────
+        # v1.80：額外目標併入主目標的多子目標單趟測光（一幀載入測完全部子目標），
+        # 不再各自跑獨立幀迴圈。同視野只在首顆主目標時跑一次。
+        _vsx_inline_cand = None
+        _vsx_field_key = None
+        _vsx_shell = prepare_vsx_candidates_func(_logger, _args, _vsx_field, cfg)
+        if _vsx_shell is not None:
+            _vsx_cand, _VSX_MAG_MIN, _VSX_MAG_MAX = _vsx_shell
+            if len(_vsx_cand) > 0:
+                _vsx_field_key = _compute_field_key(
+                    _yaml, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS[0], _args.split_subdir
+                )
+                _vsx_done_by = (
+                    _vsx_done_fields.get(_vsx_field_key)
+                    if _vsx_field_key is not None else None
+                )
+                if _vsx_done_by is not None:
+                    _logger.info(
+                        f"[VSX] field dedup: skip target={ACTIVE_TARGET} "
+                        f"already_run_by={_vsx_done_by} "
+                        f"field={_summarize_field_key(_vsx_field_key)}"
+                    )
+                    print(f"[VSX 額外目標] 同視野已由 {_vsx_done_by} 跑過，跳過 "
+                          f"{len(_vsx_cand)} 顆額外目標")
+                else:
+                    print(f"\n{'='*55}")
+                    print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 "
+                          f"({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)，併入通道迴圈")
+                    print(f"{'='*55}")
+                    print_vsx_candidate_listing(_vsx_cand)
+                    _vsx_inline_cand = _vsx_cand
+
         try:
             channel_results, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch, _active_cache, _stage4_run_root = (
                 _run_channels_for_target(
                     _logger, _yaml, _args, _log_ts, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS,
                     cfg, _shared_aperture_radius, _field_caches,
-                    photometry_func,
+                    photometry_multi_func, _vsx_inline_cand,
                 )
             )
             _processed_targets += 1
@@ -558,37 +617,13 @@ def run_main(
             )
 
             _logger.info(f"[target] base target complete target={ACTIVE_TARGET} date={ACTIVE_DATE}")
-            _vsx_shell = prepare_vsx_candidates_func(_logger, _args, _vsx_field, cfg)
-            if _vsx_shell is not None:
-                _vsx_cand, _VSX_MAG_MIN, _VSX_MAG_MAX = _vsx_shell
-                if len(_vsx_cand) > 0:
-                    _vsx_field_key = _compute_field_key(
-                        _yaml, ACTIVE_TARGET, ACTIVE_DATE, CHANNELS[0], _args.split_subdir
-                    )
-                    _vsx_done_by = (
-                        _vsx_done_fields.get(_vsx_field_key)
-                        if _vsx_field_key is not None else None
-                    )
-                    if _vsx_done_by is not None:
-                        _logger.info(
-                            f"[VSX] field dedup: skip target={ACTIVE_TARGET} "
-                            f"already_run_by={_vsx_done_by} "
-                            f"field={_summarize_field_key(_vsx_field_key)}"
-                        )
-                        print(f"[VSX 額外目標] 同視野已由 {_vsx_done_by} 跑過，跳過 "
-                              f"{len(_vsx_cand)} 顆額外目標")
-                    else:
-                        print(f"\n{'='*55}")
-                        print(f"  [VSX 額外目標] {len(_vsx_cand)} 顆 ({_VSX_MAG_MIN}-{_VSX_MAG_MAX} mag)")
-                        print(f"{'='*55}")
-                        run_vsx_targets_func(
-                            _logger, _yaml, ACTIVE_TARGET, ACTIVE_DATE, _log_ts, CHANNELS,
-                            cfg, _vsx_cand, _comp_refs_per_ch, _check_star_per_ch, _split_dir_per_ch,
-                            _shared_aperture_radius, _active_cache, check_star,
-                        )
-                        if _vsx_field_key is not None:
-                            _vsx_done_fields[_vsx_field_key] = ACTIVE_TARGET
-                        emit_progress(_logger, f"VSX done target={ACTIVE_TARGET} count={len(_vsx_cand)}")
+            if _vsx_inline_cand is not None and len(channel_results) > 0:
+                if _vsx_field_key is not None:
+                    _vsx_done_fields[_vsx_field_key] = ACTIVE_TARGET
+                emit_progress(
+                    _logger,
+                    f"VSX done target={ACTIVE_TARGET} count={len(_vsx_inline_cand)}"
+                )
             emit_progress_done(
                 _logger,
                 f"main target target={ACTIVE_TARGET} date={ACTIVE_DATE}",

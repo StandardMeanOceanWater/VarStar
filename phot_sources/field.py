@@ -11,14 +11,18 @@ from astropy.wcs import WCS
 class _FrameCompCache:
     """同視野多目標共用的比較星測光快取。
     第一顆目標測完後存入，後續目標直接讀取，避免重複孔徑測光。
-    Key: (frame_stem, ra_rounded_5dp, dec_rounded_5dp)
+    Key: (frame_stem, ra_rounded_5dp, dec_rounded_5dp, radius_rounded_3dp)
+    半徑入 key：不同目標的自動孔徑可能不同，跨孔徑共用測光值會偏置零點。
     """
     def __init__(self):
         self._data: dict = {}
         self._stats: dict = {}
 
-    def _key(self, frame_stem: str, ra: float, dec: float) -> tuple:
-        return (frame_stem, round(float(ra), 5), round(float(dec), 5))
+    def _key(self, frame_stem: str, ra: float, dec: float, radius: float) -> tuple:
+        return (
+            frame_stem, round(float(ra), 5), round(float(dec), 5),
+            round(float(radius), 3),
+        )
 
     def _bucket(self, label: str | None) -> dict:
         _label = str(label or "global")
@@ -26,8 +30,9 @@ class _FrameCompCache:
             self._stats[_label] = {"hits": 0, "misses": 0, "sets": 0}
         return self._stats[_label]
 
-    def get(self, frame_stem: str, ra: float, dec: float, label: str | None = None):
-        _value = self._data.get(self._key(frame_stem, ra, dec))
+    def get(self, frame_stem: str, ra: float, dec: float, radius: float,
+            label: str | None = None):
+        _value = self._data.get(self._key(frame_stem, ra, dec, radius))
         _bucket = self._bucket(label)
         if _value is None:
             _bucket["misses"] += 1
@@ -35,8 +40,9 @@ class _FrameCompCache:
             _bucket["hits"] += 1
         return _value
 
-    def set(self, frame_stem: str, ra: float, dec: float, result: dict, label: str | None = None):
-        self._data[self._key(frame_stem, ra, dec)] = result
+    def set(self, frame_stem: str, ra: float, dec: float, radius: float,
+            result: dict, label: str | None = None):
+        self._data[self._key(frame_stem, ra, dec, radius)] = result
         self._bucket(label)["sets"] += 1
 
     def stats(self, label: str | None = None) -> dict:

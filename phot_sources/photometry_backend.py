@@ -185,42 +185,50 @@ def _emit_photometry_products(
     return True
 
 
-def run_photometry_on_wcs_dir(
-    wcs_dir: Path,
+def _phot_memo_key(ra, dec, radius, r_in, r_out) -> tuple:
+    return (
+        round(float(ra), 5), round(float(dec), 5),
+        round(float(radius), 3), round(float(r_in), 3), round(float(r_out), 3),
+    )
+
+
+def _memo_aperture_photometry(frame_memo, img, x, y, radius, r_in, r_out, ra, dec):
+    """幀內孔徑測光 memo：同一幀同一星同一孔徑只算一次（多子目標共用）。
+
+    回傳 (phot, elapsed_sec, computed)；memo 命中時 elapsed=0、computed=False。
+    """
+    _key = _phot_memo_key(ra, dec, radius, r_in, r_out)
+    _hit = frame_memo.get(_key)
+    if _hit is not None:
+        return _hit, 0.0, False
+    _t0 = time.perf_counter()
+    _phot = aperture_photometry(img, x, y, radius, r_in, r_out)
+    _elapsed = time.perf_counter() - _t0
+    frame_memo[_key] = _phot
+    return _phot, _elapsed, True
+
+
+def _make_subtarget_processor(
+    wcs_files_sorted: list,
     out_csv: Path,
     out_png: Path,
     comp_refs: list,
     cfg_obj,
-    check_star=None,
-    ap_radius: "float | None" = None,
-    channel: str = "B",
-    shared_cache: "_FrameCompCache | None" = None,
-) -> "tuple[pd.DataFrame, dict[str, pd.Series]]":
-    """
-    Per-frame aperture differential photometry.
+    check_star,
+    ap_radius,
+    channel: str,
+    shared_cache,
+):
+    """建立單一子目標的 (process, finalize) 閉包對。
 
-    Time system : BJD_TDB (Eastman et al., 2010) at exposure midpoint.
-    Zero point  : robust iterative linear regression (see robust_linear_fit).
-    Airmass     : Young (1994); frames with X > 2.0 are flagged but kept.
-
-    Returns
-    -------
-    df               : 每幀測光結果 DataFrame（含 m_var、m_var_norm 等欄位）。
-    comp_lightcurves : reserved return slot; currently always an empty dict.
+    多子目標共用幀迴圈：外層每幀載入一次，逐子目標呼叫 process(frame)；
+    全部幀跑完後逐子目標呼叫 finalize() 做後濾波並輸出產物。
     """
     ra_t, dec_t = cfg_obj.target_radec_deg
     if ap_radius is None:
         ap_radius = cfg_obj.aperture_radius
     r_in, r_out = compute_annulus_radii(ap_radius, cfg_obj.annulus_r_in, cfg_obj.annulus_r_out)
     margin = int(np.ceil(r_out + 2))
-
-    # split/{channel}/ 的 FITS 命名規則：*_{channel}.fits
-    wcs_files_sorted = sorted(wcs_dir.glob(f"*_{channel}.fits"))
-    if not wcs_files_sorted:
-        raise FileNotFoundError(
-            f"No split/{channel} FITS found in: {wcs_dir}\n"
-            "Check that split stage completed successfully."
-        )
 
     check_coord  = (SkyCoord(ra=check_star[0] * u.deg, dec=check_star[1] * u.deg)
                     if check_star is not None else None)
@@ -234,7 +242,6 @@ def run_photometry_on_wcs_dir(
     rows = []
     _first_frame_diag_data = None   # (comp_m_cat, comp_m_inst, fit) for diag plot
 
-    _frame_stage_started = time.perf_counter()
     _cache_label = f"{cfg_obj.target_name}:{channel}"
     _frame_total_times: "list[float]" = []
     _target_ap_times: "list[float]" = []
@@ -248,28 +255,15 @@ def run_photometry_on_wcs_dir(
     _check_total_times: "list[float]" = []
     _comp_phot_calls = 0
     _cached_comp_hits = 0
-    emit_progress(
-        _phot_logger,
-        f"channel {channel} frame loop start total={len(wcs_files_sorted)}"
-    )
-    _last_heartbeat_at = _frame_stage_started
 
-    for _frame_idx, f in enumerate(wcs_files_sorted, start=1):
-        _frame_started = time.perf_counter()
-        _now = time.perf_counter()
-        if (_frame_idx % 25 == 0) or (_now - _last_heartbeat_at >= 30.0):
-            emit_progress(
-                _phot_logger,
-                f"channel {channel} heartbeat frames={_frame_idx}/{len(wcs_files_sorted)} "
-                f"elapsed={_now - _frame_stage_started:.1f}s"
-            )
-            _last_heartbeat_at = _now
-        _io_started = time.perf_counter()
-        with fits.open(f) as hdul:
-            img = hdul[0].data.astype(np.float32)
-            hdr = hdul[0].header
-            wcs_obj = WCS(hdr)
-        _io_load_times.append(time.perf_counter() - _io_started)
+    def process(f, img, hdr, wcs_obj, frame_memo, io_elapsed=None):
+        nonlocal cfg_checked, n_skipped, n_low_sharpness, n_low_peak_ratio
+        nonlocal n_low_reg_r2, n_insufficient_comps
+        nonlocal _first_frame_diag_data, _comp_phot_calls, _cached_comp_hits
+        # io_elapsed：幀載入耗時，只由視野首個子目標記帳（避免重複計）
+        if io_elapsed is not None:
+            _io_load_times.append(io_elapsed)
+        _frame_started = time.perf_counter() - (io_elapsed or 0.0)
 
         apply_gain_from_header(hdr, cfg_obj)
         if not cfg_checked:
@@ -300,33 +294,34 @@ def run_photometry_on_wcs_dir(
             rec["ok_flag"] = "high_airmass"
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         # ── [1] 幀層級 FWHM 篩選 ─────────────────────────────────────────────
         if not in_bounds(img, xt, yt, margin=margin):
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
-        _target_ap_started = time.perf_counter()
-        phot_t = aperture_photometry(img, xt, yt, ap_radius, r_in, r_out)
-        _target_ap_times.append(time.perf_counter() - _target_ap_started)
+        phot_t, _target_ap_dt, _ = _memo_aperture_photometry(
+            frame_memo, img, xt, yt, ap_radius, r_in, r_out, ra_t, dec_t
+        )
+        _target_ap_times.append(_target_ap_dt)
         if phot_t.get("ok") != 1 or not np.isfinite(phot_t.get("flux_net")):
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         sat_t = is_saturated(phot_t.get("max_pix", np.nan), cfg_obj.saturation_threshold)
         if sat_t and not cfg_obj.allow_saturated_target:
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         m_inst_t = m_inst_from_flux(phot_t["flux_net"])
         if not np.isfinite(m_inst_t):
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         # ── [2] Sharpness Index 篩選 ─────────────────────────────────────────
         # S = flux(r=3px) / flux(r=8px)（均扣背景，對象：最亮未飽和比較星）
@@ -338,6 +333,7 @@ def run_photometry_on_wcs_dir(
         if _sharpness_min > 0 and comp_refs:
             # 找視場內最亮（m_cat 最小）且未飽和的比較星
             _s_bright_x, _s_bright_y = None, None
+            _s_bright_ra, _s_bright_dec = None, None
             _s_bright_mag = np.inf
             for _sref in comp_refs:
                 _s_ra, _s_dec, _s_m = float(_sref[0]), float(_sref[1]), float(_sref[2])
@@ -346,24 +342,33 @@ def run_photometry_on_wcs_dir(
                 _s_xc, _s_yc = radec_to_pixel(wcs_obj, _s_ra, _s_dec)
                 if not in_bounds(img, _s_xc, _s_yc, margin=margin):
                     continue
-                _comp_ap_started = time.perf_counter()
-                _s_phot8 = aperture_photometry(img, _s_xc, _s_yc, 8.0, r_in, r_out)
-                _comp_ap_times.append(time.perf_counter() - _comp_ap_started)
-                _comp_phot_calls += 1
+                _s_phot8, _s_dt8, _s_computed8 = _memo_aperture_photometry(
+                    frame_memo, img, _s_xc, _s_yc, 8.0, r_in, r_out, _s_ra, _s_dec
+                )
+                if _s_computed8:
+                    _comp_ap_times.append(_s_dt8)
+                    _comp_phot_calls += 1
                 if is_saturated(_s_phot8.get("max_pix", np.nan), cfg_obj.saturation_threshold):
                     continue
                 _s_bright_x, _s_bright_y = _s_xc, _s_yc
+                _s_bright_ra, _s_bright_dec = _s_ra, _s_dec
                 _s_bright_mag = _s_m
             if _s_bright_x is not None:
                 try:
-                    _comp_ap_started = time.perf_counter()
-                    _phot_s3 = aperture_photometry(img, _s_bright_x, _s_bright_y, 3.0, r_in, r_out)
-                    _comp_ap_times.append(time.perf_counter() - _comp_ap_started)
-                    _comp_phot_calls += 1
-                    _comp_ap_started = time.perf_counter()
-                    _phot_s8 = aperture_photometry(img, _s_bright_x, _s_bright_y, 8.0, r_in, r_out)
-                    _comp_ap_times.append(time.perf_counter() - _comp_ap_started)
-                    _comp_phot_calls += 1
+                    _phot_s3, _s_dt3, _s_computed3 = _memo_aperture_photometry(
+                        frame_memo, img, _s_bright_x, _s_bright_y, 3.0, r_in, r_out,
+                        _s_bright_ra, _s_bright_dec,
+                    )
+                    if _s_computed3:
+                        _comp_ap_times.append(_s_dt3)
+                        _comp_phot_calls += 1
+                    _phot_s8, _s_dt8b, _s_computed8b = _memo_aperture_photometry(
+                        frame_memo, img, _s_bright_x, _s_bright_y, 8.0, r_in, r_out,
+                        _s_bright_ra, _s_bright_dec,
+                    )
+                    if _s_computed8b:
+                        _comp_ap_times.append(_s_dt8b)
+                        _comp_phot_calls += 1
                     if (_phot_s3.get("ok") == 1 and _phot_s8.get("ok") == 1
                             and np.isfinite(_phot_s3.get("flux_net", np.nan))
                             and np.isfinite(_phot_s8.get("flux_net", np.nan))
@@ -379,7 +384,7 @@ def run_photometry_on_wcs_dir(
             n_low_sharpness += 1
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         # ── [2b] Peak-ratio 篩選（次鏡起霧 / 甜甜圈 PSF 偵測）─────────────────
         # peak_ratio = t_max_pix / t_flux_net
@@ -400,7 +405,7 @@ def run_photometry_on_wcs_dir(
             n_low_peak_ratio += 1
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         # ── Comparison ensemble ──────────────────────────────────────────────
         comp_m_inst, comp_m_cat, comp_weights = [], [], []
@@ -416,21 +421,27 @@ def run_photometry_on_wcs_dir(
             xc, yc = radec_to_pixel(wcs_obj, ra_c, dec_c)
             if not in_bounds(img, xc, yc, margin=margin):
                 continue
-            # 同視野多目標共用快取：命中則跳過重測
-            _cached_phot = (
-                shared_cache.get(f.stem, ra_c, dec_c, label=_cache_label)
-                if shared_cache else None
-            )
-            if _cached_phot is not None:
+            # 快取層級：同幀多子目標 memo → 跨目標 shared_cache → 實際測光
+            _phot_key = _phot_memo_key(ra_c, dec_c, ap_radius, r_in, r_out)
+            phot_c = frame_memo.get(_phot_key)
+            if phot_c is not None:
                 _cached_comp_hits += 1
-                phot_c = _cached_phot
             else:
-                _comp_ap_started = time.perf_counter()
-                phot_c = aperture_photometry(img, xc, yc, ap_radius, r_in, r_out)
-                _comp_ap_times.append(time.perf_counter() - _comp_ap_started)
-                _comp_phot_calls += 1
-                if shared_cache is not None:
-                    shared_cache.set(f.stem, ra_c, dec_c, phot_c, label=_cache_label)
+                _cached_phot = (
+                    shared_cache.get(f.stem, ra_c, dec_c, ap_radius, label=_cache_label)
+                    if shared_cache else None
+                )
+                if _cached_phot is not None:
+                    _cached_comp_hits += 1
+                    phot_c = _cached_phot
+                else:
+                    _comp_ap_started = time.perf_counter()
+                    phot_c = aperture_photometry(img, xc, yc, ap_radius, r_in, r_out)
+                    _comp_ap_times.append(time.perf_counter() - _comp_ap_started)
+                    _comp_phot_calls += 1
+                    if shared_cache is not None:
+                        shared_cache.set(f.stem, ra_c, dec_c, ap_radius, phot_c, label=_cache_label)
+                frame_memo[_phot_key] = phot_c
             if phot_c.get("ok") != 1 or not np.isfinite(phot_c.get("flux_net")):
                 continue
             if is_saturated(phot_c.get("max_pix", np.nan), cfg_obj.saturation_threshold):
@@ -473,7 +484,7 @@ def run_photometry_on_wcs_dir(
                 )
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         _fit_started = time.perf_counter()
         fit = robust_linear_fit(
@@ -524,7 +535,7 @@ def run_photometry_on_wcs_dir(
         if not (np.isfinite(a) and np.isfinite(b)):
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
 
         # ── [3] 回歸 R² 幀層級篩選 ────────────────────────────────────────────
         # reg_r2_min 預設 0.0（停用）；> 0 時才自動剔除，保留 WARN 輸出。
@@ -540,7 +551,7 @@ def run_photometry_on_wcs_dir(
             n_low_reg_r2 += 1
             _frame_total_times.append(time.perf_counter() - _frame_started)
             rows.append(rec)
-            continue
+            return
         elif np.isfinite(r2) and r2 < max(_reg_r2_min, 0.5):
             _phot_logger.warning(
                 "[WARN] low reg R2=%.4f in %s (channel=%s) — consider raising reg_r2_min",
@@ -623,9 +634,10 @@ def run_photometry_on_wcs_dir(
             ra_k, dec_k, m_cat_k = check_star
             xk, yk = radec_to_pixel(wcs_obj, ra_k, dec_k)
             if in_bounds(img, xk, yk, margin=margin):
-                _check_ap_started = time.perf_counter()
-                phot_k = aperture_photometry(img, xk, yk, ap_radius, r_in, r_out)
-                _check_ap_times.append(time.perf_counter() - _check_ap_started)
+                phot_k, _check_ap_dt, _ = _memo_aperture_photometry(
+                    frame_memo, img, xk, yk, ap_radius, r_in, r_out, ra_k, dec_k
+                )
+                _check_ap_times.append(_check_ap_dt)
                 if phot_k.get("ok") == 1 and np.isfinite(phot_k.get("flux_net")):
                     sat_k = is_saturated(phot_k.get("max_pix", np.nan), cfg_obj.saturation_threshold)
                     if not sat_k or cfg_obj.allow_saturated_check:
@@ -641,7 +653,77 @@ def run_photometry_on_wcs_dir(
         rows.append(rec)
         _frame_total_times.append(time.perf_counter() - _frame_started)
 
-    emit_progress_done(_phot_logger, f"channel {channel} frame loop", _frame_stage_started)
+    def finalize():
+        return _finalize_subtarget(
+            wcs_files_sorted=wcs_files_sorted,
+            out_csv=out_csv,
+            out_png=out_png,
+            channel=channel,
+            cfg_obj=cfg_obj,
+            check_star=check_star,
+            ap_radius=ap_radius,
+            r_in=r_in,
+            r_out=r_out,
+            shared_cache=shared_cache,
+            _cache_label=_cache_label,
+            rows=rows,
+            n_skipped=n_skipped,
+            n_low_sharpness=n_low_sharpness,
+            n_low_peak_ratio=n_low_peak_ratio,
+            n_low_reg_r2=n_low_reg_r2,
+            n_insufficient_comps=n_insufficient_comps,
+            _first_frame_diag_data=_first_frame_diag_data,
+            _frame_total_times=_frame_total_times,
+            _target_ap_times=_target_ap_times,
+            _comp_ap_times=_comp_ap_times,
+            _check_ap_times=_check_ap_times,
+            _io_load_times=_io_load_times,
+            _time_wcs_times=_time_wcs_times,
+            _sharpness_times=_sharpness_times,
+            _comp_loop_times=_comp_loop_times,
+            _fit_times=_fit_times,
+            _check_total_times=_check_total_times,
+            _comp_phot_calls=_comp_phot_calls,
+            _cached_comp_hits=_cached_comp_hits,
+        )
+
+    return process, finalize
+
+
+def _finalize_subtarget(
+    *,
+    wcs_files_sorted,
+    out_csv,
+    out_png,
+    channel,
+    cfg_obj,
+    check_star,
+    ap_radius,
+    r_in,
+    r_out,
+    shared_cache,
+    _cache_label,
+    rows,
+    n_skipped,
+    n_low_sharpness,
+    n_low_peak_ratio,
+    n_low_reg_r2,
+    n_insufficient_comps,
+    _first_frame_diag_data,
+    _frame_total_times,
+    _target_ap_times,
+    _comp_ap_times,
+    _check_ap_times,
+    _io_load_times,
+    _time_wcs_times,
+    _sharpness_times,
+    _comp_loop_times,
+    _fit_times,
+    _check_total_times,
+    _comp_phot_calls,
+    _cached_comp_hits,
+) -> pd.DataFrame:
+    """單一子目標的後濾波、剔除統計與產物輸出（原 run_photometry 後段）。"""
     _frame_total_arr = np.asarray(_frame_total_times, dtype=float)
     _target_ap_arr = np.asarray(_target_ap_times, dtype=float)
     _comp_ap_arr = np.asarray(_comp_ap_times, dtype=float)
@@ -700,7 +782,7 @@ def run_photometry_on_wcs_dir(
         df = _ensure_output_schema(df)
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-        return df, {}
+        return df
 
     _dataframe_build_total = time.perf_counter() - _post_df_started
     _post_filter_started = time.perf_counter()
@@ -951,9 +1033,155 @@ def run_photometry_on_wcs_dir(
         ext_k=_ext_k,
         first_frame_diag_data=_first_frame_diag_data,
     ):
-        return df, {}
+        return df
 
-    return df, {}  # comp_lightcurves 已隨 ensemble 停用，回傳空 dict
+    return df
+
+
+def run_photometry_multi_on_wcs_dir(
+    wcs_dir: Path,
+    subtargets: "list[dict]",
+    channel: str = "B",
+    shared_cache: "_FrameCompCache | None" = None,
+) -> "list[pd.DataFrame | None]":
+    """同視野多子目標單趟測光：每幀 FITS 只載入一次，逐子目標完成測光。
+
+    subtargets 每項為 dict：
+      cfg_obj    : 該子目標的 cfg（target_name / target_radec_deg / phot_band /
+                   regression_diag_dir 等須已指向該子目標）
+      out_csv    : 測光 CSV 輸出路徑
+      out_png    : 光變曲線 PNG 輸出路徑
+      comp_refs  : 比較星參考列表
+      check_star : (ra, dec, m_cat) 或 None
+      ap_radius  : 孔徑半徑（None 則用 cfg_obj.aperture_radius）
+
+    首個子目標視為主目標。單一子目標失敗不中斷其餘子目標：
+    失敗者停止後續幀處理，回傳列表中對應位置為 None。
+    回傳 list 順序對應 subtargets。
+    """
+    wcs_files_sorted = sorted(Path(wcs_dir).glob(f"*_{channel}.fits"))
+    if not wcs_files_sorted:
+        raise FileNotFoundError(
+            f"No split/{channel} FITS found in: {wcs_dir}\n"
+            "Check that split stage completed successfully."
+        )
+
+    _pairs = [
+        _make_subtarget_processor(
+            wcs_files_sorted,
+            Path(_spec["out_csv"]),
+            Path(_spec["out_png"]),
+            _spec["comp_refs"],
+            _spec["cfg_obj"],
+            _spec.get("check_star"),
+            _spec.get("ap_radius"),
+            channel,
+            shared_cache,
+        )
+        for _spec in subtargets
+    ]
+    _names = [str(_spec["cfg_obj"].target_name) for _spec in subtargets]
+    _failed = [False] * len(_pairs)
+
+    _frame_stage_started = time.perf_counter()
+    emit_progress(
+        _phot_logger,
+        f"channel {channel} frame loop start total={len(wcs_files_sorted)} "
+        f"subtargets={len(_pairs)}"
+    )
+    _last_heartbeat_at = _frame_stage_started
+    for _frame_idx, f in enumerate(wcs_files_sorted, start=1):
+        _now = time.perf_counter()
+        if (_frame_idx % 25 == 0) or (_now - _last_heartbeat_at >= 30.0):
+            emit_progress(
+                _phot_logger,
+                f"channel {channel} heartbeat frames={_frame_idx}/{len(wcs_files_sorted)} "
+                f"elapsed={_now - _frame_stage_started:.1f}s"
+            )
+            _last_heartbeat_at = _now
+        _io_started = time.perf_counter()
+        with fits.open(f) as hdul:
+            img = hdul[0].data.astype(np.float32)
+            hdr = hdul[0].header
+            wcs_obj = WCS(hdr)
+        _io_elapsed = time.perf_counter() - _io_started
+
+        frame_memo: dict = {}
+        for _st_idx, (_process, _fin) in enumerate(_pairs):
+            if _failed[_st_idx]:
+                continue
+            try:
+                _process(
+                    f, img, hdr, wcs_obj, frame_memo,
+                    io_elapsed=(_io_elapsed if _st_idx == 0 else None),
+                )
+            except Exception:
+                _failed[_st_idx] = True
+                _phot_logger.exception(
+                    "[multi] subtarget frame processing failed target=%s "
+                    "channel=%s frame=%s; disabling this subtarget",
+                    _names[_st_idx], channel, f.name,
+                )
+    emit_progress_done(_phot_logger, f"channel {channel} frame loop", _frame_stage_started)
+
+    _results: "list[pd.DataFrame | None]" = []
+    for _st_idx, (_process, _fin) in enumerate(_pairs):
+        if _failed[_st_idx]:
+            _results.append(None)
+            continue
+        try:
+            _results.append(_fin())
+        except Exception:
+            _phot_logger.exception(
+                "[multi] subtarget finalize failed target=%s channel=%s",
+                _names[_st_idx], channel,
+            )
+            _results.append(None)
+    return _results
+
+
+def run_photometry_on_wcs_dir(
+    wcs_dir: Path,
+    out_csv: Path,
+    out_png: Path,
+    comp_refs: list,
+    cfg_obj,
+    check_star=None,
+    ap_radius: "float | None" = None,
+    channel: str = "B",
+    shared_cache: "_FrameCompCache | None" = None,
+) -> "tuple[pd.DataFrame, dict[str, pd.Series]]":
+    """
+    Per-frame aperture differential photometry.
+
+    Time system : BJD_TDB (Eastman et al., 2010) at exposure midpoint.
+    Zero point  : robust iterative linear regression (see robust_linear_fit).
+    Airmass     : Young (1994); frames with X > 2.0 are flagged but kept.
+
+    Returns
+    -------
+    df               : 每幀測光結果 DataFrame（含 m_var、m_var_norm 等欄位）。
+    comp_lightcurves : reserved return slot; currently always an empty dict.
+    """
+    _dfs = run_photometry_multi_on_wcs_dir(
+        wcs_dir,
+        [dict(
+            cfg_obj=cfg_obj,
+            out_csv=out_csv,
+            out_png=out_png,
+            comp_refs=comp_refs,
+            check_star=check_star,
+            ap_radius=ap_radius,
+        )],
+        channel=channel,
+        shared_cache=shared_cache,
+    )
+    if _dfs[0] is None:
+        raise RuntimeError(
+            f"photometry failed target={getattr(cfg_obj, 'target_name', '?')} "
+            f"channel={channel}; see log for the original exception"
+        )
+    return _dfs[0], {}  # comp_lightcurves 已隨 ensemble 停用，回傳空 dict
 
 
 # ── 週期分析已移至 period_analysis.py（統一從 YAML 讀取參數）────────────────
@@ -964,5 +1192,6 @@ def run_photometry_on_wcs_dir(
 __all__ = [
     "_ensure_output_schema",
     "_emit_photometry_products",
+    "run_photometry_multi_on_wcs_dir",
     "run_photometry_on_wcs_dir",
 ]
