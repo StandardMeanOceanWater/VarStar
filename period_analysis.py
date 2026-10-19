@@ -764,7 +764,8 @@ def select_best_period_candidate(
         switched   : True 表示採用了非主峰候選
         decisive   : ΔBIC 是否具決定性
         candidates : 各候選明細 list（period_d/power/n_harmonics/bic/delta_bic）
-        status     : "selected" | "kept" | "skipped_disabled" | "no_candidates"
+        status     : "selected" | "kept" | "baseline_fallback" |
+                     "skipped_disabled" | "no_candidates" | "no_foldable_candidates"
     """
     cs_cfg = _get(cfg, "period_analysis", "candidate_selection", default={})
     enabled = bool(_get(cs_cfg, "enabled", default=True))
@@ -773,8 +774,15 @@ def select_best_period_candidate(
     min_phase_coverage = float(_get(cs_cfg, "min_phase_coverage", default=0.9))
 
     best_idx = int(np.argmax(ls_power))
+    baseline = float(np.max(t) - np.min(t))
+    original_ls_peak_period = float(1.0 / freqs[best_idx])
+    original_peak_exceeds_baseline = original_ls_peak_period > baseline
     result = {
-        "period": float(1.0 / freqs[best_idx]),
+        "period": original_ls_peak_period,
+        "original_ls_peak_period_d": original_ls_peak_period,
+        "baseline_d": baseline,
+        "global_peak_exceeds_baseline": original_peak_exceeds_baseline,
+        "fallback_to_foldable_peak": False,
         "switched": False,
         "decisive": False,
         "candidates": [],
@@ -784,7 +792,6 @@ def select_best_period_candidate(
         result["status"] = "skipped_disabled"
         return result
 
-    baseline = float(np.max(t) - np.min(t))
     min_freq_sep = 1.0 / baseline if baseline > 0 else 0.0
 
     # 候選只在可折疊區（P <= 基線）內尋找：P > 基線折不滿一週期無法評分，
@@ -793,17 +800,23 @@ def select_best_period_candidate(
     _p = np.asarray(ls_power, dtype=float).copy()
     _foldable = (1.0 / np.asarray(freqs, dtype=float)) <= baseline
     if not _foldable.any():
-        result["status"] = "no_candidates"
+        result["status"] = "no_foldable_candidates"
         return result
     _p[~_foldable] = -np.inf
     _fold_best_idx = int(np.argmax(_p))
-    if not _foldable[best_idx]:
+    if original_peak_exceeds_baseline:
         logger.info(
             "[候選] LS 全域主峰 P=%.4f h 超出基線 %.4f h，改以可折疊區主峰 "
             "P=%.4f h 為錨點。",
             (1.0 / freqs[best_idx]) * 24.0, baseline * 24.0,
             (1.0 / freqs[_fold_best_idx]) * 24.0,
         )
+        # The caller must apply this foldable peak. Without this flag it would
+        # continue fitting the original LS peak, even though that period is
+        # longer than the observation baseline.
+        result["switched"] = True
+        result["fallback_to_foldable_peak"] = True
+        result["status"] = "baseline_fallback"
     best_idx = _fold_best_idx
     result["period"] = float(1.0 / freqs[best_idx])
     _local_max = np.flatnonzero(
@@ -868,7 +881,10 @@ def select_best_period_candidate(
     if not scored:
         result["status"] = "no_candidates"
         result["candidates"] = candidates
-        logger.warning("[候選] 無可評分候選（全部超出基線或擬合失敗），保留 LS 主峰。")
+        logger.warning(
+            "[候選] 無可評分候選（全部超出基線或擬合失敗）；"
+            "採用可折疊區最高峰，但週期判定不具決定性。"
+        )
         return result
 
     bic_min = min(c["bic"] for c in scored)
@@ -1116,6 +1132,16 @@ def _write_fourier_fit_json(
             "status": cand_sel["status"],
             "switched": bool(cand_sel["switched"]),
             "decisive": bool(cand_sel["decisive"]),
+            "original_ls_peak_period_hr": (
+                float(cand_sel["original_ls_peak_period_d"]) * 24.0
+            ),
+            "baseline_hr": float(cand_sel["baseline_d"]) * 24.0,
+            "global_peak_exceeds_baseline": bool(
+                cand_sel["global_peak_exceeds_baseline"]
+            ),
+            "fallback_to_foldable_peak": bool(
+                cand_sel["fallback_to_foldable_peak"]
+            ),
             "candidates": [
                 {
                     "period_hr": float(c["period_hr"]),
@@ -1896,6 +1922,12 @@ def run_period_analysis(
         t, mag, err, ls_result["freqs"], ls_result["ls_power"], cfg
     )
     ls_result["candidate_selection"] = cand_sel
+    if cand_sel["status"] == "no_foldable_candidates":
+        logger.error(
+            "[run_period_analysis] LS 主峰超出觀測基線，且搜尋範圍內沒有可折疊候選；"
+            "不輸出傅立葉週期擬合。"
+        )
+        return {"ls_result": ls_result, "fit_result": {}}
     if cand_sel["switched"]:
         ls_result["ls_peak_period"] = ls_result["best_period"]
         ls_result["best_period"] = cand_sel["period"]
